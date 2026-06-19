@@ -1,0 +1,132 @@
+"""
+core/orchestrator.py
+--------------------
+Coordinates the full analysis pipeline for a single video.
+
+Architecture (Option B — event-driven modular):
+  1. Ingest: extract audio, probe video, compute windows
+  2. Dispatch: run each worker (optionally in parallel via threading)
+  3. Fuse: merge all modality outputs per window
+  4. Report: store final results in FeatureStore
+
+Workers run as threads so they can be parallelised without the GIL
+bottleneck (each worker is I/O or C-extension bound, not pure Python).
+"""
+
+from __future__ import annotations
+
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+from loguru import logger
+
+from core.feature_store import FeatureStore
+from core.fusion_engine import FusionEngine
+from core.models import AnalysisJob, FusedWindow, JobStatus
+from core.preprocessing import compute_windows, extract_audio, probe_video
+from workers.camera_worker import CameraWorker
+from workers.gesture_worker import GestureWorker
+from workers.prosody_worker import ProsodyWorker
+from workers.verbal_worker import VerbalWorker
+
+
+class Orchestrator:
+    def __init__(
+        self,
+        store: FeatureStore,
+        work_dir: str = "/tmp/mannerism",
+        window_size_s: float = 5.0,
+        whisper_model: str = "base",
+        whisper_device: str = "cpu",
+        parallel: bool = True,
+    ):
+        self.store = store
+        self.work_dir = Path(work_dir)
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.window_size_s = window_size_s
+        self.parallel = parallel
+
+        self._gesture_worker = GestureWorker(store)
+        self._prosody_worker = ProsodyWorker(store)
+        self._verbal_worker = VerbalWorker(store, model_size=whisper_model, device=whisper_device)
+        self._camera_worker = CameraWorker(store)
+        self._fusion = FusionEngine(store)
+
+    def analyze(self, video_path: str, job_id: str | None = None) -> str:
+        """
+        Full analysis pipeline. Returns the job_id.
+        Pass job_id to pre-assign one (e.g. so callers can poll before analyze() returns).
+        """
+        if job_id is None:
+            job_id = str(uuid.uuid4())[:8]
+        job = AnalysisJob(
+            job_id=job_id,
+            video_path=video_path,
+            window_size_s=self.window_size_s,
+            status=JobStatus.PENDING,
+            created_at=time.time(),
+        )
+        self.store.create_job(job)
+        logger.info(f"[orchestrator] Created job {job_id} for {video_path}")
+
+        try:
+            self.store.set_status(job_id, JobStatus.RUNNING)
+
+            # 1. Ingest
+            audio_path = extract_audio(video_path, str(self.work_dir))
+            meta = probe_video(video_path, audio_path)
+            windows = compute_windows(meta.duration_s, self.window_size_s)
+
+            logger.info(
+                f"[orchestrator] Video: {meta.duration_s:.1f}s, "
+                f"{meta.fps:.1f}fps, {len(windows)} windows"
+            )
+
+            # 2. Dispatch workers
+            if self.parallel:
+                self._run_parallel(job_id, meta, windows)
+            else:
+                self._run_sequential(job_id, meta, windows)
+
+            # 3. Fuse
+            fused = self._fusion.fuse_job(job_id, len(windows))
+            logger.info(f"[orchestrator] Fusion complete — {len(fused)} records")
+
+            self.store.set_status(job_id, JobStatus.DONE)
+            logger.info(f"[orchestrator] Job {job_id} DONE")
+
+        except Exception as exc:
+            logger.exception(f"[orchestrator] Job {job_id} FAILED: {exc}")
+            self.store.set_status(job_id, JobStatus.FAILED, error=str(exc))
+
+        return job_id
+
+    # ------------------------------------------------------------------
+
+    def _run_parallel(self, job_id, meta, windows) -> None:
+        tasks = {
+            "gesture": lambda: self._gesture_worker.process_job(job_id, meta, windows),
+            "prosody": lambda: self._prosody_worker.process_job(job_id, meta, windows),
+            "verbal":  lambda: self._verbal_worker.process_job(job_id, meta, windows),
+            "camera":  lambda: self._camera_worker.process_job(job_id, meta, windows),
+        }
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(fn): name for name, fn in tasks.items()}
+            for future in as_completed(futures):
+                name = futures[future]
+                exc = future.exception()
+                if exc:
+                    logger.error(f"[orchestrator] Worker '{name}' raised: {exc}")
+                else:
+                    logger.info(f"[orchestrator] Worker '{name}' finished")
+
+    def _run_sequential(self, job_id, meta, windows) -> None:
+        self._gesture_worker.process_job(job_id, meta, windows)
+        self._prosody_worker.process_job(job_id, meta, windows)
+        self._verbal_worker.process_job(job_id, meta, windows)
+        self._camera_worker.process_job(job_id, meta, windows)
+
+    def close(self) -> None:
+        self._gesture_worker.close()
