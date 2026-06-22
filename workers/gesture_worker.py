@@ -21,16 +21,12 @@ import numpy as np
 from loguru import logger
 
 from core.feature_store import FeatureStore
-from core.models import GestureFeatures, GestureFrame, Landmark, TimeWindow
+from core.models import GestureFeatures, GestureFrame, Landmark, PoseKeyframe, TimeWindow
 from core.preprocessing import VideoMeta, frames_for_window
 
 # MediaPipe landmark indices
 _LEFT_WRIST = 15
 _RIGHT_WRIST = 16
-_LEFT_SHOULDER = 11
-_RIGHT_SHOULDER = 12
-_LEFT_ELBOW = 13
-_RIGHT_ELBOW = 14
 
 
 class GestureWorker:
@@ -132,11 +128,8 @@ class GestureWorker:
                 window=window,
                 mean_wrist_velocity=0.0,
                 max_wrist_displacement=0.0,
-                gesture_amplitude=0.0,
-                bilateral_symmetry_score=0.0,
-                hands_above_shoulder_ratio=0.0,
-                gesture_rate=0.0,
                 pose_present_ratio=0.0,
+                pose_keyframes=[],
             )
 
         # Wrist positions over time
@@ -145,21 +138,67 @@ class GestureWorker:
 
         mean_vel = self._mean_velocity(left_wrists + right_wrists, pose_present)
         max_disp = self._max_displacement(left_wrists + right_wrists)
-        amplitude = self._gesture_amplitude(left_wrists + right_wrists)
-        symmetry = self._bilateral_symmetry(left_wrists, right_wrists, pose_present)
-        above_shoulder = self._hands_above_shoulder_ratio(pose_present)
-        gesture_rate = self._estimate_gesture_rate(left_wrists + right_wrists, end_s - start_s)
+        handedness = self._compute_handedness(left_wrists, right_wrists)
+        keyframes = self._extract_keyframes(pose_present, width, height)
 
         return GestureFeatures(
             window=window,
             mean_wrist_velocity=mean_vel,
             max_wrist_displacement=max_disp,
-            gesture_amplitude=amplitude,
-            bilateral_symmetry_score=symmetry,
-            hands_above_shoulder_ratio=above_shoulder,
-            gesture_rate=gesture_rate,
             pose_present_ratio=pose_present_ratio,
+            handedness_ratio=handedness,
+            pose_keyframes=keyframes,
         )
+
+    # ------------------------------------------------------------------
+    # Handedness + representative-frame helpers
+    # ------------------------------------------------------------------
+
+    def _compute_handedness(
+        self,
+        left_wrists: list,
+        right_wrists: list,
+    ) -> float:
+        """
+        Ratio of right-hand motion to total wrist motion.
+        0.0 = fully left-dominant, 0.5 = bilateral, 1.0 = fully right-dominant.
+        """
+        def _total(positions):
+            total = 0.0
+            for i in range(1, len(positions)):
+                p0, p1 = positions[i - 1], positions[i]
+                if p0 is not None and p1 is not None:
+                    total += math.sqrt((p1[0] - p0[0]) ** 2 + (p1[1] - p0[1]) ** 2)
+            return total
+
+        lm = _total(left_wrists)
+        rm = _total(right_wrists)
+        total = lm + rm
+        return (rm - lm) / total if total > 1e-6 else 0.0
+
+    def _extract_keyframes(
+        self,
+        frames: list[GestureFrame],
+        width: int,
+        height: int,
+        step: int = 3,
+    ) -> list[PoseKeyframe]:
+        """
+        Return every `step`-th frame as a PoseKeyframe with normalised coords.
+        y is pre-flipped (stored as 1 − raw_y) so the JS viewer needs no flip.
+        """
+        keyframes = []
+        for i in range(0, len(frames), step):
+            f = frames[i]
+            if len(f.pose) < 33:
+                continue
+            keyframes.append(PoseKeyframe(
+                ts=f.timestamp_s,
+                pose_x=[lm.x / width for lm in f.pose],
+                pose_y=[1.0 - lm.y / height for lm in f.pose],
+                pose_vis=[lm.visibility for lm in f.pose],
+            ))
+        return keyframes
 
     # ------------------------------------------------------------------
     # Kinematic helpers
@@ -213,90 +252,4 @@ class GestureWorker:
         ys = [p[1] for p in valid]
         return math.sqrt((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2)
 
-    def _gesture_amplitude(self, positions: list[Optional[tuple[float, float]]]) -> float:
-        valid = [p for p in positions if p is not None]
-        if len(valid) < 2:
-            return 0.0
-        xs = [p[0] for p in valid]
-        ys = [p[1] for p in valid]
-        return math.sqrt((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2)
 
-    def _bilateral_symmetry(
-        self,
-        left: list[Optional[tuple]],
-        right: list[Optional[tuple]],
-        frames: list[GestureFrame],
-    ) -> float:
-        """
-        Symmetry score: 1 - normalised mean absolute difference
-        in vertical wrist position between L and R hands.
-        """
-        diffs = []
-        for l, r in zip(left, right):
-            if l is None or r is None:
-                continue
-            # Compare y-coordinate (vertical position)
-            diffs.append(abs(l[1] - r[1]))
-        if not diffs:
-            return 0.0
-        max_possible = max(diffs) if diffs else 1.0
-        if max_possible == 0:
-            return 1.0
-        return float(1.0 - (np.mean(diffs) / max_possible))
-
-    def _hands_above_shoulder_ratio(self, frames: list[GestureFrame]) -> float:
-        above = 0
-        total = 0
-        for f in frames:
-            if len(f.pose) < max(_LEFT_WRIST, _RIGHT_WRIST, _LEFT_SHOULDER, _RIGHT_SHOULDER) + 1:
-                continue
-            l_shoulder_y = f.pose[_LEFT_SHOULDER].y
-            r_shoulder_y = f.pose[_RIGHT_SHOULDER].y
-            shoulder_y = (l_shoulder_y + r_shoulder_y) / 2.0
-
-            l_wrist = f.pose[_LEFT_WRIST]
-            r_wrist = f.pose[_RIGHT_WRIST]
-            total += 1
-            # In image coords, smaller y = higher on screen
-            if (l_wrist.visibility > 0.3 and l_wrist.y < shoulder_y) or \
-               (r_wrist.visibility > 0.3 and r_wrist.y < shoulder_y):
-                above += 1
-        return above / max(total, 1)
-
-    def _estimate_gesture_rate(
-        self,
-        positions: list[Optional[tuple[float, float]]],
-        duration_s: float,
-    ) -> float:
-        """
-        Counts velocity peaks as a proxy for discrete gesture events.
-        """
-        if duration_s <= 0:
-            return 0.0
-        valid = [p for p in positions if p is not None]
-        if len(valid) < 3:
-            return 0.0
-
-        # Compute displacement series
-        displacements = []
-        for i in range(1, len(valid)):
-            dx = valid[i][0] - valid[i - 1][0]
-            dy = valid[i][1] - valid[i - 1][1]
-            displacements.append(math.sqrt(dx**2 + dy**2))
-
-        if not displacements:
-            return 0.0
-
-        arr = np.array(displacements)
-        threshold = np.mean(arr) + np.std(arr)
-        # Count zero-crossings above threshold as gesture events
-        peaks = 0
-        in_peak = False
-        for d in arr:
-            if d > threshold and not in_peak:
-                peaks += 1
-                in_peak = True
-            elif d <= threshold:
-                in_peak = False
-
-        return peaks / duration_s

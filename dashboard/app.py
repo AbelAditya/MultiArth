@@ -119,6 +119,8 @@ LABEL_STYLE = {
 
 CHART_CFG = {"displayModeBar": False}
 
+# (Pose-viewer skeleton constants live in the clientside JS callback below)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Layout helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -194,6 +196,47 @@ def _analysis_progress(state: str, message: str):
     })], style={"display": "flex", "alignItems": "center", "marginTop": "10px"})
 
 
+def _window_at_time(ws, t):
+    """Return the FusedWindow that contains timestamp t, else last window."""
+    if not ws:
+        return None
+    if t is None:
+        return ws[0]
+    for w in ws:
+        if w.window.start_s <= t < w.window.end_s:
+            return w
+    return ws[-1]
+
+
+def _initial_pose_figure():
+    """Empty pose canvas shown before any video is loaded."""
+    fig = go.Figure([
+        go.Scatter(x=[], y=[], mode="lines", showlegend=False, hoverinfo="skip",
+                   line=dict(color="rgba(155,145,140,0.38)", width=1.2)),
+        go.Scatter(x=[], y=[], mode="lines", showlegend=False, hoverinfo="skip",
+                   line=dict(color=C["gesture"], width=2.5)),
+        go.Scatter(x=[], y=[], mode="markers", showlegend=False, hoverinfo="skip",
+                   marker=dict(color="rgba(155,145,140,0.55)", size=4)),
+        go.Scatter(x=[], y=[], mode="markers", showlegend=False, hoverinfo="skip",
+                   marker=dict(color=C["gesture"], size=7,
+                               line=dict(color="white", width=1))),
+    ])
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#EDECF0",
+        margin=dict(l=10, r=90, t=16, b=52),
+        xaxis=dict(range=[0.1, 0.9], showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(range=[0.2, 1.0], showgrid=False, zeroline=False, showticklabels=False),
+        showlegend=False,
+        annotations=[dict(
+            x=0.5, y=0.6, showarrow=False, xanchor="center", yanchor="middle",
+            text="Upload a video to see pose animation",
+            font=dict(family="DM Mono, monospace", size=12, color=C["muted"]),
+        )],
+    )
+    return fig
+
+
 def empty_fig(title=""):
     fig = go.Figure()
     fig.update_layout(**PLOT_LAYOUT,
@@ -212,7 +255,7 @@ def add_cursor(fig, t):
 # ─────────────────────────────────────────────────────────────────────────────
 
 CHART_IDS = [
-    "g-velocity", "g-amplitude", "g-symmetry", "g-above-shoulder", "g-rate",
+    "g-velocity", "g-handedness",
     "p-f0", "p-intensity", "p-voiced", "p-jitter", "p-shimmer", "p-hnr",
     "v-filler", "v-ttr", "v-pauses", "v-hedge", "v-sent-len", "v-confidence",
     "c-shot", "c-cutrate", "c-facearea", "c-trend",
@@ -320,11 +363,52 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
         # ── GESTURE ──────────────────────────────────────────────────────
         html.Div(style=SECTION_STYLE, children=[
             section_header("Gesture", C["gesture"], "MediaPipe Holistic · Kinematic features"),
-            dcc.Graph(id="g-velocity",       style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="g-amplitude",      style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="g-symmetry",       style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="g-above-shoulder", style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="g-rate",           style={"height": "200px"}, config=CHART_CFG),
+
+            # ── Pose Viewer ───────────────────────────────────────────
+            html.Div(style={
+                "marginBottom": "28px",
+                "paddingBottom": "24px",
+                "borderBottom": f"1px solid {C['border']}",
+            }, children=[
+
+                # Segment selector row
+                html.Div(style={
+                    "display": "flex", "alignItems": "flex-end",
+                    "justifyContent": "space-between", "flexWrap": "wrap",
+                    "gap": "12px", "marginBottom": "14px",
+                }, children=[
+                    html.Div([
+                        html.P("BODY SEGMENT", style=LABEL_STYLE),
+                        html.Div([
+                            dbc.Button("Head / Face", id="seg-head",  size="sm",
+                                       outline=True, color="danger", className="me-2 mt-1"),
+                            dbc.Button("Arms",        id="seg-arms",  size="sm",
+                                       outline=True, color="danger", className="me-2 mt-1"),
+                            dbc.Button("Hands",       id="seg-hands", size="sm",
+                                       outline=True, color="danger", className="me-2 mt-1"),
+                            dbc.Button("Torso",       id="seg-torso", size="sm",
+                                       outline=True, color="danger", className="me-2 mt-1"),
+                            dbc.Button("Gaze",        id="seg-gaze",  size="sm",
+                                       outline=True, color="danger", className="mt-1"),
+                        ], style={"marginTop": "6px", "display": "flex", "flexWrap": "wrap"}),
+                    ]),
+                    html.P(
+                        "McNeil gesture space · X-L/R = extreme periphery · P = periphery · C = centre",
+                        style={**LABEL_STYLE, "margin": "0", "textAlign": "right", "maxWidth": "320px"},
+                    ),
+                ]),
+
+                # Skeleton canvas — animated clientside; initial figure set here
+                dcc.Graph(id="g-pose", style={"height": "460px"}, config=CHART_CFG,
+                          figure=_initial_pose_figure()),
+
+                # Handedness time-series
+                dcc.Graph(id="g-handedness", style={"height": "160px", "marginTop": "14px"},
+                          config=CHART_CFG),
+            ]),
+
+            # ── Kinematic time-series charts ──────────────────────────
+            dcc.Graph(id="g-velocity", style={"height": "200px"}, config=CHART_CFG),
         ]),
 
         # ── PROSODY ───────────────────────────────────────────────────────
@@ -363,7 +447,10 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
     dcc.Store(id="fused-data"),
     dcc.Store(id="current-time", data=0.0),
     dcc.Store(id="active-job-id"),
+    dcc.Store(id="pose-segment", data=None),
+    dcc.Store(id="pose-timeline", data=None),
     dcc.Interval(id="poll-interval", interval=2000, n_intervals=0, disabled=True),
+    dcc.Interval(id="pose-ticker", interval=67, n_intervals=0),  # ~15 fps animation
 ])
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -563,54 +650,238 @@ def g_velocity(data, ct):
     return add_cursor(fig, ct)
 
 
-@callback(Output("g-amplitude", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def g_amplitude(data, ct):
-    if not data: return empty_fig("Gesture Amplitude")
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pose viewer callbacks
+# ─────────────────────────────────────────────────────────────────────────────
+
+@callback(
+    Output("pose-segment", "data"),
+    Output("seg-head",  "outline"),
+    Output("seg-arms",  "outline"),
+    Output("seg-hands", "outline"),
+    Output("seg-torso", "outline"),
+    Output("seg-gaze",  "outline"),
+    Input("seg-head",  "n_clicks"),
+    Input("seg-arms",  "n_clicks"),
+    Input("seg-hands", "n_clicks"),
+    Input("seg-torso", "n_clicks"),
+    Input("seg-gaze",  "n_clicks"),
+    State("pose-segment", "data"),
+    prevent_initial_call=True,
+)
+def select_segment(_h, _a, _ha, _t, _g, current_seg):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return [dash.no_update] * 6
+    btn_id = ctx.triggered[0]["prop_id"].split(".")[0]
+    seg = {"seg-head": "head", "seg-arms": "arms",
+           "seg-hands": "hands", "seg-torso": "torso",
+           "seg-gaze": "gaze"}.get(btn_id)
+    selected = None if seg == current_seg else seg  # click same → deselect
+    outlines = {s: (selected != s) for s in ["head", "arms", "hands", "torso", "gaze"]}
+    return (selected,
+            outlines["head"], outlines["arms"],
+            outlines["hands"], outlines["torso"], outlines["gaze"])
+
+
+@callback(
+    Output("pose-timeline", "data"),
+    Input("fused-data", "data"),
+)
+def build_pose_timeline(data):
+    """Flatten all per-frame pose keyframes into one sorted timeline for clientside animation."""
+    if not data:
+        return None
+    ws, _ = _parse(data)
+    frames = []
+    for w in ws:
+        if not w.gesture:
+            continue
+        for kf in w.gesture.pose_keyframes:
+            frames.append({"ts": kf.ts, "px": kf.pose_x, "py": kf.pose_y, "pv": kf.pose_vis})
+    frames.sort(key=lambda f: f["ts"])
+    return {"frames": frames} if frames else None
+
+
+clientside_callback(
+    """
+    function(n, timeline, segment) {
+        if (!timeline || !timeline.frames || timeline.frames.length === 0)
+            return window.dash_clientside.no_update;
+
+        var video = document.getElementById('video-player');
+        if (!video || !video.src) return window.dash_clientside.no_update;
+        var t = video.currentTime;
+
+        // Binary-search nearest frame by timestamp
+        var frames = timeline.frames;
+        var lo = 0, hi = frames.length - 1;
+        while (lo < hi) {
+            var mid = (lo + hi) >> 1;
+            if (frames[mid].ts < t) lo = mid + 1; else hi = mid;
+        }
+        if (lo > 0 && Math.abs(frames[lo-1].ts - t) < Math.abs(frames[lo].ts - t)) lo--;
+        var f = frames[lo];
+        var px = f.px, py = f.py, pv = f.pv, n33 = px.length;
+        if (n33 < 33) return window.dash_clientside.no_update;
+
+        // Segment highlight sets
+        var SEG_LMS = {
+            head:  [0,1,2,3,4,5,6,7,8,9,10],
+            arms:  [11,12,13,14,15,16,17,18,19,20,21,22],
+            hands: [15,16,17,18,19,20,21,22],
+            torso: [11,12,23,24],
+            gaze:  [1,2,3,4,5,6]
+        };
+        var CONNECTIONS = [
+            [0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],[9,10],
+            [11,12],[11,23],[12,24],[23,24],
+            [11,13],[13,15],[15,17],[15,19],[15,21],[17,19],
+            [12,14],[14,16],[16,18],[16,20],[16,22],[18,20],
+            [23,25],[25,27],[27,29],[27,31],[29,31],
+            [24,26],[26,28],[28,30],[28,32],[30,32]
+        ];
+
+        var segSet = {};
+        if (segment && SEG_LMS[segment]) {
+            SEG_LMS[segment].forEach(function(i) { segSet[i] = true; });
+        }
+
+        // Build edge traces (normal + highlighted)
+        var nx=[], ny=[], hx=[], hy=[];
+        for (var e = 0; e < CONNECTIONS.length; e++) {
+            var i = CONNECTIONS[e][0], j = CONNECTIONS[e][1];
+            if (i >= n33 || j >= n33 || pv[i] < 0.15 || pv[j] < 0.15) continue;
+            var lit = segment && segSet[i] && segSet[j];
+            if (lit) { hx.push(px[i], px[j], null); hy.push(py[i], py[j], null); }
+            else      { nx.push(px[i], px[j], null); ny.push(py[i], py[j], null); }
+        }
+
+        // Build joint traces
+        var jx=[], jy=[], ljx=[], ljy=[];
+        for (var k = 0; k < n33; k++) {
+            if (pv[k] < 0.15) continue;
+            if (segment && segSet[k]) { ljx.push(px[k]); ljy.push(py[k]); }
+            else                      { jx.push(px[k]);  jy.push(py[k]); }
+        }
+
+        // McNeil grid anchored to body landmarks (y already flipped in Python)
+        var cx   = (px[11] + px[12]) / 2;
+        var sw   = Math.max(Math.abs(px[12] - px[11]), 0.05);
+        var ySho = (py[11] + py[12]) / 2;
+        var yHip = (py[23] + py[24]) / 2;
+        var yHd  = py[0];
+        var yCrn = yHd + sw * 0.28;
+        var yCh  = (ySho + yHip) / 2;
+        var xEL = cx - sw*1.8, xPL = cx - sw*0.9;
+        var xPR = cx + sw*0.9, xER = cx + sw*1.8;
+        var gc = 'rgba(90,110,190,0.22)', lc = 'rgba(90,110,190,0.48)';
+
+        var shapes = [
+            {type:'rect', x0:xEL, y0:yHip-0.01, x1:xER, y1:yCrn+0.01,
+             fillcolor:'rgba(90,110,190,0.04)', line:{color:gc, width:1}},
+            {type:'rect', x0:xPL, y0:yHip-0.01, x1:xPR, y1:yCrn+0.01,
+             fillcolor:'rgba(90,110,190,0.06)', line:{width:0}}
+        ];
+        [xEL, xPL, cx, xPR, xER].forEach(function(gx) {
+            shapes.push({type:'line', x0:gx, y0:yHip-0.02, x1:gx, y1:yCrn+0.02,
+                line:{color:gc, width:1, dash:'dot'}});
+        });
+        [yCrn, yHd, ySho, yCh, yHip].forEach(function(gy) {
+            shapes.push({type:'line', x0:xEL-0.01, y0:gy, x1:xER+0.01, y1:gy,
+                line:{color:gc, width:1, dash:'dot'}});
+        });
+
+        var annotations = [
+            {x:xEL, y:yHip-0.03, text:'X-L', showarrow:false,
+             xanchor:'center', yanchor:'top', font:{family:'DM Mono, monospace', size:7, color:lc}},
+            {x:xPL, y:yHip-0.03, text:'P-L', showarrow:false,
+             xanchor:'center', yanchor:'top', font:{family:'DM Mono, monospace', size:7, color:lc}},
+            {x:cx,  y:yHip-0.03, text:'C',   showarrow:false,
+             xanchor:'center', yanchor:'top', font:{family:'DM Mono, monospace', size:7, color:lc}},
+            {x:xPR, y:yHip-0.03, text:'P-R', showarrow:false,
+             xanchor:'center', yanchor:'top', font:{family:'DM Mono, monospace', size:7, color:lc}},
+            {x:xER, y:yHip-0.03, text:'X-R', showarrow:false,
+             xanchor:'center', yanchor:'top', font:{family:'DM Mono, monospace', size:7, color:lc}},
+            {x:xER+0.015, y:yCrn, text:'Crown',    showarrow:false,
+             xanchor:'left', yanchor:'middle', font:{family:'DM Mono, monospace', size:7, color:lc}},
+            {x:xER+0.015, y:yHd,  text:'Head',     showarrow:false,
+             xanchor:'left', yanchor:'middle', font:{family:'DM Mono, monospace', size:7, color:lc}},
+            {x:xER+0.015, y:ySho, text:'Shoulder', showarrow:false,
+             xanchor:'left', yanchor:'middle', font:{family:'DM Mono, monospace', size:7, color:lc}},
+            {x:xER+0.015, y:yCh,  text:'Center',   showarrow:false,
+             xanchor:'left', yanchor:'middle', font:{family:'DM Mono, monospace', size:7, color:lc}},
+            {x:xER+0.015, y:yHip, text:'Waist',    showarrow:false,
+             xanchor:'left', yanchor:'middle', font:{family:'DM Mono, monospace', size:7, color:lc}}
+        ];
+
+        // Centered view bounds
+        var vx=[], vy=[];
+        for (var m = 0; m < n33; m++) {
+            if (pv[m] > 0.15) { vx.push(px[m]); vy.push(py[m]); }
+        }
+        var minX=Math.min.apply(null,vx), maxX=Math.max.apply(null,vx);
+        var minY=Math.min.apply(null,vy), maxY=Math.max.apply(null,vy);
+        var bspan = Math.max(maxX-minX, maxY-minY, 0.3) * 1.4;
+        var bcx=(minX+maxX)/2, bcy=(minY+maxY)/2;
+
+        return {
+            data: [
+                {x:nx, y:ny, type:'scatter', mode:'lines', showlegend:false, hoverinfo:'skip',
+                 line:{color:'rgba(155,145,140,0.38)', width:1.2}},
+                {x:hx, y:hy, type:'scatter', mode:'lines', showlegend:false, hoverinfo:'skip',
+                 line:{color:'#C84B31', width:2.5}},
+                {x:jx, y:jy, type:'scatter', mode:'markers', showlegend:false, hoverinfo:'skip',
+                 marker:{color:'rgba(155,145,140,0.55)', size:4}},
+                {x:ljx, y:ljy, type:'scatter', mode:'markers', showlegend:false, hoverinfo:'skip',
+                 marker:{color:'#C84B31', size:7, line:{color:'white', width:1}}}
+            ],
+            layout: {
+                paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'#EDECF0',
+                margin:{l:10, r:90, t:16, b:52},
+                xaxis:{range:[bcx-bspan*0.56, bcx+bspan*0.56],
+                       showgrid:false, zeroline:false, showticklabels:false},
+                yaxis:{range:[bcy-bspan*0.56, bcy+bspan*0.56],
+                       showgrid:false, zeroline:false, showticklabels:false},
+                showlegend:false, shapes:shapes, annotations:annotations
+            }
+        };
+    }
+    """,
+    Output("g-pose", "figure"),
+    Input("pose-ticker", "n_intervals"),
+    State("pose-timeline", "data"),
+    State("pose-segment", "data"),
+)
+
+
+@callback(Output("g-handedness", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
+def g_handedness(data, ct):
+    if not data:
+        return empty_fig("Handedness  (R−L) / (R+L)")
     ws, t = _parse(data)
-    fig = go.Figure(go.Bar(
-        x=t, y=[w.gesture.gesture_amplitude if w.gesture else None for w in ws],
-        marker_color=C["gesture"], marker_opacity=0.7, name="px",
+    y = [w.gesture.handedness_ratio if w.gesture else None for w in ws]
+    fig = go.Figure()
+    fig.add_hline(y=0, line=dict(color=C["muted"], width=1, dash="dash"))
+    fig.add_trace(go.Scatter(
+        x=t, y=y, mode="lines+markers",
+        line=dict(color=C["gesture"], width=2),
+        marker=dict(size=5),
+        name="(R−L)/(R+L)",
     ))
-    _style(fig, "Gesture Amplitude", "px")
+    layout = {**PLOT_LAYOUT}
+    layout["yaxis"] = {**PLOT_LAYOUT["yaxis"],
+                       "range": [-1.05, 1.05],
+                       "title": dict(text="← Left  |  Right →", font=dict(size=9, color=C["muted"])),
+                       "tickvals": [-1, -0.5, 0, 0.5, 1],
+                       "ticktext": ["-1", "-0.5", "0", "0.5", "1"]}
+    layout["title"] = dict(text="Handedness  (R−L) / (R+L)", font=dict(size=11, color=C["muted"]))
+    fig.update_layout(**layout)
     return add_cursor(fig, ct)
 
-
-@callback(Output("g-symmetry", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def g_symmetry(data, ct):
-    if not data: return empty_fig("Bilateral Symmetry")
-    ws, t = _parse(data)
-    fig = go.Figure(go.Scatter(
-        x=t, y=[w.gesture.bilateral_symmetry_score if w.gesture else None for w in ws],
-        mode="lines+markers", line=dict(color=C["gesture"], width=1.5),
-        marker=dict(size=4), name="score",
-    ))
-    fig.add_hline(y=0.5, line=dict(color=C["muted"], width=1, dash="dash"))
-    _style(fig, "Bilateral Symmetry", "0–1")
-    return add_cursor(fig, ct)
-
-
-@callback(Output("g-above-shoulder", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def g_above_shoulder(data, ct):
-    if not data: return empty_fig("Hands Above Shoulder")
-    ws, t = _parse(data)
-    fig = go.Figure(go.Bar(
-        x=t, y=[w.gesture.hands_above_shoulder_ratio * 100 if w.gesture else None for w in ws],
-        marker_color=C["gesture"], marker_opacity=0.6, name="%",
-    ))
-    _style(fig, "Hands Above Shoulder", "%")
-    return add_cursor(fig, ct)
-
-
-@callback(Output("g-rate", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def g_rate(data, ct):
-    if not data: return empty_fig("Gesture Rate")
-    ws, t = _parse(data)
-    fig = go.Figure(go.Scatter(
-        x=t, y=[w.gesture.gesture_rate if w.gesture else None for w in ws],
-        mode="lines", line=dict(color=C["gesture"], width=2), name="evt/s",
-    ))
-    _style(fig, "Gesture Rate", "events/s")
-    return add_cursor(fig, ct)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Chart callbacks — Prosody

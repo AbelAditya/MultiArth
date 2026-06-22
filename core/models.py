@@ -50,16 +50,24 @@ class GestureFrame(BaseModel):
     right_hand: list[Landmark]    # 21 landmarks, empty list if not detected
 
 
+class PoseKeyframe(BaseModel):
+    """Lightweight normalised pose snapshot for the timeline animation viewer."""
+    ts: float                  # timestamp in seconds
+    pose_x: list[float]        # 33 normalised x-coords [0, 1]
+    pose_y: list[float]        # 33 normalised y-coords, already flipped (1 − raw_y) so up = high
+    pose_vis: list[float]      # 33 visibility scores
+
+
 class GestureFeatures(BaseModel):
     """Aggregated gesture features over a time window."""
     window: TimeWindow
     mean_wrist_velocity: float             # pixels/s, averaged L+R
     max_wrist_displacement: float          # peak displacement in window
-    gesture_amplitude: float               # bounding-box diagonal of hand motion
-    bilateral_symmetry_score: float        # 0–1, 1 = perfectly symmetric
-    hands_above_shoulder_ratio: float      # fraction of frames hands are raised
-    gesture_rate: float                    # gesture events per second (heuristic)
     pose_present_ratio: float              # fraction of frames pose was detected
+    # Handedness: −1 = fully left-dominant, 0 = bilateral, +1 = fully right-dominant
+    handedness_ratio: float = 0.0
+    # Per-frame pose data (subsampled) for the animated pose viewer
+    pose_keyframes: list[PoseKeyframe] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

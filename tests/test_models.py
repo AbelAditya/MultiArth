@@ -39,10 +39,6 @@ class TestGestureFeatures:
             window=make_window(),
             mean_wrist_velocity=12.5,
             max_wrist_displacement=80.0,
-            gesture_amplitude=120.0,
-            bilateral_symmetry_score=0.75,
-            hands_above_shoulder_ratio=0.3,
-            gesture_rate=1.2,
             pose_present_ratio=0.95,
         )
         raw = gf.model_dump_json()
@@ -97,10 +93,6 @@ class TestFusedWindow:
                 window=make_window(),
                 mean_wrist_velocity=0,
                 max_wrist_displacement=0,
-                gesture_amplitude=0,
-                bilateral_symmetry_score=0,
-                hands_above_shoulder_ratio=0,
-                gesture_rate=0,
                 pose_present_ratio=0,
             ),
             prosody=ProsodyFeatures(
