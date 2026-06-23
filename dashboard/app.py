@@ -14,7 +14,6 @@ import os
 import threading
 import uuid as _uuid_module
 from pathlib import Path
-from typing import Optional
 
 import dash
 import dash_bootstrap_components as dbc
@@ -119,8 +118,6 @@ LABEL_STYLE = {
 
 CHART_CFG = {"displayModeBar": False}
 
-# (Pose-viewer skeleton constants live in the clientside JS callback below)
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Layout helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -196,47 +193,6 @@ def _analysis_progress(state: str, message: str):
     })], style={"display": "flex", "alignItems": "center", "marginTop": "10px"})
 
 
-def _window_at_time(ws, t):
-    """Return the FusedWindow that contains timestamp t, else last window."""
-    if not ws:
-        return None
-    if t is None:
-        return ws[0]
-    for w in ws:
-        if w.window.start_s <= t < w.window.end_s:
-            return w
-    return ws[-1]
-
-
-def _initial_pose_figure():
-    """Empty pose canvas shown before any video is loaded."""
-    fig = go.Figure([
-        go.Scatter(x=[], y=[], mode="lines", showlegend=False, hoverinfo="skip",
-                   line=dict(color="rgba(155,145,140,0.38)", width=1.2)),
-        go.Scatter(x=[], y=[], mode="lines", showlegend=False, hoverinfo="skip",
-                   line=dict(color=C["gesture"], width=2.5)),
-        go.Scatter(x=[], y=[], mode="markers", showlegend=False, hoverinfo="skip",
-                   marker=dict(color="rgba(155,145,140,0.55)", size=4)),
-        go.Scatter(x=[], y=[], mode="markers", showlegend=False, hoverinfo="skip",
-                   marker=dict(color=C["gesture"], size=7,
-                               line=dict(color="white", width=1))),
-    ])
-    fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="#EDECF0",
-        margin=dict(l=10, r=90, t=16, b=52),
-        xaxis=dict(range=[0.1, 0.9], showgrid=False, zeroline=False, showticklabels=False),
-        yaxis=dict(range=[0.2, 1.0], showgrid=False, zeroline=False, showticklabels=False),
-        showlegend=False,
-        annotations=[dict(
-            x=0.5, y=0.6, showarrow=False, xanchor="center", yanchor="middle",
-            text="Upload a video to see pose animation",
-            font=dict(family="DM Mono, monospace", size=12, color=C["muted"]),
-        )],
-    )
-    return fig
-
-
 def empty_fig(title=""):
     fig = go.Figure()
     fig.update_layout(**PLOT_LAYOUT,
@@ -299,18 +255,10 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
             "display": "flex", "gap": "14px", "flexWrap": "wrap", "marginBottom": "28px",
         }),
 
-        # ── Video section ─────────────────────────────────────────────────
+        # ── GESTURE ──────────────────────────────────────────────────────
         html.Div(style=SECTION_STYLE, children=[
-            section_header("Video Player", C["muted"], "Upload a video to analyse · click any chart to seek"),
-            html.Video(
-                id="video-player",
-                controls=True,
-                style={
-                    "width": "100%", "maxHeight": "520px",
-                    "borderRadius": "8px", "backgroundColor": "#111",
-                    "display": "block",
-                },
-            ),
+            section_header("Gesture", C["gesture"], "MediaPipe Holistic · Kinematic features"),
+
             # Upload drop zone
             dcc.Upload(
                 id="video-upload",
@@ -332,37 +280,11 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                     "border": f"1px dashed {C['border']}",
                     "borderRadius": "8px",
                     "cursor": "pointer",
-                    "marginTop": "16px",
+                    "marginBottom": "12px",
                     "backgroundColor": C["bg"],
                 },
             ),
-            # Analysis progress indicator
-            html.Div(id="analysis-status"),
-            # Meta row
-            html.Div(style={
-                "display": "flex", "gap": "32px", "alignItems": "flex-end",
-                "marginTop": "16px", "flexWrap": "wrap",
-            }, children=[
-                html.Div([
-                    html.P("CURRENT TIME", style=LABEL_STYLE),
-                    html.P(id="current-time-display", children="—", style={
-                        "fontFamily": "Fraunces, serif", "fontSize": "2rem",
-                        "color": C["cursor"], "margin": "4px 0 0 0", "lineHeight": "1",
-                    }),
-                ]),
-                html.Div(style={"flex": "1", "minWidth": "200px"}, children=[
-                    html.P("CURRENT WINDOW", style=LABEL_STYLE),
-                    html.P(id="current-window-display", children="—", style={
-                        "fontFamily": "DM Mono, monospace", "fontSize": "11px",
-                        "color": C["text"], "margin": "4px 0 0 0",
-                    }),
-                ]),
-            ]),
-        ]),
-
-        # ── GESTURE ──────────────────────────────────────────────────────
-        html.Div(style=SECTION_STYLE, children=[
-            section_header("Gesture", C["gesture"], "MediaPipe Holistic · Kinematic features"),
+            html.Div(id="analysis-status", style={"marginBottom": "16px"}),
 
             # ── Pose Viewer ───────────────────────────────────────────
             html.Div(style={
@@ -371,7 +293,7 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                 "borderBottom": f"1px solid {C['border']}",
             }, children=[
 
-                # Segment selector row
+                # Controls row: segment selector + landmark toggle
                 html.Div(style={
                     "display": "flex", "alignItems": "flex-end",
                     "justifyContent": "space-between", "flexWrap": "wrap",
@@ -392,18 +314,54 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                                        outline=True, color="danger", className="mt-1"),
                         ], style={"marginTop": "6px", "display": "flex", "flexWrap": "wrap"}),
                     ]),
-                    html.P(
-                        "McNeil gesture space · X-L/R = extreme periphery · P = periphery · C = centre",
-                        style={**LABEL_STYLE, "margin": "0", "textAlign": "right", "maxWidth": "320px"},
-                    ),
+                    html.Div([
+                        html.P("POSE OVERLAY", style=LABEL_STYLE),
+                        dbc.Button("Landmarks  ON", id="landmark-toggle", size="sm",
+                                   color="success", className="mt-1", disabled=True),
+                    ]),
                 ]),
 
-                # Skeleton canvas — animated clientside; initial figure set here
-                dcc.Graph(id="g-pose", style={"height": "460px"}, config=CHART_CFG,
-                          figure=_initial_pose_figure()),
+                # Video with transparent landmark canvas overlay
+                html.Div(style={"position": "relative", "lineHeight": "0"}, children=[
+                    html.Video(
+                        id="video-player",
+                        controls=True,
+                        style={
+                            "width": "100%", "maxHeight": "520px",
+                            "display": "block", "borderRadius": "8px",
+                            "backgroundColor": "#000",
+                        },
+                    ),
+                    html.Canvas(id="pose-canvas", style={
+                        "position": "absolute", "top": "0", "left": "0",
+                        "width": "100%", "height": "100%",
+                        "pointerEvents": "none", "borderRadius": "8px",
+                    }),
+                ]),
+
+                # Time / window info below the video
+                html.Div(style={
+                    "display": "flex", "gap": "32px", "alignItems": "flex-end",
+                    "marginTop": "12px", "flexWrap": "wrap",
+                }, children=[
+                    html.Div([
+                        html.P("CURRENT TIME", style=LABEL_STYLE),
+                        html.P(id="current-time-display", children="—", style={
+                            "fontFamily": "Fraunces, serif", "fontSize": "2rem",
+                            "color": C["cursor"], "margin": "4px 0 0 0", "lineHeight": "1",
+                        }),
+                    ]),
+                    html.Div(style={"flex": "1", "minWidth": "200px"}, children=[
+                        html.P("CURRENT WINDOW", style=LABEL_STYLE),
+                        html.P(id="current-window-display", children="—", style={
+                            "fontFamily": "DM Mono, monospace", "fontSize": "11px",
+                            "color": C["text"], "margin": "4px 0 0 0",
+                        }),
+                    ]),
+                ]),
 
                 # Handedness time-series
-                dcc.Graph(id="g-handedness", style={"height": "160px", "marginTop": "14px"},
+                dcc.Graph(id="g-handedness", style={"height": "160px", "marginTop": "20px"},
                           config=CHART_CFG),
             ]),
 
@@ -449,6 +407,8 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
     dcc.Store(id="active-job-id"),
     dcc.Store(id="pose-segment", data=None),
     dcc.Store(id="pose-timeline", data=None),
+    dcc.Store(id="pose-render-dummy"),
+    dcc.Store(id="landmarks-visible", data=True),
     dcc.Interval(id="poll-interval", interval=2000, n_intervals=0, disabled=True),
     dcc.Interval(id="pose-ticker", interval=67, n_intervals=0),  # ~15 fps animation
 ])
@@ -502,13 +462,14 @@ _UPLOAD_DIR = Path("/tmp/mannerism/uploads")
     Output("poll-interval", "disabled"),
     Output("video-player", "src"),
     Output("analysis-status", "children"),
+    Output("landmark-toggle", "disabled"),
     Input("video-upload", "contents"),
     State("video-upload", "filename"),
     prevent_initial_call=True,
 )
 def handle_upload(contents, filename):
     if not contents:
-        return dash.no_update, True, dash.no_update, dash.no_update
+        return dash.no_update, True, dash.no_update, dash.no_update, dash.no_update
 
     _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     _, b64 = contents.split(",", 1)
@@ -527,7 +488,7 @@ def handle_upload(contents, filename):
     ).start()
 
     video_src = f"/video?t={os.path.getmtime(video_path)}"
-    return job_id, False, video_src, _analysis_progress("running", f"Analysing {filename}…")
+    return job_id, False, video_src, _analysis_progress("running", f"Analysing {filename}…"), True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -538,17 +499,18 @@ def handle_upload(contents, filename):
     Output("fused-data", "data", allow_duplicate=True),
     Output("analysis-status", "children", allow_duplicate=True),
     Output("poll-interval", "disabled", allow_duplicate=True),
+    Output("landmark-toggle", "disabled", allow_duplicate=True),
     Input("poll-interval", "n_intervals"),
     State("active-job-id", "data"),
     prevent_initial_call=True,
 )
 def poll_analysis(_, job_id):
     if not job_id:
-        return dash.no_update, dash.no_update, True
+        return dash.no_update, dash.no_update, True, dash.no_update
 
     status = store.get_status(job_id)
     if status is None:
-        return dash.no_update, dash.no_update, True
+        return dash.no_update, dash.no_update, True, dash.no_update
 
     if status.value == "done":
         windows = store.get_all_fused(job_id)
@@ -557,6 +519,7 @@ def poll_analysis(_, job_id):
             serialised,
             _analysis_progress("done", f"Analysis complete — {len(windows)} windows"),
             True,
+            False,  # enable landmark toggle
         )
 
     if status.value == "failed":
@@ -564,6 +527,7 @@ def poll_analysis(_, job_id):
             dash.no_update,
             _analysis_progress("failed", "Analysis failed — check server logs"),
             True,
+            dash.no_update,
         )
 
     # Still running — show last log event as progress hint
@@ -573,12 +537,9 @@ def poll_analysis(_, job_id):
         dash.no_update,
         _analysis_progress("running", msg),
         False,
+        dash.no_update,
     )
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Load job data
-# ─────────────────────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────────
 # KPI strip
@@ -635,21 +596,15 @@ def update_window_display(t, data):
 
 @callback(Output("g-velocity", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
 def g_velocity(data, ct):
-    print(f"[debug] g_velocity called: data={'None' if not data else f'{len(data)} windows'}, ct={ct}")
     if not data: return empty_fig("Wrist Velocity")
     ws, t = _parse(data)
-    print(f"[debug] g_velocity: {len(ws)} parsed, t={t[:3]}...")
-    y = [w.gesture.mean_wrist_velocity if w.gesture else None for w in ws]
-    print(f"[debug] g_velocity y (first 3): {y[:3]}")
     fig = go.Figure(go.Scatter(
-        x=t, y=y,
+        x=t, y=[w.gesture.mean_wrist_velocity if w.gesture else None for w in ws],
         mode="lines", line=dict(color=C["gesture"], width=2),
         fill="tozeroy", fillcolor="rgba(200,75,49,0.08)", name="px/s",
     ))
     _style(fig, "Wrist Velocity", "px/s")
     return add_cursor(fig, ct)
-
-
 
 
 
@@ -708,15 +663,48 @@ def build_pose_timeline(data):
 
 clientside_callback(
     """
-    function(n, timeline, segment) {
-        if (!timeline || !timeline.frames || timeline.frames.length === 0)
+    function(n, timeline, segment, visible) {
+        var canvas = document.getElementById('pose-canvas');
+        var video  = document.getElementById('video-player');
+        if (!canvas || !video || !video.src) return window.dash_clientside.no_update;
+
+        var el_w = video.offsetWidth, el_h = video.offsetHeight;
+        if (!el_w || !el_h) return window.dash_clientside.no_update;
+
+        // Compute the actual rendered frame rect inside the element box.
+        // The browser fits the video with object-fit:contain semantics (aspect-ratio
+        // preserved, centred, letterboxed/pillarboxed as needed by maxHeight etc.).
+        var vid_w = video.videoWidth, vid_h = video.videoHeight;
+        var frame_w, frame_h, frame_x, frame_y;
+        if (vid_w && vid_h) {
+            var scale = Math.min(el_w / vid_w, el_h / vid_h);
+            frame_w = Math.round(vid_w * scale);
+            frame_h = Math.round(vid_h * scale);
+            frame_x = Math.round((el_w - frame_w) / 2);
+            frame_y = Math.round((el_h - frame_h) / 2);
+        } else {
+            // Metadata not loaded yet — use full element, will correct next tick.
+            frame_w = el_w; frame_h = el_h; frame_x = 0; frame_y = 0;
+        }
+
+        // Position the canvas to exactly cover the rendered frame (not the full element).
+        if (canvas.width !== frame_w || canvas.height !== frame_h) {
+            canvas.width  = frame_w;
+            canvas.height = frame_h;
+        }
+        canvas.style.left   = frame_x + 'px';
+        canvas.style.top    = frame_y + 'px';
+        canvas.style.width  = frame_w + 'px';
+        canvas.style.height = frame_h + 'px';
+
+        var ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, frame_w, frame_h);
+
+        if (!visible || !timeline || !timeline.frames || timeline.frames.length === 0)
             return window.dash_clientside.no_update;
 
-        var video = document.getElementById('video-player');
-        if (!video || !video.src) return window.dash_clientside.no_update;
+        // Binary-search nearest keyframe by timestamp
         var t = video.currentTime;
-
-        // Binary-search nearest frame by timestamp
         var frames = timeline.frames;
         var lo = 0, hi = frames.length - 1;
         while (lo < hi) {
@@ -728,7 +716,14 @@ clientside_callback(
         var px = f.px, py = f.py, pv = f.pv, n33 = px.length;
         if (n33 < 33) return window.dash_clientside.no_update;
 
-        // Segment highlight sets
+        // Convert normalised coords → canvas pixels
+        // py is stored y-flipped (1 − raw_y); canvas y=0 is top, so un-flip
+        var cx_arr = new Float32Array(n33), cy_arr = new Float32Array(n33);
+        for (var m = 0; m < n33; m++) {
+            cx_arr[m] = px[m] * frame_w;
+            cy_arr[m] = (1 - py[m]) * frame_h;
+        }
+
         var SEG_LMS = {
             head:  [0,1,2,3,4,5,6,7,8,9,10],
             arms:  [11,12,13,14,15,16,17,18,19,20,21,22],
@@ -746,115 +741,65 @@ clientside_callback(
         ];
 
         var segSet = {};
-        if (segment && SEG_LMS[segment]) {
+        if (segment && SEG_LMS[segment])
             SEG_LMS[segment].forEach(function(i) { segSet[i] = true; });
-        }
 
-        // Build edge traces (normal + highlighted)
-        var nx=[], ny=[], hx=[], hy=[];
+        var normalEdge = 'rgba(255,255,255,0.60)';
+        var hlEdge     = '#C84B31';
+
+        // Draw edges
         for (var e = 0; e < CONNECTIONS.length; e++) {
             var i = CONNECTIONS[e][0], j = CONNECTIONS[e][1];
             if (i >= n33 || j >= n33 || pv[i] < 0.15 || pv[j] < 0.15) continue;
             var lit = segment && segSet[i] && segSet[j];
-            if (lit) { hx.push(px[i], px[j], null); hy.push(py[i], py[j], null); }
-            else      { nx.push(px[i], px[j], null); ny.push(py[i], py[j], null); }
+            ctx.beginPath();
+            ctx.moveTo(cx_arr[i], cy_arr[i]);
+            ctx.lineTo(cx_arr[j], cy_arr[j]);
+            ctx.strokeStyle = lit ? hlEdge : normalEdge;
+            ctx.lineWidth   = lit ? 3 : 1.5;
+            ctx.stroke();
         }
 
-        // Build joint traces
-        var jx=[], jy=[], ljx=[], ljy=[];
+        // Draw joints
         for (var k = 0; k < n33; k++) {
             if (pv[k] < 0.15) continue;
-            if (segment && segSet[k]) { ljx.push(px[k]); ljy.push(py[k]); }
-            else                      { jx.push(px[k]);  jy.push(py[k]); }
-        }
-
-        // McNeil grid anchored to body landmarks (y already flipped in Python)
-        var cx   = (px[11] + px[12]) / 2;
-        var sw   = Math.max(Math.abs(px[12] - px[11]), 0.05);
-        var ySho = (py[11] + py[12]) / 2;
-        var yHip = (py[23] + py[24]) / 2;
-        var yHd  = py[0];
-        var yCrn = yHd + sw * 0.28;
-        var yCh  = (ySho + yHip) / 2;
-        var xEL = cx - sw*1.8, xPL = cx - sw*0.9;
-        var xPR = cx + sw*0.9, xER = cx + sw*1.8;
-        var gc = 'rgba(90,110,190,0.22)', lc = 'rgba(90,110,190,0.48)';
-
-        var shapes = [
-            {type:'rect', x0:xEL, y0:yHip-0.01, x1:xER, y1:yCrn+0.01,
-             fillcolor:'rgba(90,110,190,0.04)', line:{color:gc, width:1}},
-            {type:'rect', x0:xPL, y0:yHip-0.01, x1:xPR, y1:yCrn+0.01,
-             fillcolor:'rgba(90,110,190,0.06)', line:{width:0}}
-        ];
-        [xEL, xPL, cx, xPR, xER].forEach(function(gx) {
-            shapes.push({type:'line', x0:gx, y0:yHip-0.02, x1:gx, y1:yCrn+0.02,
-                line:{color:gc, width:1, dash:'dot'}});
-        });
-        [yCrn, yHd, ySho, yCh, yHip].forEach(function(gy) {
-            shapes.push({type:'line', x0:xEL-0.01, y0:gy, x1:xER+0.01, y1:gy,
-                line:{color:gc, width:1, dash:'dot'}});
-        });
-
-        var annotations = [
-            {x:xEL, y:yHip-0.03, text:'X-L', showarrow:false,
-             xanchor:'center', yanchor:'top', font:{family:'DM Mono, monospace', size:7, color:lc}},
-            {x:xPL, y:yHip-0.03, text:'P-L', showarrow:false,
-             xanchor:'center', yanchor:'top', font:{family:'DM Mono, monospace', size:7, color:lc}},
-            {x:cx,  y:yHip-0.03, text:'C',   showarrow:false,
-             xanchor:'center', yanchor:'top', font:{family:'DM Mono, monospace', size:7, color:lc}},
-            {x:xPR, y:yHip-0.03, text:'P-R', showarrow:false,
-             xanchor:'center', yanchor:'top', font:{family:'DM Mono, monospace', size:7, color:lc}},
-            {x:xER, y:yHip-0.03, text:'X-R', showarrow:false,
-             xanchor:'center', yanchor:'top', font:{family:'DM Mono, monospace', size:7, color:lc}},
-            {x:xER+0.015, y:yCrn, text:'Crown',    showarrow:false,
-             xanchor:'left', yanchor:'middle', font:{family:'DM Mono, monospace', size:7, color:lc}},
-            {x:xER+0.015, y:yHd,  text:'Head',     showarrow:false,
-             xanchor:'left', yanchor:'middle', font:{family:'DM Mono, monospace', size:7, color:lc}},
-            {x:xER+0.015, y:ySho, text:'Shoulder', showarrow:false,
-             xanchor:'left', yanchor:'middle', font:{family:'DM Mono, monospace', size:7, color:lc}},
-            {x:xER+0.015, y:yCh,  text:'Center',   showarrow:false,
-             xanchor:'left', yanchor:'middle', font:{family:'DM Mono, monospace', size:7, color:lc}},
-            {x:xER+0.015, y:yHip, text:'Waist',    showarrow:false,
-             xanchor:'left', yanchor:'middle', font:{family:'DM Mono, monospace', size:7, color:lc}}
-        ];
-
-        // Centered view bounds
-        var vx=[], vy=[];
-        for (var m = 0; m < n33; m++) {
-            if (pv[m] > 0.15) { vx.push(px[m]); vy.push(py[m]); }
-        }
-        var minX=Math.min.apply(null,vx), maxX=Math.max.apply(null,vx);
-        var minY=Math.min.apply(null,vy), maxY=Math.max.apply(null,vy);
-        var bspan = Math.max(maxX-minX, maxY-minY, 0.3) * 1.4;
-        var bcx=(minX+maxX)/2, bcy=(minY+maxY)/2;
-
-        return {
-            data: [
-                {x:nx, y:ny, type:'scatter', mode:'lines', showlegend:false, hoverinfo:'skip',
-                 line:{color:'rgba(155,145,140,0.38)', width:1.2}},
-                {x:hx, y:hy, type:'scatter', mode:'lines', showlegend:false, hoverinfo:'skip',
-                 line:{color:'#C84B31', width:2.5}},
-                {x:jx, y:jy, type:'scatter', mode:'markers', showlegend:false, hoverinfo:'skip',
-                 marker:{color:'rgba(155,145,140,0.55)', size:4}},
-                {x:ljx, y:ljy, type:'scatter', mode:'markers', showlegend:false, hoverinfo:'skip',
-                 marker:{color:'#C84B31', size:7, line:{color:'white', width:1}}}
-            ],
-            layout: {
-                paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'#EDECF0',
-                margin:{l:10, r:90, t:16, b:52},
-                xaxis:{range:[bcx-bspan*0.56, bcx+bspan*0.56],
-                       showgrid:false, zeroline:false, showticklabels:false},
-                yaxis:{range:[bcy-bspan*0.56, bcy+bspan*0.56],
-                       showgrid:false, zeroline:false, showticklabels:false},
-                showlegend:false, shapes:shapes, annotations:annotations
+            var litJ = segment && segSet[k];
+            ctx.beginPath();
+            ctx.arc(cx_arr[k], cy_arr[k], litJ ? 5 : 3, 0, 2 * Math.PI);
+            ctx.fillStyle = litJ ? hlEdge : 'rgba(255,255,255,0.80)';
+            ctx.fill();
+            if (litJ) {
+                ctx.strokeStyle = 'white';
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
             }
-        };
+        }
+
+        return window.dash_clientside.no_update;
     }
     """,
-    Output("g-pose", "figure"),
+    Output("pose-render-dummy", "data"),
     Input("pose-ticker", "n_intervals"),
     State("pose-timeline", "data"),
     State("pose-segment", "data"),
+    State("landmarks-visible", "data"),
+)
+
+
+clientside_callback(
+    """
+    function(n, visible) {
+        var nu = window.dash_clientside.no_update;
+        if (n === null || n === undefined) return [nu, nu, nu];
+        var on = !visible;
+        return [on, on ? 'Landmarks  ON' : 'Landmarks  OFF', on ? 'success' : 'danger'];
+    }
+    """,
+    Output("landmarks-visible", "data"),
+    Output("landmark-toggle", "children"),
+    Output("landmark-toggle", "color"),
+    Input("landmark-toggle", "n_clicks"),
+    State("landmarks-visible", "data"),
 )
 
 
@@ -1134,7 +1079,6 @@ def _parse(data):
         except Exception as e:
             import traceback
             print(f"[dashboard] _parse failed on window {i}: {e}\n{traceback.format_exc()}")
-    print(f"[debug] _parse: {len(data)} raw → {len(ws)} parsed windows")
     return ws, [w.window.midpoint for w in ws]
 
 def _mean(vals):
