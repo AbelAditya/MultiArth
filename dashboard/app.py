@@ -303,15 +303,15 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                         html.P("BODY SEGMENT", style=LABEL_STYLE),
                         html.Div([
                             dbc.Button("Head / Face", id="seg-head",  size="sm",
-                                       outline=True, color="danger", className="me-2 mt-1"),
+                                       outline=True, color="primary", className="me-2 mt-1"),
                             dbc.Button("Arms",        id="seg-arms",  size="sm",
-                                       outline=True, color="danger", className="me-2 mt-1"),
+                                       outline=True, color="warning", className="me-2 mt-1"),
                             dbc.Button("Hands",       id="seg-hands", size="sm",
-                                       outline=True, color="danger", className="me-2 mt-1"),
+                                       outline=True, color="danger",  className="me-2 mt-1"),
                             dbc.Button("Torso",       id="seg-torso", size="sm",
-                                       outline=True, color="danger", className="me-2 mt-1"),
+                                       outline=True, color="success", className="me-2 mt-1"),
                             dbc.Button("Gaze",        id="seg-gaze",  size="sm",
-                                       outline=True, color="danger", className="mt-1"),
+                                       outline=True, color="info",    className="mt-1"),
                         ], style={"marginTop": "6px", "display": "flex", "flexWrap": "wrap"}),
                     ]),
                     html.Div([
@@ -405,7 +405,7 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
     dcc.Store(id="fused-data"),
     dcc.Store(id="current-time", data=0.0),
     dcc.Store(id="active-job-id"),
-    dcc.Store(id="pose-segment", data=None),
+    dcc.Store(id="pose-segment", data=[]),
     dcc.Store(id="pose-timeline", data=None),
     dcc.Store(id="pose-render-dummy"),
     dcc.Store(id="landmarks-visible", data=True),
@@ -627,7 +627,7 @@ def g_velocity(data, ct):
     State("pose-segment", "data"),
     prevent_initial_call=True,
 )
-def select_segment(_h, _a, _ha, _t, _g, current_seg):
+def select_segment(_h, _a, _ha, _t, _g, current_segs):
     ctx = dash.callback_context
     if not ctx.triggered:
         return [dash.no_update] * 6
@@ -635,9 +635,13 @@ def select_segment(_h, _a, _ha, _t, _g, current_seg):
     seg = {"seg-head": "head", "seg-arms": "arms",
            "seg-hands": "hands", "seg-torso": "torso",
            "seg-gaze": "gaze"}.get(btn_id)
-    selected = None if seg == current_seg else seg  # click same → deselect
-    outlines = {s: (selected != s) for s in ["head", "arms", "hands", "torso", "gaze"]}
-    return (selected,
+    active = list(current_segs or [])
+    if seg in active:
+        active.remove(seg)   # click active segment → deselect
+    else:
+        active.append(seg)   # click inactive segment → add
+    outlines = {s: (s not in active) for s in ["head", "arms", "hands", "torso", "gaze"]}
+    return (active,
             outlines["head"], outlines["arms"],
             outlines["hands"], outlines["torso"], outlines["gaze"])
 
@@ -731,6 +735,13 @@ clientside_callback(
             torso: [11,12,23,24],
             gaze:  [1,2,3,4,5,6]
         };
+        var SEG_COLORS = {
+            head:  '#4A90D9',
+            arms:  '#F0A500',
+            hands: '#C84B31',
+            torso: '#28a745',
+            gaze:  '#20c2d4'
+        };
         var CONNECTIONS = [
             [0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],[9,10],
             [11,12],[11,23],[12,24],[23,24],
@@ -740,33 +751,41 @@ clientside_callback(
             [24,26],[26,28],[28,30],[28,32],[30,32]
         ];
 
-        var segSet = {};
-        if (segment && SEG_LMS[segment])
-            SEG_LMS[segment].forEach(function(i) { segSet[i] = true; });
-
-        var normalEdge = 'rgba(255,255,255,0.60)';
-        var hlEdge     = '#C84B31';
+        // Build landmark → color map from all active segments.
+        // Segments applied in order: later entries overwrite for shared landmarks
+        // (e.g. 'hands' colours hand landmarks on top of 'arms').
+        var activeSegs = Array.isArray(segment) ? segment : (segment ? [segment] : []);
+        var segColor = {};  // landmark_idx → hex color string
+        activeSegs.forEach(function(seg) {
+            if (SEG_LMS[seg]) {
+                SEG_LMS[seg].forEach(function(i) { segColor[i] = SEG_COLORS[seg]; });
+            }
+        });
+        var anyActive = activeSegs.length > 0;
+        var normalEdge = anyActive ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.60)';
 
         // Draw edges
         for (var e = 0; e < CONNECTIONS.length; e++) {
             var i = CONNECTIONS[e][0], j = CONNECTIONS[e][1];
             if (i >= n33 || j >= n33 || pv[i] < 0.15 || pv[j] < 0.15) continue;
-            var lit = segment && segSet[i] && segSet[j];
+            var ci = segColor[i], cj = segColor[j];
+            var lit = ci !== undefined && cj !== undefined;
             ctx.beginPath();
             ctx.moveTo(cx_arr[i], cy_arr[i]);
             ctx.lineTo(cx_arr[j], cy_arr[j]);
-            ctx.strokeStyle = lit ? hlEdge : normalEdge;
-            ctx.lineWidth   = lit ? 3 : 1.5;
+            ctx.strokeStyle = lit ? (ci || cj) : normalEdge;
+            ctx.lineWidth   = lit ? 2.5 : 1.5;
             ctx.stroke();
         }
 
         // Draw joints
         for (var k = 0; k < n33; k++) {
             if (pv[k] < 0.15) continue;
-            var litJ = segment && segSet[k];
+            var kc = segColor[k];
+            var litJ = kc !== undefined;
             ctx.beginPath();
             ctx.arc(cx_arr[k], cy_arr[k], litJ ? 5 : 3, 0, 2 * Math.PI);
-            ctx.fillStyle = litJ ? hlEdge : 'rgba(255,255,255,0.80)';
+            ctx.fillStyle = litJ ? kc : (anyActive ? 'rgba(255,255,255,0.40)' : 'rgba(255,255,255,0.80)');
             ctx.fill();
             if (litJ) {
                 ctx.strokeStyle = 'white';
