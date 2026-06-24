@@ -25,6 +25,7 @@ import time
 from typing import Optional
 
 import redis
+from loguru import logger
 
 from .models import (
     AnalysisJob,
@@ -125,7 +126,10 @@ class FeatureStore:
         for key in sorted(keys, key=lambda k: int(k.split(":")[-1])):
             raw = self.r.get(key)
             if raw:
-                results.append(FusedWindow.model_validate_json(raw))
+                try:
+                    results.append(FusedWindow.model_validate_json(raw))
+                except Exception as exc:
+                    logger.warning(f"[store] Skipping stale fused window {key}: {exc}")
         return results
 
     def count_windows(self, job_id: str, modality: str) -> int:

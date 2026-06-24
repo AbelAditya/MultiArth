@@ -129,11 +129,14 @@ class VerbalFeatures(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ShotType(str, Enum):
-    UNKNOWN = "unknown"
-    WIDE = "wide"
-    MEDIUM = "medium"
-    CLOSE_UP = "close_up"
-    CUTAWAY = "cutaway"
+    UNKNOWN          = "unknown"
+    EXTREME_CLOSE_UP = "extreme_close_up"  # partial face / isolated detail
+    CLOSE_UP         = "close_up"           # head and shoulders
+    MEDIUM_CLOSE     = "medium_close"       # cut at waist
+    MEDIUM           = "medium"             # cut at knees
+    MEDIUM_LONG      = "medium_long"        # full figure, ankles visible
+    LONG             = "long"               # full figure, person ≥40% frame height
+    VERY_LONG        = "very_long"          # full figure, person <40% frame height
 
 
 class SceneCut(BaseModel):

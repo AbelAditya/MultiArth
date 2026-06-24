@@ -41,6 +41,7 @@ app = dash.Dash(
     server=server,
     external_stylesheets=[dbc.themes.BOOTSTRAP, FONT_URL],
     title="Mannerism Analyzer",
+    update_title=None,
     suppress_callback_exceptions=True,
 )
 
@@ -410,7 +411,6 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
     dcc.Store(id="pose-render-dummy"),
     dcc.Store(id="landmarks-visible", data=True),
     dcc.Interval(id="poll-interval", interval=2000, n_intervals=0, disabled=True),
-    dcc.Interval(id="pose-ticker", interval=67, n_intervals=0),  # ~15 fps animation
 ])
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -667,66 +667,19 @@ def build_pose_timeline(data):
 
 clientside_callback(
     """
-    function(n, timeline, segment, visible) {
-        var canvas = document.getElementById('pose-canvas');
-        var video  = document.getElementById('video-player');
-        if (!canvas || !video || !video.src) return window.dash_clientside.no_update;
-
-        var el_w = video.offsetWidth, el_h = video.offsetHeight;
-        if (!el_w || !el_h) return window.dash_clientside.no_update;
-
-        // Compute the actual rendered frame rect inside the element box.
-        // The browser fits the video with object-fit:contain semantics (aspect-ratio
-        // preserved, centred, letterboxed/pillarboxed as needed by maxHeight etc.).
-        var vid_w = video.videoWidth, vid_h = video.videoHeight;
-        var frame_w, frame_h, frame_x, frame_y;
-        if (vid_w && vid_h) {
-            var scale = Math.min(el_w / vid_w, el_h / vid_h);
-            frame_w = Math.round(vid_w * scale);
-            frame_h = Math.round(vid_h * scale);
-            frame_x = Math.round((el_w - frame_w) / 2);
-            frame_y = Math.round((el_h - frame_h) / 2);
-        } else {
-            // Metadata not loaded yet — use full element, will correct next tick.
-            frame_w = el_w; frame_h = el_h; frame_x = 0; frame_y = 0;
+    function(timeline, segment, visible) {
+        // Sync Dash store values into a plain JS object so the RAF loop can
+        // read them without going through the Dash callback system.
+        if (!window._poseState) {
+            window._poseState = { timeline: null, segment: [], visible: true };
         }
+        window._poseState.timeline = timeline || null;
+        window._poseState.segment  = Array.isArray(segment) ? segment : [];
+        window._poseState.visible  = (visible !== false);
 
-        // Position the canvas to exactly cover the rendered frame (not the full element).
-        if (canvas.width !== frame_w || canvas.height !== frame_h) {
-            canvas.width  = frame_w;
-            canvas.height = frame_h;
-        }
-        canvas.style.left   = frame_x + 'px';
-        canvas.style.top    = frame_y + 'px';
-        canvas.style.width  = frame_w + 'px';
-        canvas.style.height = frame_h + 'px';
-
-        var ctx = canvas.getContext('2d');
-        ctx.clearRect(0, 0, frame_w, frame_h);
-
-        if (!visible || !timeline || !timeline.frames || timeline.frames.length === 0)
-            return window.dash_clientside.no_update;
-
-        // Binary-search nearest keyframe by timestamp
-        var t = video.currentTime;
-        var frames = timeline.frames;
-        var lo = 0, hi = frames.length - 1;
-        while (lo < hi) {
-            var mid = (lo + hi) >> 1;
-            if (frames[mid].ts < t) lo = mid + 1; else hi = mid;
-        }
-        if (lo > 0 && Math.abs(frames[lo-1].ts - t) < Math.abs(frames[lo].ts - t)) lo--;
-        var f = frames[lo];
-        var px = f.px, py = f.py, pv = f.pv, n33 = px.length;
-        if (n33 < 33) return window.dash_clientside.no_update;
-
-        // Convert normalised coords → canvas pixels
-        // py is stored y-flipped (1 − raw_y); canvas y=0 is top, so un-flip
-        var cx_arr = new Float32Array(n33), cy_arr = new Float32Array(n33);
-        for (var m = 0; m < n33; m++) {
-            cx_arr[m] = px[m] * frame_w;
-            cy_arr[m] = (1 - py[m]) * frame_h;
-        }
+        // Bootstrap the RAF draw loop exactly once.
+        if (window._poseRafRunning) return window.dash_clientside.no_update;
+        window._poseRafRunning = true;
 
         var SEG_LMS = {
             head:  [0,1,2,3,4,5,6,7,8,9,10],
@@ -736,11 +689,8 @@ clientside_callback(
             gaze:  [1,2,3,4,5,6]
         };
         var SEG_COLORS = {
-            head:  '#4A90D9',
-            arms:  '#F0A500',
-            hands: '#C84B31',
-            torso: '#28a745',
-            gaze:  '#20c2d4'
+            head:  '#4A90D9', arms:  '#F0A500',
+            hands: '#C84B31', torso: '#28a745', gaze: '#20c2d4'
         };
         var CONNECTIONS = [
             [0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],[9,10],
@@ -751,57 +701,104 @@ clientside_callback(
             [24,26],[26,28],[28,30],[28,32],[30,32]
         ];
 
-        // Build landmark → color map from all active segments.
-        // Segments applied in order: later entries overwrite for shared landmarks
-        // (e.g. 'hands' colours hand landmarks on top of 'arms').
-        var activeSegs = Array.isArray(segment) ? segment : (segment ? [segment] : []);
-        var segColor = {};  // landmark_idx → hex color string
-        activeSegs.forEach(function(seg) {
-            if (SEG_LMS[seg]) {
-                SEG_LMS[seg].forEach(function(i) { segColor[i] = SEG_COLORS[seg]; });
+        function drawLoop() {
+            requestAnimationFrame(drawLoop);
+
+            var state   = window._poseState;
+            var canvas  = document.getElementById('pose-canvas');
+            var video   = document.getElementById('video-player');
+            if (!canvas || !video) return;
+
+            var el_w = video.offsetWidth, el_h = video.offsetHeight;
+            if (!el_w || !el_h) return;
+
+            // object-fit:contain frame rect
+            var vid_w = video.videoWidth, vid_h = video.videoHeight;
+            var frame_w, frame_h, frame_x, frame_y;
+            if (vid_w && vid_h) {
+                var scale = Math.min(el_w / vid_w, el_h / vid_h);
+                frame_w = Math.round(vid_w * scale);
+                frame_h = Math.round(vid_h * scale);
+                frame_x = Math.round((el_w - frame_w) / 2);
+                frame_y = Math.round((el_h - frame_h) / 2);
+            } else {
+                frame_w = el_w; frame_h = el_h; frame_x = 0; frame_y = 0;
             }
-        });
-        var anyActive = activeSegs.length > 0;
-        var normalEdge = anyActive ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.60)';
 
-        // Draw edges
-        for (var e = 0; e < CONNECTIONS.length; e++) {
-            var i = CONNECTIONS[e][0], j = CONNECTIONS[e][1];
-            if (i >= n33 || j >= n33 || pv[i] < 0.15 || pv[j] < 0.15) continue;
-            var ci = segColor[i], cj = segColor[j];
-            var lit = ci !== undefined && cj !== undefined;
-            ctx.beginPath();
-            ctx.moveTo(cx_arr[i], cy_arr[i]);
-            ctx.lineTo(cx_arr[j], cy_arr[j]);
-            ctx.strokeStyle = lit ? (ci || cj) : normalEdge;
-            ctx.lineWidth   = lit ? 2.5 : 1.5;
-            ctx.stroke();
-        }
+            if (canvas.width !== frame_w || canvas.height !== frame_h) {
+                canvas.width = frame_w; canvas.height = frame_h;
+            }
+            canvas.style.left   = frame_x + 'px';
+            canvas.style.top    = frame_y + 'px';
+            canvas.style.width  = frame_w + 'px';
+            canvas.style.height = frame_h + 'px';
 
-        // Draw joints
-        for (var k = 0; k < n33; k++) {
-            if (pv[k] < 0.15) continue;
-            var kc = segColor[k];
-            var litJ = kc !== undefined;
-            ctx.beginPath();
-            ctx.arc(cx_arr[k], cy_arr[k], litJ ? 5 : 3, 0, 2 * Math.PI);
-            ctx.fillStyle = litJ ? kc : (anyActive ? 'rgba(255,255,255,0.40)' : 'rgba(255,255,255,0.80)');
-            ctx.fill();
-            if (litJ) {
-                ctx.strokeStyle = 'white';
-                ctx.lineWidth = 1.5;
+            var ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, frame_w, frame_h);
+
+            var timeline = state.timeline;
+            if (!state.visible || !timeline || !timeline.frames || !timeline.frames.length) return;
+
+            // Binary-search nearest keyframe to video.currentTime
+            var t = video.currentTime;
+            var frames = timeline.frames;
+            var lo = 0, hi = frames.length - 1;
+            while (lo < hi) {
+                var mid = (lo + hi) >> 1;
+                if (frames[mid].ts < t) lo = mid + 1; else hi = mid;
+            }
+            if (lo > 0 && Math.abs(frames[lo-1].ts - t) < Math.abs(frames[lo].ts - t)) lo--;
+            var f = frames[lo];
+            var px = f.px, py = f.py, pv = f.pv, n33 = px.length;
+            if (n33 < 33) return;
+
+            var cx_arr = new Float32Array(n33), cy_arr = new Float32Array(n33);
+            for (var m = 0; m < n33; m++) {
+                cx_arr[m] = px[m] * frame_w;
+                cy_arr[m] = (1 - py[m]) * frame_h;
+            }
+
+            var activeSegs = state.segment;
+            var segColor = {};
+            activeSegs.forEach(function(seg) {
+                if (SEG_LMS[seg]) SEG_LMS[seg].forEach(function(i) { segColor[i] = SEG_COLORS[seg]; });
+            });
+            var anyActive = activeSegs.length > 0;
+            var normalEdge = anyActive ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.60)';
+
+            for (var e = 0; e < CONNECTIONS.length; e++) {
+                var i = CONNECTIONS[e][0], j = CONNECTIONS[e][1];
+                if (i >= n33 || j >= n33 || pv[i] < 0.15 || pv[j] < 0.15) continue;
+                var ci = segColor[i], cj = segColor[j];
+                var lit = ci !== undefined && cj !== undefined;
+                ctx.beginPath();
+                ctx.moveTo(cx_arr[i], cy_arr[i]);
+                ctx.lineTo(cx_arr[j], cy_arr[j]);
+                ctx.strokeStyle = lit ? (ci || cj) : normalEdge;
+                ctx.lineWidth   = lit ? 2.5 : 1.5;
                 ctx.stroke();
             }
+
+            for (var k = 0; k < n33; k++) {
+                if (pv[k] < 0.15) continue;
+                var kc = segColor[k];
+                var litJ = kc !== undefined;
+                ctx.beginPath();
+                ctx.arc(cx_arr[k], cy_arr[k], litJ ? 5 : 3, 0, 2 * Math.PI);
+                ctx.fillStyle = litJ ? kc : (anyActive ? 'rgba(255,255,255,0.40)' : 'rgba(255,255,255,0.80)');
+                ctx.fill();
+                if (litJ) { ctx.strokeStyle = 'white'; ctx.lineWidth = 1.5; ctx.stroke(); }
+            }
         }
 
+        requestAnimationFrame(drawLoop);
         return window.dash_clientside.no_update;
     }
     """,
     Output("pose-render-dummy", "data"),
-    Input("pose-ticker", "n_intervals"),
-    State("pose-timeline", "data"),
-    State("pose-segment", "data"),
-    State("landmarks-visible", "data"),
+    Input("pose-timeline", "data"),
+    Input("pose-segment", "data"),
+    Input("landmarks-visible", "data"),
 )
 
 
@@ -1020,8 +1017,14 @@ def v_confidence(data, ct):
 # ─────────────────────────────────────────────────────────────────────────────
 
 SHOT_COLOURS = {
-    "close_up": C["gesture"], "medium": C["camera"],
-    "wide": C["verbal"], "cutaway": C["prosody"], "unknown": C["muted"],
+    "extreme_close_up": "#9B2335",
+    "close_up":         C["gesture"],
+    "medium_close":     "#7B5EA7",
+    "medium":           C["camera"],
+    "medium_long":      "#2D6A4F",
+    "long":             "#1B4F8A",
+    "very_long":        "#5C6970",
+    "unknown":          C["muted"],
 }
 
 @callback(Output("c-shot", "figure"), Input("fused-data", "data"), Input("current-time", "data"))

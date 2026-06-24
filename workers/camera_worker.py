@@ -4,8 +4,10 @@ workers/camera_worker.py
 PySceneDetect + OpenCV camera/editorial analysis worker.
 
 Detects scene cuts globally then attributes them to windows.
-Also uses a basic face detector to estimate shot type (close-up
-vs medium vs wide) from face bounding-box area.
+Uses Haar cascade face detection to track face area over time
+(zoom-level proxy for the dashboard charts).
+Shot type classification is handled in FusionEngine using MediaPipe
+pose keypoints, which give finer-grained framing information.
 """
 
 from __future__ import annotations
@@ -20,11 +22,6 @@ from scenedetect import open_video, SceneManager, ContentDetector
 from core.feature_store import FeatureStore
 from core.models import CameraFeatures, SceneCut, ShotType, TimeWindow
 from core.preprocessing import VideoMeta, frames_for_window
-
-# Thresholds for shot classification by face-area fraction
-_CLOSE_UP_THRESHOLD = 0.08    # face occupies > 8% of frame → close-up
-_MEDIUM_THRESHOLD = 0.02      # face occupies 2–8% → medium
-# Below _MEDIUM_THRESHOLD → wide or face not found
 
 
 class CameraWorker:
@@ -100,7 +97,6 @@ class CameraWorker:
                 face_areas.append(area)
 
         mean_face_area = float(np.mean(face_areas)) if face_areas else None
-        shot_type = self._classify_shot(mean_face_area)
         face_trend = self._face_area_trend(face_areas) if len(face_areas) > 2 else None
 
         return CameraFeatures(
@@ -108,7 +104,7 @@ class CameraWorker:
             scene_cuts=window_cuts,
             cut_count=cut_count,
             cut_rate=cut_rate,
-            dominant_shot_type=shot_type,
+            dominant_shot_type=ShotType.UNKNOWN,
             mean_face_bbox_area=mean_face_area,
             face_bbox_trend=face_trend,
         )
@@ -128,16 +124,6 @@ class CameraWorker:
         max_area = max(areas)
         frame_area = width * height
         return max_area / frame_area
-
-    def _classify_shot(self, mean_face_area: Optional[float]) -> ShotType:
-        if mean_face_area is None:
-            return ShotType.UNKNOWN
-        if mean_face_area >= _CLOSE_UP_THRESHOLD:
-            return ShotType.CLOSE_UP
-        elif mean_face_area >= _MEDIUM_THRESHOLD:
-            return ShotType.MEDIUM
-        else:
-            return ShotType.WIDE
 
     def _face_area_trend(self, face_areas: list[float]) -> float:
         """
