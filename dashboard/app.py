@@ -370,9 +370,9 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
             dcc.Graph(id="g-velocity", style={"height": "200px"}, config=CHART_CFG),
         ]),
 
-        # ── PROSODY ───────────────────────────────────────────────────────
+        # ── ACOUSTIC ──────────────────────────────────────────────────────
         html.Div(style=SECTION_STYLE, children=[
-            section_header("Prosody", C["prosody"], "Parselmouth · Praat algorithms"),
+            section_header("Acoustic", C["prosody"], "Parselmouth · Praat algorithms"),
             dcc.Graph(id="p-f0",        style={"height": "200px"}, config=CHART_CFG),
             dcc.Graph(id="p-intensity", style={"height": "200px"}, config=CHART_CFG),
             dcc.Graph(id="p-voiced",    style={"height": "200px"}, config=CHART_CFG),
@@ -845,7 +845,7 @@ def g_handedness(data, ct):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Chart callbacks — Prosody
+# Chart callbacks — Acoustic
 # ─────────────────────────────────────────────────────────────────────────────
 
 @callback(Output("p-f0", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
