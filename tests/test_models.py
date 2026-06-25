@@ -54,12 +54,11 @@ class TestProsodyFeatures:
             mean_f0=None,
             f0_range=None,
             f0_std=None,
-            voiced_fraction=0.0,
             mean_intensity_db=-60.0,
             intensity_range_db=0.0,
+            speech_rate_syl_per_s=None,
         )
         assert pf.mean_f0 is None
-        assert pf.voiced_fraction == 0.0
 
     def test_serialise_roundtrip(self):
         pf = ProsodyFeatures(
@@ -67,18 +66,13 @@ class TestProsodyFeatures:
             mean_f0=180.5,
             f0_range=40.0,
             f0_std=15.2,
-            voiced_fraction=0.8,
             mean_intensity_db=65.0,
             intensity_range_db=20.0,
             speech_rate_syl_per_s=4.5,
-            jitter_local=0.02,
-            shimmer_local=0.05,
-            hnr_db=18.0,
         )
         raw = pf.model_dump_json()
         restored = ProsodyFeatures.model_validate_json(raw)
         assert restored.mean_f0 == pytest.approx(180.5)
-        assert restored.hnr_db == pytest.approx(18.0)
 
 
 class TestFusedWindow:
@@ -97,9 +91,12 @@ class TestFusedWindow:
             ),
             prosody=ProsodyFeatures(
                 window=make_window(),
-                voiced_fraction=0,
+                mean_f0=None,
+                f0_range=None,
+                f0_std=None,
                 mean_intensity_db=0,
                 intensity_range_db=0,
+                speech_rate_syl_per_s=None,
             ),
             verbal=VerbalFeatures(
                 window=make_window(),
@@ -122,6 +119,8 @@ class TestFusedWindow:
                 cut_count=0,
                 cut_rate=0,
                 dominant_shot_type=ShotType.UNKNOWN,
+                mean_face_bbox_area=None,
+                face_bbox_trend=None,
             ),
         )
         assert fw.is_complete()

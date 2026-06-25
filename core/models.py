@@ -87,13 +87,9 @@ class ProsodyFeatures(BaseModel):
     mean_f0: Optional[float]
     f0_range: Optional[float]              # max – min over voiced frames
     f0_std: Optional[float]
-    voiced_fraction: float                 # fraction of frames that are voiced
     mean_intensity_db: float
     intensity_range_db: float
     speech_rate_syl_per_s: Optional[float] # populated after alignment with ASR
-    jitter_local: Optional[float]          # cycle-to-cycle F0 variation
-    shimmer_local: Optional[float]         # cycle-to-cycle amplitude variation
-    hnr_db: Optional[float]               # harmonics-to-noise ratio
 
 
 # ---------------------------------------------------------------------------

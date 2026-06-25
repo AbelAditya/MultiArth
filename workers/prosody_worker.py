@@ -6,8 +6,6 @@ Parselmouth (Praat) prosody worker.
 For each time window it extracts:
   - F0 contour (pitch)
   - Intensity
-  - Jitter, shimmer, HNR (voice quality)
-  - Voiced fraction
 """
 
 from __future__ import annotations
@@ -46,9 +44,48 @@ class ProsodyWorker:
                 logger.error(f"[prosody] Window {idx} failed: {exc}")
                 self.store.log_event(job_id, "prosody", f"window {idx} ERROR: {exc}")
 
+        try:
+            sg = self._compute_spectrogram(sound)
+            self.store.put_spectrogram(job_id, sg)
+            self.store.log_event(job_id, "prosody", "spectrogram done")
+        except Exception as exc:
+            logger.error(f"[prosody] Spectrogram failed: {exc}")
+
         logger.info(f"[prosody] Job {job_id} complete")
 
     # ------------------------------------------------------------------
+
+    def _compute_spectrogram(self, sound: parselmouth.Sound) -> dict:
+        """
+        Compute a downsampled wide-band spectrogram for the full audio.
+        Returns times (s), freqs (kHz), and dB values as a JSON-safe dict.
+        Downsampled to ≤1000 time steps × ≤200 frequency bins to keep
+        payload manageable for the dashboard.
+        """
+        sg = sound.to_spectrogram(
+            window_length=0.005,     # 5 ms → wide-band (resolves formants)
+            maximum_frequency=5000.0,
+            time_step=0.01,          # 10 ms time step
+        )
+        values = sg.values           # shape: (n_freq, n_time), power Pa²/Hz
+        n_freq, n_time = values.shape
+
+        t_step = max(1, n_time // 1000)
+        f_step = max(1, n_freq // 200)
+
+        ds = values[::f_step, ::t_step]
+        db = 10.0 * np.log10(ds + 1e-10)
+
+        # Clip to a sensible dB range so colour scale isn't dominated by silence
+        db_max = float(np.percentile(db, 99))
+        db_min = db_max - 60.0
+        db = np.clip(db, db_min, db_max)
+
+        return {
+            "times": sg.xs()[::t_step].tolist(),
+            "freqs": (sg.ys()[::f_step] / 1000.0).tolist(),  # Hz → kHz
+            "data":  db.tolist(),
+        }
 
     def _process_window(
         self, sound: parselmouth.Sound, start_s: float, end_s: float
@@ -74,60 +111,18 @@ class ProsodyWorker:
         mean_f0 = float(np.mean(voiced)) if len(voiced) > 0 else None
         f0_range = float(np.ptp(voiced)) if len(voiced) > 1 else None
         f0_std = float(np.std(voiced)) if len(voiced) > 1 else None
-        voiced_fraction = len(voiced) / max(len(f0_values), 1)
-
         # ---- Intensity -------------------------------------------------
         intensity_obj = segment.to_intensity(time_step=0.01)
         intensity_values = intensity_obj.values.T.flatten()
         mean_intensity = float(np.mean(intensity_values)) if len(intensity_values) > 0 else 0.0
         intensity_range = float(np.ptp(intensity_values)) if len(intensity_values) > 0 else 0.0
 
-        # ---- Voice quality (jitter, shimmer, HNR) ----------------------
-        jitter = self._get_jitter(segment)
-        shimmer = self._get_shimmer(segment)
-        hnr = self._get_hnr(segment)
-
         return ProsodyFeatures(
             window=window,
             mean_f0=mean_f0,
             f0_range=f0_range,
             f0_std=f0_std,
-            voiced_fraction=voiced_fraction,
             mean_intensity_db=mean_intensity,
             intensity_range_db=intensity_range,
             speech_rate_syl_per_s=None,  # filled by fusion engine after ASR
-            jitter_local=jitter,
-            shimmer_local=shimmer,
-            hnr_db=hnr,
         )
-
-    def _get_jitter(self, segment: parselmouth.Sound) -> Optional[float]:
-        """Local jitter: mean absolute F0 period difference."""
-        try:
-            point_process = call(segment, "To PointProcess (periodic, cc)", 75, 500)
-            jitter = call(point_process, "Get jitter (local)", 0, 0, 0.0001, 0.02, 1.3)
-            return float(jitter) if jitter is not None else None
-        except Exception:
-            return None
-
-    def _get_shimmer(self, segment: parselmouth.Sound) -> Optional[float]:
-        """Local shimmer: mean absolute amplitude difference."""
-        try:
-            point_process = call(segment, "To PointProcess (periodic, cc)", 75, 500)
-            shimmer = call(
-                [segment, point_process],
-                "Get shimmer (local)",
-                0, 0, 0.0001, 0.02, 1.3, 1.6,
-            )
-            return float(shimmer) if shimmer is not None else None
-        except Exception:
-            return None
-
-    def _get_hnr(self, segment: parselmouth.Sound) -> Optional[float]:
-        """Harmonics-to-noise ratio in dB."""
-        try:
-            harmonicity = call(segment, "To Harmonicity (cc)", 0.01, 75, 0.1, 1.0)
-            hnr = call(harmonicity, "Get mean", 0, 0)
-            return float(hnr) if hnr is not None and not np.isnan(hnr) else None
-        except Exception:
-            return None

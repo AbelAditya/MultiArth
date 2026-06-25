@@ -213,7 +213,7 @@ def add_cursor(fig, t):
 
 CHART_IDS = [
     "g-velocity", "g-handedness",
-    "p-f0", "p-intensity", "p-voiced", "p-jitter", "p-shimmer", "p-hnr",
+    "p-spectrogram", "p-f0", "p-intensity",
     "v-filler", "v-ttr", "v-pauses", "v-hedge", "v-sent-len", "v-confidence",
     "c-shot", "c-cutrate", "c-facearea", "c-trend",
 ]
@@ -373,12 +373,9 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
         # ── ACOUSTIC ──────────────────────────────────────────────────────
         html.Div(style=SECTION_STYLE, children=[
             section_header("Acoustic", C["prosody"], "Parselmouth · Praat algorithms"),
+            dcc.Graph(id="p-spectrogram", style={"height": "280px"}, config=CHART_CFG),
             dcc.Graph(id="p-f0",        style={"height": "200px"}, config=CHART_CFG),
             dcc.Graph(id="p-intensity", style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="p-voiced",    style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="p-jitter",    style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="p-shimmer",   style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="p-hnr",       style={"height": "200px"}, config=CHART_CFG),
         ]),
 
         # ── VERBAL ────────────────────────────────────────────────────────
@@ -559,7 +556,6 @@ def render_kpis(data):
     mean_f0     = _mean([w.prosody.mean_f0 for w in ws if w.prosody and w.prosody.mean_f0])
     mean_vel    = _mean([w.gesture.mean_wrist_velocity for w in ws if w.gesture])
     total_cuts  = sum(w.camera.cut_count for w in ws if w.camera)
-    mean_hnr    = _mean([w.prosody.hnr_db for w in ws if w.prosody and w.prosody.hnr_db])
     return [
         kpi_card("Duration",   f"{duration:.0f}s",                      C["muted"]),
         kpi_card("Words",      str(total_words),                         C["verbal"]),
@@ -568,7 +564,6 @@ def render_kpis(data):
         kpi_card("Mean F0",    f"{mean_f0:.0f} Hz" if mean_f0 else "—", C["prosody"]),
         kpi_card("Wrist Vel.", f"{mean_vel:.0f} px/s" if mean_vel else "—", C["gesture"]),
         kpi_card("Cuts",       str(total_cuts),                          C["camera"]),
-        kpi_card("Mean HNR",   f"{mean_hnr:.1f} dB" if mean_hnr else "—", C["prosody"]),
     ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -848,6 +843,53 @@ def g_handedness(data, ct):
 # Chart callbacks — Acoustic
 # ─────────────────────────────────────────────────────────────────────────────
 
+@callback(
+    Output("p-spectrogram", "figure"),
+    Input("fused-data", "data"),
+    State("active-job-id", "data"),
+)
+def p_spectrogram(data, job_id):
+    if not data or not job_id:
+        return empty_fig("Spectrogram")
+    sg = store.get_spectrogram(job_id)
+    if not sg:
+        return empty_fig("Spectrogram")
+    fig = go.Figure(go.Heatmap(
+        x=sg["times"],
+        y=sg["freqs"],
+        z=sg["data"],
+        colorscale="viridis",
+        showscale=True,
+        colorbar=dict(
+            title=dict(text="dB", side="right",
+                       font=dict(size=9, color=C["muted"])),
+            tickfont=dict(size=8, color=C["muted"]),
+            thickness=10,
+            len=0.9,
+        ),
+        hovertemplate="<b>Time: %{x:.2f}s<br>Freq: %{y:.2f} kHz<br>%{z:.1f} dB</b><extra></extra>",
+    ))
+    layout = {k: v for k, v in PLOT_LAYOUT.items() if k not in ("xaxis", "yaxis")}
+    fig.update_layout(
+        **layout,
+        hoverlabel=dict(
+            bgcolor=C["text"],
+            bordercolor=C["muted"],
+            font=dict(color="#FFFFFF", size=11, family="DM Mono, monospace"),
+        ),
+        title=dict(text="Spectrogram  (wide-band)", font=dict(size=11, color=C["muted"])),
+        xaxis=dict(
+            **PLOT_LAYOUT["xaxis"],
+            showspikes=False,
+        ),
+        yaxis=dict(
+            title=dict(text="Frequency (kHz)", font=dict(size=9, color=C["muted"])),
+            showgrid=False, zeroline=False, showspikes=False,
+        ),
+    )
+    return fig
+
+
 @callback(Output("p-f0", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
 def p_f0(data, ct):
     if not data: return empty_fig("Pitch (F0)")
@@ -882,55 +924,7 @@ def p_intensity(data, ct):
     return add_cursor(fig, ct)
 
 
-@callback(Output("p-voiced", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def p_voiced(data, ct):
-    if not data: return empty_fig("Voiced Fraction")
-    ws, t = _parse(data)
-    fig = go.Figure(go.Bar(
-        x=t, y=[w.prosody.voiced_fraction if w.prosody else None for w in ws],
-        marker_color=C["prosody"], marker_opacity=0.7, name="fraction",
-    ))
-    _style(fig, "Voiced Fraction", "0–1")
-    return add_cursor(fig, ct)
 
-
-@callback(Output("p-jitter", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def p_jitter(data, ct):
-    if not data: return empty_fig("Jitter")
-    ws, t = _parse(data)
-    fig = go.Figure(go.Scatter(
-        x=t, y=[w.prosody.jitter_local if w.prosody and w.prosody.jitter_local else None for w in ws],
-        mode="lines+markers", line=dict(color=C["prosody"], width=1.5),
-        marker=dict(size=3), name="local",
-    ))
-    _style(fig, "Jitter (local)", "ratio")
-    return add_cursor(fig, ct)
-
-
-@callback(Output("p-shimmer", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def p_shimmer(data, ct):
-    if not data: return empty_fig("Shimmer")
-    ws, t = _parse(data)
-    fig = go.Figure(go.Scatter(
-        x=t, y=[w.prosody.shimmer_local if w.prosody and w.prosody.shimmer_local else None for w in ws],
-        mode="lines+markers", line=dict(color=C["prosody"], width=1.5),
-        marker=dict(size=3), name="local",
-    ))
-    _style(fig, "Shimmer (local)", "ratio")
-    return add_cursor(fig, ct)
-
-
-@callback(Output("p-hnr", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def p_hnr(data, ct):
-    if not data: return empty_fig("HNR")
-    ws, t = _parse(data)
-    fig = go.Figure(go.Scatter(
-        x=t, y=[w.prosody.hnr_db if w.prosody and w.prosody.hnr_db else None for w in ws],
-        mode="lines", line=dict(color=C["prosody"], width=2),
-        fill="tozeroy", fillcolor="rgba(45,106,79,0.08)", name="dB",
-    ))
-    _style(fig, "Harmonics-to-Noise Ratio", "dB")
-    return add_cursor(fig, ct)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Chart callbacks — Verbal
