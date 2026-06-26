@@ -100,12 +100,21 @@ class GestureWorker:
                 for lm in lm_list.landmark
             ]
 
+        def to_world_landmarks(lm_list) -> list[Landmark]:
+            if lm_list is None:
+                return []
+            return [
+                Landmark(x=lm.x, y=lm.y, z=lm.z, visibility=getattr(lm, "visibility", 1.0))
+                for lm in lm_list.landmark
+            ]
+
         return GestureFrame(
             frame_idx=frame_idx,
             timestamp_s=ts,
             pose=to_landmarks(result.pose_landmarks),
             left_hand=to_landmarks(result.left_hand_landmarks),
             right_hand=to_landmarks(result.right_hand_landmarks),
+            pose_world=to_world_landmarks(result.pose_world_landmarks),
         )
 
     def _aggregate(
@@ -192,11 +201,15 @@ class GestureWorker:
             f = frames[i]
             if len(f.pose) < 33:
                 continue
+            has_world = len(f.pose_world) == 33
             keyframes.append(PoseKeyframe(
                 ts=f.timestamp_s,
                 pose_x=[lm.x / width for lm in f.pose],
                 pose_y=[1.0 - lm.y / height for lm in f.pose],
                 pose_vis=[lm.visibility for lm in f.pose],
+                world_x=[lm.x for lm in f.pose_world] if has_world else None,
+                world_y=[lm.y for lm in f.pose_world] if has_world else None,
+                world_z=[lm.z for lm in f.pose_world] if has_world else None,
             ))
         return keyframes
 

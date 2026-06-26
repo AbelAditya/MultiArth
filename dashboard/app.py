@@ -22,7 +22,7 @@ import plotly.graph_objects as go
 from dash import Input, Output, State, callback, clientside_callback, dcc, html
 
 from core.feature_store import FeatureStore
-from core.models import FusedWindow
+from core.models import FusedWindow, HorizontalAngle, VerticalAngle
 from core.orchestrator import Orchestrator
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -215,7 +215,7 @@ CHART_IDS = [
     "g-velocity", "g-handedness",
     "p-spectrogram", "p-f0", "p-intensity",
     "v-filler", "v-ttr", "v-pauses", "v-hedge", "v-sent-len", "v-confidence",
-    "c-shot", "c-cutrate", "c-facearea", "c-trend",
+    "c-shot", "c-h-angle", "c-v-angle", "c-cutrate", "c-facearea", "c-trend",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -393,6 +393,8 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
         html.Div(style=SECTION_STYLE, children=[
             section_header("Camera", C["camera"], "PySceneDetect · Haar cascade"),
             dcc.Graph(id="c-shot",     style={"height": "200px"}, config=CHART_CFG),
+            dcc.Graph(id="c-h-angle",  style={"height": "200px"}, config=CHART_CFG),
+            dcc.Graph(id="c-v-angle",  style={"height": "200px"}, config=CHART_CFG),
             dcc.Graph(id="c-cutrate",  style={"height": "200px"}, config=CHART_CFG),
             dcc.Graph(id="c-facearea", style={"height": "200px"}, config=CHART_CFG),
             dcc.Graph(id="c-trend",    style={"height": "200px"}, config=CHART_CFG),
@@ -1038,6 +1040,82 @@ def c_shot(data, ct):
     fig.update_layout(**layout,
         title=dict(text="Dominant Shot Type", font=dict(size=11, color=C["muted"])),
         yaxis=dict(showticklabels=False, showgrid=False),
+        bargap=0.05,
+    )
+    return add_cursor(fig, ct)
+
+
+H_ANGLE_COLOURS = {
+    HorizontalAngle.FRONTAL: C["prosody"],
+    HorizontalAngle.OBLIQUE: C["cursor"],
+    HorizontalAngle.UNKNOWN: C["muted"],
+}
+
+V_ANGLE_COLOURS = {
+    VerticalAngle.HIGH:      C["gesture"],
+    VerticalAngle.EYE_LEVEL: C["camera"],
+    VerticalAngle.LOW:       C["verbal"],
+    VerticalAngle.UNKNOWN:   C["muted"],
+}
+
+
+@callback(Output("c-h-angle", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
+def c_h_angle(data, ct):
+    if not data: return empty_fig("Horizontal Angle")
+    ws, t = _parse(data)
+    yaws = [w.camera.mean_shoulder_yaw_deg if w.camera and w.camera.mean_shoulder_yaw_deg is not None else None for w in ws]
+    classes = [w.camera.horizontal_angle if w.camera else HorizontalAngle.UNKNOWN for w in ws]
+    labels = [c.value for c in classes]
+    fig = go.Figure(go.Bar(
+        x=t,
+        y=[abs(v) if v is not None else 0 for v in yaws],
+        marker_color=[H_ANGLE_COLOURS.get(c, C["muted"]) for c in classes],
+        text=labels,
+        textposition="inside",
+        textfont=dict(size=9, family="DM Mono, monospace"),
+        customdata=[[round(v, 1)] if v is not None else [None] for v in yaws],
+        hovertemplate="%{text}  |  %{customdata[0]}°<extra></extra>",
+        showlegend=False,
+    ))
+    fig.add_hline(y=30, line=dict(color=C["muted"], width=1, dash="dot"))
+    layout = {k: v for k, v in PLOT_LAYOUT.items() if k not in ("yaxis",)}
+    fig.update_layout(**layout,
+        title=dict(text="Horizontal Angle  (shoulder yaw)", font=dict(size=11, color=C["muted"])),
+        yaxis=dict(title=dict(text="|yaw| °", font=dict(size=10, color=C["muted"])),
+                   range=[0, 95], showgrid=True, gridcolor=C["border"],
+                   zeroline=False, tickfont=dict(size=10)),
+        bargap=0.05,
+    )
+    return add_cursor(fig, ct)
+
+
+@callback(Output("c-v-angle", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
+def c_v_angle(data, ct):
+    if not data: return empty_fig("Vertical Angle")
+    ws, t = _parse(data)
+    pitches = [w.camera.mean_face_pitch_deg if w.camera and w.camera.mean_face_pitch_deg is not None else None for w in ws]
+    classes = [w.camera.vertical_angle if w.camera else VerticalAngle.UNKNOWN for w in ws]
+    labels = [c.value.replace("_", " ") for c in classes]
+    fig = go.Figure(go.Bar(
+        x=t,
+        y=[v if v is not None else 0 for v in pitches],
+        marker_color=[V_ANGLE_COLOURS.get(c, C["muted"]) for c in classes],
+        text=labels,
+        textposition="inside",
+        textfont=dict(size=9, family="DM Mono, monospace"),
+        customdata=[[round(v, 1)] if v is not None else [None] for v in pitches],
+        hovertemplate="%{text}  |  %{customdata[0]}°<extra></extra>",
+        showlegend=False,
+    ))
+    fig.add_hline(y=10,  line=dict(color=C["muted"], width=1, dash="dot"))
+    fig.add_hline(y=-10, line=dict(color=C["muted"], width=1, dash="dot"))
+    fig.add_hline(y=0,   line=dict(color=C["muted"], width=0.5))
+    layout = {k: v for k, v in PLOT_LAYOUT.items() if k not in ("yaxis",)}
+    fig.update_layout(**layout,
+        title=dict(text="Vertical Angle  (face pitch)", font=dict(size=11, color=C["muted"])),
+        yaxis=dict(title=dict(text="pitch °", font=dict(size=10, color=C["muted"])),
+                   showgrid=True, gridcolor=C["border"],
+                   zeroline=False, tickfont=dict(size=10)),
         bargap=0.05,
     )
     return add_cursor(fig, ct)

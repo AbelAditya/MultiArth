@@ -8,11 +8,15 @@ records, then enriches them with cross-modal derived features
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 from loguru import logger
 
 from core.feature_store import FeatureStore
-from core.models import FusedWindow, PoseKeyframe, ShotType, TimeWindow
+from core.models import (
+    FusedWindow, HorizontalAngle, PoseKeyframe, ShotType, TimeWindow, VerticalAngle,
+)
 
 
 def _classify_shot_from_pose(keyframes: list[PoseKeyframe]) -> ShotType:
@@ -83,6 +87,50 @@ def _classify_shot_from_pose(keyframes: list[PoseKeyframe]) -> ShotType:
     return ShotType.EXTREME_CLOSE_UP
 
 
+def _compute_angles_from_pose(
+    keyframes: list[PoseKeyframe],
+) -> tuple[float | None, float | None]:
+    """
+    Returns (mean_shoulder_yaw_deg, mean_face_pitch_deg) across keyframes.
+
+    Shoulder yaw — angle of the shoulder vector in the XZ plane:
+      0° = subject faces camera directly, ±90° = pure profile.
+    Face pitch — elevation of nose relative to mid-ear anchor:
+      positive = subject looking up (HIGH angle), negative = looking down (LOW).
+
+    MediaPipe world_y is downward-positive, so the pitch sign is negated to
+    give an intuitive result.
+    """
+    yaws: list[float] = []
+    pitches: list[float] = []
+
+    for kf in keyframes:
+        if kf.world_x is None or len(kf.world_x) < 33:
+            continue
+
+        wx, wy, wz = kf.world_x, kf.world_y, kf.world_z
+
+        # Shoulder yaw (landmarks 11 = left, 12 = right)
+        dx = wx[12] - wx[11]
+        dz = wz[12] - wz[11]
+        if abs(dx) + abs(dz) > 1e-4:
+            yaws.append(math.degrees(math.atan2(dz, dx)))
+
+        # Face pitch (nose=0, left_ear=7, right_ear=8)
+        ear_mid_x = (wx[7] + wx[8]) / 2
+        ear_mid_y = (wy[7] + wy[8]) / 2
+        ear_mid_z = (wz[7] + wz[8]) / 2
+        dy = wy[0] - ear_mid_y
+        xz_dist = math.sqrt((wx[0] - ear_mid_x) ** 2 + (wz[0] - ear_mid_z) ** 2)
+        if xz_dist > 1e-4:
+            # Negate because world y is down-positive; positive result = looking up
+            pitches.append(-math.degrees(math.atan2(dy, xz_dist)))
+
+    mean_yaw = float(np.mean(yaws)) if yaws else None
+    mean_pitch = float(np.mean(pitches)) if pitches else None
+    return mean_yaw, mean_pitch
+
+
 class FusionEngine:
     def __init__(self, store: FeatureStore):
         self.store = store
@@ -129,11 +177,25 @@ class FusionEngine:
                 words_per_s = fused.verbal.word_count / duration
                 fused.prosody.speech_rate_syl_per_s = words_per_s * 1.5
 
-        # 2. Pose-based shot classification (overrides camera worker's UNKNOWN default)
+        # 2. Pose-based shot classification + camera angle (both from world landmarks)
         if fused.gesture and fused.camera and fused.gesture.pose_keyframes:
-            fused.camera.dominant_shot_type = _classify_shot_from_pose(
-                fused.gesture.pose_keyframes
-            )
+            kfs = fused.gesture.pose_keyframes
+            fused.camera.dominant_shot_type = _classify_shot_from_pose(kfs)
+
+            yaw, pitch = _compute_angles_from_pose(kfs)
+            if yaw is not None:
+                fused.camera.mean_shoulder_yaw_deg = yaw
+                fused.camera.horizontal_angle = (
+                    HorizontalAngle.FRONTAL if abs(yaw) < 30 else HorizontalAngle.OBLIQUE
+                )
+            if pitch is not None:
+                fused.camera.mean_face_pitch_deg = pitch
+                if pitch > 10:
+                    fused.camera.vertical_angle = VerticalAngle.HIGH
+                elif pitch < -10:
+                    fused.camera.vertical_angle = VerticalAngle.LOW
+                else:
+                    fused.camera.vertical_angle = VerticalAngle.EYE_LEVEL
 
         return fused
 

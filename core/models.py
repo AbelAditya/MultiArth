@@ -45,9 +45,10 @@ class GestureFrame(BaseModel):
     """Pose + hand keypoints for a single frame."""
     frame_idx: int
     timestamp_s: float
-    pose: list[Landmark]          # 33 MediaPipe pose landmarks
+    pose: list[Landmark]          # 33 MediaPipe pose landmarks (image-space pixels)
     left_hand: list[Landmark]     # 21 landmarks, empty list if not detected
     right_hand: list[Landmark]    # 21 landmarks, empty list if not detected
+    pose_world: list[Landmark] = Field(default_factory=list)  # 33 metric world-space coords
 
 
 class PoseKeyframe(BaseModel):
@@ -56,6 +57,9 @@ class PoseKeyframe(BaseModel):
     pose_x: list[float]        # 33 normalised x-coords [0, 1]
     pose_y: list[float]        # 33 normalised y-coords, already flipped (1 − raw_y) so up = high
     pose_vis: list[float]      # 33 visibility scores
+    world_x: Optional[list[float]] = None  # 33 metric world x-coords (right positive)
+    world_y: Optional[list[float]] = None  # 33 metric world y-coords (down positive)
+    world_z: Optional[list[float]] = None  # 33 metric world z-coords (toward camera positive)
 
 
 class GestureFeatures(BaseModel):
@@ -124,6 +128,19 @@ class VerbalFeatures(BaseModel):
 # Camera / scene features  (PySceneDetect)
 # ---------------------------------------------------------------------------
 
+class HorizontalAngle(str, Enum):
+    UNKNOWN  = "unknown"
+    FRONTAL  = "frontal"   # |yaw| < 30° — subject faces roughly toward camera
+    OBLIQUE  = "oblique"   # |yaw| ≥ 30° — body turned away from camera
+
+
+class VerticalAngle(str, Enum):
+    UNKNOWN   = "unknown"
+    HIGH      = "high"       # pitch > 10°  — camera above, subject looks up
+    EYE_LEVEL = "eye_level"  # |pitch| ≤ 10° — camera roughly level with face
+    LOW       = "low"        # pitch < -10° — camera below, subject looks down
+
+
 class ShotType(str, Enum):
     UNKNOWN          = "unknown"
     EXTREME_CLOSE_UP = "extreme_close_up"  # partial face / isolated detail
@@ -150,6 +167,10 @@ class CameraFeatures(BaseModel):
     dominant_shot_type: ShotType
     mean_face_bbox_area: Optional[float]  # proxy for zoom level; None if undetected
     face_bbox_trend: Optional[float]      # positive = zooming in
+    mean_shoulder_yaw_deg: Optional[float] = None   # 0° = frontal, ±90° = profile
+    horizontal_angle: HorizontalAngle = HorizontalAngle.UNKNOWN
+    mean_face_pitch_deg: Optional[float] = None     # positive = HIGH, negative = LOW
+    vertical_angle: VerticalAngle = VerticalAngle.UNKNOWN
 
 
 # ---------------------------------------------------------------------------
