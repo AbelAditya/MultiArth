@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import threading
 import uuid as _uuid_module
 from pathlib import Path
@@ -19,8 +20,13 @@ import dash
 import dash_bootstrap_components as dbc
 import flask
 import plotly.graph_objects as go
-from dash import Input, Output, State, callback, clientside_callback, dcc, html
+from plotly.subplots import make_subplots
+from dash import ALL, Input, Output, State, callback, clientside_callback, dash_table, dcc, html
+from dotenv import load_dotenv
 
+load_dotenv()
+
+from core import corpus_analysis
 from core.feature_store import FeatureStore
 from core.models import FusedWindow, HorizontalAngle, VerticalAngle
 from core.orchestrator import Orchestrator
@@ -75,7 +81,10 @@ C = {
     "verbal":  "#1B4F8A",
     "camera":  "#7B5EA7",
     "cursor":  "#E8A838",
+    "corpus":  "#4361EE",
 }
+
+KW_COLOUR = "#00B4D8"  # cyan-teal — distinct from all section colours and cursor amber
 
 PLOT_LAYOUT = dict(
     paper_bgcolor="rgba(0,0,0,0)",
@@ -117,7 +126,45 @@ LABEL_STYLE = {
     "margin": "0",
 }
 
+LABEL_STYLE_C = {
+    "fontFamily": "DM Mono, monospace",
+    "fontSize": "10px",
+    "letterSpacing": "0.12em",
+    "textTransform": "uppercase",
+    "color": C["text"],
+    "marginBottom": "4px",
+    "margin": "0",
+}
+
+
 CHART_CFG = {"displayModeBar": False}
+
+# Per-tab base style; each tab overrides color + top-border when selected
+_TAB_BASE = {
+    "fontFamily": "DM Mono, monospace",
+    "fontSize":   "11px",
+    "letterSpacing": "0.08em",
+    "color":         C["muted"],
+    "backgroundColor": C["bg"],
+    "border":     f"1px solid {C['border']}",
+    "borderBottom": "none",
+    "padding":    "10px 22px",
+    "borderRadius": "6px 6px 0 0",
+}
+
+def _tab_sel(accent):
+    return {**_TAB_BASE, "color": accent,
+            "borderTop": f"2px solid {accent}",
+            "backgroundColor": C["surface"]}
+
+_TAB_PAD = {
+    "backgroundColor": C["surface"],
+    "border": f"1px solid {C['border']}",
+    "borderTop": "none",
+    "borderRadius": "0 0 12px 12px",
+    "padding": "28px 32px",
+    "minHeight": "300px",
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Layout helpers
@@ -201,9 +248,12 @@ def empty_fig(title=""):
     return fig
 
 
-def add_cursor(fig, t):
+def add_cursor(fig, t, occ=None):
     if t:
-        fig.add_vline(x=t, line=dict(color=C["cursor"], width=1.5, dash="dot"))
+        fig.add_vline(x=t, line=dict(color=C["cursor"], width=2.5, dash="dot"))
+    if occ:
+        for o in occ:
+            fig.add_vline(x=o["start_s"], line=dict(color=KW_COLOUR, width=2), opacity=0.7)
     return fig
 
 
@@ -214,7 +264,6 @@ def add_cursor(fig, t):
 CHART_IDS = [
     "g-velocity", "g-handedness",
     "p-spectrogram", "p-f0", "p-intensity",
-    "v-filler", "v-ttr", "v-pauses", "v-hedge", "v-sent-len", "v-confidence",
     "c-shot", "c-h-angle", "c-v-angle", "c-cutrate", "c-facearea", "c-trend",
 ]
 
@@ -258,9 +307,8 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
 
         # ── GESTURE ──────────────────────────────────────────────────────
         html.Div(style=SECTION_STYLE, children=[
-            section_header("Gesture", C["gesture"], "MediaPipe Holistic · Kinematic features"),
+            section_header("Pose Estimation", C["gesture"], "MediaPipe Holistic · Kinematic features"),
 
-            # Upload drop zone
             dcc.Upload(
                 id="video-upload",
                 children=html.Div([
@@ -287,14 +335,10 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
             ),
             html.Div(id="analysis-status", style={"marginBottom": "16px"}),
 
-            # ── Pose Viewer ───────────────────────────────────────────
             html.Div(style={
-                "marginBottom": "28px",
-                "paddingBottom": "24px",
+                "marginBottom": "28px", "paddingBottom": "24px",
                 "borderBottom": f"1px solid {C['border']}",
             }, children=[
-
-                # Controls row: segment selector + landmark toggle
                 html.Div(style={
                     "display": "flex", "alignItems": "flex-end",
                     "justifyContent": "space-between", "flexWrap": "wrap",
@@ -322,7 +366,6 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                     ]),
                 ]),
 
-                # Video with transparent landmark canvas overlay
                 html.Div(style={"position": "relative", "lineHeight": "0"}, children=[
                     html.Video(
                         id="video-player",
@@ -340,7 +383,6 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                     }),
                 ]),
 
-                # Time / window info below the video
                 html.Div(style={
                     "display": "flex", "gap": "32px", "alignItems": "flex-end",
                     "marginTop": "12px", "flexWrap": "wrap",
@@ -361,32 +403,19 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                     ]),
                 ]),
 
-                # Handedness time-series
                 dcc.Graph(id="g-handedness", style={"height": "160px", "marginTop": "20px"},
                           config=CHART_CFG),
             ]),
 
-            # ── Kinematic time-series charts ──────────────────────────
             dcc.Graph(id="g-velocity", style={"height": "200px"}, config=CHART_CFG),
         ]),
 
         # ── ACOUSTIC ──────────────────────────────────────────────────────
         html.Div(style=SECTION_STYLE, children=[
-            section_header("Acoustic", C["prosody"], "Parselmouth · Praat algorithms"),
+            section_header("Acoustic Properties", C["prosody"], "Parselmouth · Praat algorithms"),
             dcc.Graph(id="p-spectrogram", style={"height": "280px"}, config=CHART_CFG),
             dcc.Graph(id="p-f0",        style={"height": "200px"}, config=CHART_CFG),
             dcc.Graph(id="p-intensity", style={"height": "200px"}, config=CHART_CFG),
-        ]),
-
-        # ── VERBAL ────────────────────────────────────────────────────────
-        html.Div(style=SECTION_STYLE, children=[
-            section_header("Verbal", C["verbal"], "faster-whisper · spaCy"),
-            dcc.Graph(id="v-filler",     style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="v-ttr",        style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="v-pauses",     style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="v-hedge",      style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="v-sent-len",   style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="v-confidence", style={"height": "200px"}, config=CHART_CFG),
         ]),
 
         # ── CAMERA ────────────────────────────────────────────────────────
@@ -399,6 +428,135 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
             dcc.Graph(id="c-facearea", style={"height": "200px"}, config=CHART_CFG),
             dcc.Graph(id="c-trend",    style={"height": "200px"}, config=CHART_CFG),
         ]),
+
+        # ── CORPUS ANALYSIS ───────────────────────────────────────────────
+        html.Div(style=SECTION_STYLE, children=[
+            section_header("Verbal Language", C["corpus"],
+                           "spaCy dep parse · local corpus"),
+
+            # ── Search inputs (always visible above corpus tabs) ──────────
+            html.Div(style={"display": "flex", "gap": "10px", "marginBottom": "8px",
+                            "alignItems": "center"}, children=[
+                dcc.Input(
+                    id="kw-input", type="text",
+                    placeholder="Enter keyword or lemma…",
+                    debounce=False, n_submit=0,
+                    style={
+                        "fontFamily": "DM Mono, monospace", "fontSize": "12px",
+                        "flex": "1", "padding": "8px 12px",
+                        "border": f"1px solid {C['border']}", "borderRadius": "6px",
+                        "backgroundColor": C["bg"], "color": C["text"], "outline": "none",
+                    },
+                ),
+                dbc.Button("Search", id="kw-search-btn", size="sm",
+                           style={"backgroundColor": C["corpus"], "border": "none",
+                                  "fontFamily": "DM Mono, monospace", "fontSize": "11px"}),
+            ]),
+            html.Div(style={"display": "flex", "gap": "10px", "marginBottom": "20px",
+                            "alignItems": "center"}, children=[
+                html.Span("vs.", style={
+                    "fontFamily": "DM Mono, monospace", "fontSize": "11px",
+                    "color": C["muted"], "whiteSpace": "nowrap",
+                }),
+                dcc.Input(
+                    id="kw-input2", type="text",
+                    placeholder="Second keyword for Word Sketch Difference (optional)…",
+                    debounce=False, n_submit=0,
+                    style={
+                        "fontFamily": "DM Mono, monospace", "fontSize": "12px",
+                        "flex": "1", "padding": "8px 12px",
+                        "border": f"1px solid {C['border']}", "borderRadius": "6px",
+                        "backgroundColor": C["bg"], "color": C["text"], "outline": "none",
+                    },
+                ),
+            ]),
+
+            # ── Corpus tabs ───────────────────────────────────────────────
+            dcc.Tabs(id="corpus-tabs", value="corpus-transcript", style={
+                "marginBottom": "0",
+            }, children=[
+
+                # Tab: Transcript ──────────────────────────────────────
+                dcc.Tab(label="Transcript", value="corpus-transcript",
+                        style=_TAB_BASE, selected_style=_tab_sel(C["corpus"]),
+                        children=[html.Div(style={"paddingTop": "20px"}, children=[
+                    html.P("FULL TRANSCRIPT", style=LABEL_STYLE_C),
+                    html.P("Current scene is highlighted as the video plays.",
+                           style={"fontFamily": "DM Mono, monospace", "fontSize": "10px",
+                                  "color": C["muted"], "marginTop": "2px",
+                                  "marginBottom": "14px"}),
+                    html.Div(
+                        id="transcript-view",
+                        style={
+                            "overflowY": "auto",
+                            "maxHeight": "560px",
+                            "border": f"1px solid {C['border']}",
+                            "borderRadius": "6px",
+                            "padding": "4px 0",
+                        },
+                    ),
+                ])]),
+
+                # Tab: Concordance ─────────────────────────────────────
+                dcc.Tab(label="Concordance", value="corpus-concordance",
+                        style=_TAB_BASE, selected_style=_tab_sel(C["corpus"]),
+                        children=[html.Div(style={"paddingTop": "20px"}, children=[
+                    html.Div(id="kw-stats", style={
+                        "fontFamily": "DM Mono, monospace", "fontSize": "11px",
+                        "color": C["muted"], "marginBottom": "10px",
+                    }),
+                    html.Div(id="kw-concordance",
+                             style={"marginTop": "16px"}),
+                ])]),
+
+                # Tab: Word Sketch & Thesaurus ─────────────────────────
+                dcc.Tab(label="Word Sketch & Thesaurus", value="corpus-wordsketch",
+                        style=_TAB_BASE, selected_style=_tab_sel(C["corpus"]),
+                        children=[html.Div(style={"paddingTop": "20px"}, children=[
+                    html.P("WORD SKETCH", style=LABEL_STYLE_C),
+                    html.Div(id="kw-sketch-panel",
+                             style={"marginTop": "8px", "minHeight": "60px",
+                                    "marginBottom": "28px"}),
+                    html.Hr(style={"borderColor": C["border"], "margin": "0 0 20px 0"}),
+                    html.P("DISTRIBUTIONAL THESAURUS", style=LABEL_STYLE_C),
+                    html.Div(id="kw-thesaurus-panel",
+                             style={"marginTop": "8px", "minHeight": "60px",
+                                    "marginBottom": "28px"}),
+                    html.Hr(style={"borderColor": C["border"], "margin": "0 0 20px 0"}),
+                    html.Div(id="kw-diff-panel"),
+                ])]),
+
+                # Tab: Frequency ───────────────────────────────────────
+                dcc.Tab(label="Frequency", value="corpus-frequency",
+                        style=_TAB_BASE, selected_style=_tab_sel(C["corpus"]),
+                        children=[html.Div(style={"paddingTop": "20px"}, children=[
+                    html.Div(style={"display": "flex", "alignItems": "center",
+                                    "gap": "16px", "marginBottom": "10px"}, children=[
+                        html.P("WORD LIST", style={**LABEL_STYLE, "marginBottom": "0"}),
+                        dcc.Dropdown(
+                            id="pos-filter",
+                            options=[
+                                {"label": "All words",          "value": "ALL"},
+                                {"label": "Noun (NOUN/PROPN)",  "value": "NOUN"},
+                                {"label": "Verb (VERB/AUX)",    "value": "VERB"},
+                                {"label": "Adjective (ADJ)",    "value": "ADJ"},
+                                {"label": "Adverb (ADV)",       "value": "ADV"},
+                                {"label": "Other",              "value": "OTHER"},
+                            ],
+                            value="ALL",
+                            clearable=False,
+                            style={"width": "200px",
+                                   "fontFamily": "DM Mono, monospace",
+                                   "fontSize": "11px"},
+                        ),
+                    ]),
+                    dcc.Graph(id="kw-wordlist-chart", config=CHART_CFG),
+                    html.P("N-GRAMS", style={**LABEL_STYLE, "marginTop": "28px"}),
+                    dcc.Graph(id="kw-ngrams-chart",
+                              style={"height": "380px"}, config=CHART_CFG),
+                ])]),
+            ]),
+        ]),
     ]),
 
     # ── Hidden stores ─────────────────────────────────────────────────────────
@@ -409,6 +567,12 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
     dcc.Store(id="pose-timeline", data=None),
     dcc.Store(id="pose-render-dummy"),
     dcc.Store(id="landmarks-visible", data=True),
+    dcc.Store(id="keyword-occurrences", data=[]),
+    dcc.Store(id="active-keyword", data=None),
+    dcc.Store(id="second-keyword", data=None),
+    dcc.Store(id="window-times", data=[]),
+    dcc.Store(id="transcript-hl-dummy"),
+    dcc.Store(id="seek-to", data=None),
     dcc.Interval(id="poll-interval", interval=2000, n_intervals=0, disabled=True),
 ])
 
@@ -448,6 +612,63 @@ clientside_callback(
     """,
     Output("current-time-display", "children"),
     Input("current-time", "data"),
+)
+
+# seek-to store → seek video + propagate to current-time (for prev/next buttons)
+clientside_callback(
+    """
+    function(t) {
+        if (t === null || t === undefined) return window.dash_clientside.no_update;
+        var video = document.getElementById('video-player');
+        if (video && video.src) { video.currentTime = parseFloat(t); }
+        return parseFloat(t);
+    }
+    """,
+    Output("current-time", "data", allow_duplicate=True),
+    Input("seek-to", "data"),
+    prevent_initial_call=True,
+)
+
+# Set up a native browser setInterval when window-times loads.
+# Runs entirely outside Dash so it never triggers page scroll.
+clientside_callback(
+    """
+    function(times) {
+        if (window._transcriptHlInterval) {
+            clearInterval(window._transcriptHlInterval);
+            window._transcriptHlInterval = null;
+        }
+        if (!times || !times.length) return '';
+        window._transcriptHlInterval = setInterval(function() {
+            var video = document.getElementById('video-player');
+            if (!video) return;
+            var t = video.currentTime || 0;
+            var activeIdx = -1;
+            for (var i = 0; i < times.length; i++) {
+                if (t >= times[i].start && t < times[i].end) { activeIdx = i; break; }
+            }
+            var prev = document.querySelector('[data-ts-active="1"]');
+            if (prev) {
+                var prevIdx = parseInt(prev.getAttribute('data-ts-active-idx'), 10);
+                if (prevIdx === activeIdx) return;
+                prev.style.backgroundColor = '';
+                prev.removeAttribute('data-ts-active');
+                prev.removeAttribute('data-ts-active-idx');
+            }
+            if (activeIdx === -1) return;
+            var el = document.getElementById('ts-seg-' + activeIdx);
+            if (el) {
+                el.style.backgroundColor = 'rgba(67, 97, 238, 0.12)';
+                el.setAttribute('data-ts-active', '1');
+                el.setAttribute('data-ts-active-idx', activeIdx);
+            }
+        }, 500);
+        return '';
+    }
+    """,
+    Output("transcript-hl-dummy", "data"),
+    Input("window-times", "data"),
+    prevent_initial_call=True,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -554,15 +775,12 @@ def render_kpis(data):
                           style={"fontFamily": "DM Mono, monospace", "fontSize": "11px", "color": C["gesture"]})]
     duration    = ws[-1].window.end_s if ws else 0
     total_words = sum(w.verbal.word_count for w in ws if w.verbal)
-    fillers     = sum(w.verbal.filler_word_count for w in ws if w.verbal)
     mean_f0     = _mean([w.prosody.mean_f0 for w in ws if w.prosody and w.prosody.mean_f0])
     mean_vel    = _mean([w.gesture.mean_wrist_velocity for w in ws if w.gesture])
     total_cuts  = sum(w.camera.cut_count for w in ws if w.camera)
     return [
         kpi_card("Duration",   f"{duration:.0f}s",                      C["muted"]),
         kpi_card("Words",      str(total_words),                         C["verbal"]),
-        kpi_card("Fillers",    str(fillers), C["gesture"],
-                 f"{fillers/max(total_words,1)*100:.1f}% of words"),
         kpi_card("Mean F0",    f"{mean_f0:.0f} Hz" if mean_f0 else "—", C["prosody"]),
         kpi_card("Wrist Vel.", f"{mean_vel:.0f} px/s" if mean_vel else "—", C["gesture"]),
         kpi_card("Cuts",       str(total_cuts),                          C["camera"]),
@@ -591,8 +809,8 @@ def update_window_display(t, data):
 # Chart callbacks — Gesture
 # ─────────────────────────────────────────────────────────────────────────────
 
-@callback(Output("g-velocity", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def g_velocity(data, ct):
+@callback(Output("g-velocity", "figure"), Input("fused-data", "data"), Input("current-time", "data"), Input("keyword-occurrences", "data"))
+def g_velocity(data, ct, occ):
     if not data: return empty_fig("Wrist Velocity")
     ws, t = _parse(data)
     fig = go.Figure(go.Scatter(
@@ -601,7 +819,7 @@ def g_velocity(data, ct):
         fill="tozeroy", fillcolor="rgba(200,75,49,0.08)", name="px/s",
     ))
     _style(fig, "Wrist Velocity", "px/s")
-    return add_cursor(fig, ct)
+    return add_cursor(fig, ct, occ)
 
 
 
@@ -816,8 +1034,8 @@ clientside_callback(
 )
 
 
-@callback(Output("g-handedness", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def g_handedness(data, ct):
+@callback(Output("g-handedness", "figure"), Input("fused-data", "data"), Input("current-time", "data"), Input("keyword-occurrences", "data"))
+def g_handedness(data, ct, occ):
     if not data:
         return empty_fig("Handedness  (R−L) / (R+L)")
     ws, t = _parse(data)
@@ -838,7 +1056,7 @@ def g_handedness(data, ct):
                        "ticktext": ["-1", "-0.5", "0", "0.5", "1"]}
     layout["title"] = dict(text="Handedness  (R−L) / (R+L)", font=dict(size=11, color=C["muted"]))
     fig.update_layout(**layout)
-    return add_cursor(fig, ct)
+    return add_cursor(fig, ct, occ)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -848,9 +1066,10 @@ def g_handedness(data, ct):
 @callback(
     Output("p-spectrogram", "figure"),
     Input("fused-data", "data"),
+    Input("keyword-occurrences", "data"),
     State("active-job-id", "data"),
 )
-def p_spectrogram(data, job_id):
+def p_spectrogram(data, occ, job_id):
     if not data or not job_id:
         return empty_fig("Spectrogram")
     sg = store.get_spectrogram(job_id)
@@ -860,7 +1079,7 @@ def p_spectrogram(data, job_id):
         x=sg["times"],
         y=sg["freqs"],
         z=sg["data"],
-        colorscale="viridis",
+        colorscale="greys",
         showscale=True,
         colorbar=dict(
             title=dict(text="dB", side="right",
@@ -889,11 +1108,14 @@ def p_spectrogram(data, job_id):
             showgrid=False, zeroline=False, showspikes=False,
         ),
     )
+    if occ:
+        for o in occ:
+            fig.add_vline(x=o["start_s"], line=dict(color=KW_COLOUR, width=2), opacity=0.7)
     return fig
 
 
-@callback(Output("p-f0", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def p_f0(data, ct):
+@callback(Output("p-f0", "figure"), Input("fused-data", "data"), Input("current-time", "data"), Input("keyword-occurrences", "data"))
+def p_f0(data, ct, occ):
     if not data: return empty_fig("Pitch (F0)")
     ws, t = _parse(data)
     mean_f0 = [w.prosody.mean_f0 if w.prosody and w.prosody.mean_f0 else None for w in ws]
@@ -910,11 +1132,11 @@ def p_f0(data, ct):
         line=dict(color=C["prosody"], width=2), name="F0 Hz",
     ))
     _style(fig, "Pitch (F0) ± std", "Hz")
-    return add_cursor(fig, ct)
+    return add_cursor(fig, ct, occ)
 
 
-@callback(Output("p-intensity", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def p_intensity(data, ct):
+@callback(Output("p-intensity", "figure"), Input("fused-data", "data"), Input("current-time", "data"), Input("keyword-occurrences", "data"))
+def p_intensity(data, ct, occ):
     if not data: return empty_fig("Intensity")
     ws, t = _parse(data)
     fig = go.Figure(go.Scatter(
@@ -923,7 +1145,7 @@ def p_intensity(data, ct):
         fill="tozeroy", fillcolor="rgba(45,106,79,0.08)", name="dB",
     ))
     _style(fig, "Intensity", "dB")
-    return add_cursor(fig, ct)
+    return add_cursor(fig, ct, occ)
 
 
 
@@ -931,82 +1153,6 @@ def p_intensity(data, ct):
 # ─────────────────────────────────────────────────────────────────────────────
 # Chart callbacks — Verbal
 # ─────────────────────────────────────────────────────────────────────────────
-
-@callback(Output("v-filler", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def v_filler(data, ct):
-    if not data: return empty_fig("Filler Rate")
-    ws, t = _parse(data)
-    fig = go.Figure(go.Bar(
-        x=t, y=[w.verbal.filler_word_rate if w.verbal else None for w in ws],
-        marker_color=C["verbal"], marker_opacity=0.7, name="per min",
-    ))
-    _style(fig, "Filler Word Rate", "per minute")
-    return add_cursor(fig, ct)
-
-
-@callback(Output("v-ttr", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def v_ttr(data, ct):
-    if not data: return empty_fig("Type-Token Ratio")
-    ws, t = _parse(data)
-    fig = go.Figure(go.Scatter(
-        x=t, y=[w.verbal.type_token_ratio if w.verbal else None for w in ws],
-        mode="lines", line=dict(color=C["verbal"], width=2),
-        fill="tozeroy", fillcolor="rgba(27,79,138,0.08)", name="TTR",
-    ))
-    fig.add_hline(y=0.5, line=dict(color=C["muted"], width=1, dash="dash"))
-    _style(fig, "Type-Token Ratio", "0–1")
-    return add_cursor(fig, ct)
-
-
-@callback(Output("v-pauses", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def v_pauses(data, ct):
-    if not data: return empty_fig("Pauses")
-    ws, t = _parse(data)
-    fig = go.Figure(go.Bar(
-        x=t, y=[w.verbal.pause_count if w.verbal else None for w in ws],
-        marker_color=C["verbal"], marker_opacity=0.6, name="count",
-    ))
-    _style(fig, "Pause Count", "count")
-    return add_cursor(fig, ct)
-
-
-@callback(Output("v-hedge", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def v_hedge(data, ct):
-    if not data: return empty_fig("Hedge Words")
-    ws, t = _parse(data)
-    fig = go.Figure(go.Bar(
-        x=t, y=[w.verbal.hedge_count if w.verbal else None for w in ws],
-        marker_color=C["verbal"], marker_opacity=0.6, name="count",
-    ))
-    _style(fig, "Hedge Word Count", "count")
-    return add_cursor(fig, ct)
-
-
-@callback(Output("v-sent-len", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def v_sent_len(data, ct):
-    if not data: return empty_fig("Sentence Length")
-    ws, t = _parse(data)
-    fig = go.Figure(go.Scatter(
-        x=t, y=[w.verbal.mean_sentence_length if w.verbal else None for w in ws],
-        mode="lines+markers", line=dict(color=C["verbal"], width=1.5),
-        marker=dict(size=3), name="words",
-    ))
-    _style(fig, "Mean Sentence Length", "words")
-    return add_cursor(fig, ct)
-
-
-@callback(Output("v-confidence", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def v_confidence(data, ct):
-    if not data: return empty_fig("Word Confidence")
-    ws, t = _parse(data)
-    fig = go.Figure(go.Scatter(
-        x=t, y=[w.verbal.mean_word_confidence if w.verbal else None for w in ws],
-        mode="lines", line=dict(color=C["verbal"], width=2),
-        fill="tozeroy", fillcolor="rgba(27,79,138,0.08)", name="conf",
-    ))
-    fig.add_hline(y=0.8, line=dict(color=C["muted"], width=1, dash="dash"))
-    _style(fig, "ASR Word Confidence", "0–1")
-    return add_cursor(fig, ct)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Chart callbacks — Camera
@@ -1023,8 +1169,8 @@ SHOT_COLOURS = {
     "unknown":          C["muted"],
 }
 
-@callback(Output("c-shot", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def c_shot(data, ct):
+@callback(Output("c-shot", "figure"), Input("fused-data", "data"), Input("current-time", "data"), Input("keyword-occurrences", "data"))
+def c_shot(data, ct, occ):
     if not data: return empty_fig("Shot Type")
     ws, t = _parse(data)
     shot_types = [w.camera.dominant_shot_type.value if w.camera else "unknown" for w in ws]
@@ -1042,7 +1188,7 @@ def c_shot(data, ct):
         yaxis=dict(showticklabels=False, showgrid=False),
         bargap=0.05,
     )
-    return add_cursor(fig, ct)
+    return add_cursor(fig, ct, occ)
 
 
 H_ANGLE_COLOURS = {
@@ -1059,8 +1205,8 @@ V_ANGLE_COLOURS = {
 }
 
 
-@callback(Output("c-h-angle", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def c_h_angle(data, ct):
+@callback(Output("c-h-angle", "figure"), Input("fused-data", "data"), Input("current-time", "data"), Input("keyword-occurrences", "data"))
+def c_h_angle(data, ct, occ):
     if not data: return empty_fig("Horizontal Angle")
     ws, t = _parse(data)
     yaws = [w.camera.mean_shoulder_yaw_deg if w.camera and w.camera.mean_shoulder_yaw_deg is not None else None for w in ws]
@@ -1086,11 +1232,11 @@ def c_h_angle(data, ct):
                    zeroline=False, tickfont=dict(size=10)),
         bargap=0.05,
     )
-    return add_cursor(fig, ct)
+    return add_cursor(fig, ct, occ)
 
 
-@callback(Output("c-v-angle", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def c_v_angle(data, ct):
+@callback(Output("c-v-angle", "figure"), Input("fused-data", "data"), Input("current-time", "data"), Input("keyword-occurrences", "data"))
+def c_v_angle(data, ct, occ):
     if not data: return empty_fig("Vertical Angle")
     ws, t = _parse(data)
     pitches = [w.camera.mean_face_pitch_deg if w.camera and w.camera.mean_face_pitch_deg is not None else None for w in ws]
@@ -1118,23 +1264,23 @@ def c_v_angle(data, ct):
                    zeroline=False, tickfont=dict(size=10)),
         bargap=0.05,
     )
-    return add_cursor(fig, ct)
+    return add_cursor(fig, ct, occ)
 
 
-@callback(Output("c-cutrate", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def c_cutrate(data, ct):
-    if not data: return empty_fig("Cut Rate")
+@callback(Output("c-cutrate", "figure"), Input("fused-data", "data"), Input("current-time", "data"), Input("keyword-occurrences", "data"))
+def c_cutrate(data, ct, occ):
+    if not data: return empty_fig("Scene Cuts")
     ws, t = _parse(data)
     fig = go.Figure(go.Bar(
-        x=t, y=[w.camera.cut_rate if w.camera else None for w in ws],
-        marker_color=C["camera"], marker_opacity=0.7, name="per min",
+        x=t, y=[w.camera.cut_count if w.camera else None for w in ws],
+        marker_color=C["camera"], marker_opacity=0.7, name="cuts",
     ))
-    _style(fig, "Scene Cut Rate", "cuts/min")
-    return add_cursor(fig, ct)
+    _style(fig, "Scene Cuts", "cuts")
+    return add_cursor(fig, ct, occ)
 
 
-@callback(Output("c-facearea", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def c_facearea(data, ct):
+@callback(Output("c-facearea", "figure"), Input("fused-data", "data"), Input("current-time", "data"), Input("keyword-occurrences", "data"))
+def c_facearea(data, ct, occ):
     if not data: return empty_fig("Face Area")
     ws, t = _parse(data)
     vals = [w.camera.mean_face_bbox_area * 100 if w.camera and w.camera.mean_face_bbox_area else None for w in ws]
@@ -1144,11 +1290,11 @@ def c_facearea(data, ct):
         fill="tozeroy", fillcolor="rgba(123,94,167,0.08)", name="%",
     ))
     _style(fig, "Mean Face Area (zoom proxy)", "% of frame")
-    return add_cursor(fig, ct)
+    return add_cursor(fig, ct, occ)
 
 
-@callback(Output("c-trend", "figure"), Input("fused-data", "data"), Input("current-time", "data"))
-def c_trend(data, ct):
+@callback(Output("c-trend", "figure"), Input("fused-data", "data"), Input("current-time", "data"), Input("keyword-occurrences", "data"))
+def c_trend(data, ct, occ):
     if not data: return empty_fig("Zoom Trend")
     ws, t = _parse(data)
     vals = [w.camera.face_bbox_trend if w.camera and w.camera.face_bbox_trend is not None else None for w in ws]
@@ -1159,7 +1305,492 @@ def c_trend(data, ct):
     ))
     fig.add_hline(y=0, line=dict(color=C["muted"], width=1))
     _style(fig, "Zoom Trend  (+ = zoom in)", "slope")
-    return add_cursor(fig, ct)
+    return add_cursor(fig, ct, occ)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Corpus Analysis callbacks
+# ─────────────────────────────────────────────────────────────────────────────
+
+@callback(
+    Output("keyword-occurrences", "data"),
+    Output("active-keyword", "data"),
+    Output("second-keyword", "data"),
+    Input("kw-search-btn", "n_clicks"),
+    Input("kw-input", "n_submit"),
+    State("kw-input", "value"),
+    State("kw-input2", "value"),
+    State("fused-data", "data"),
+    prevent_initial_call=True,
+)
+def kw_search(_, __, keyword, keyword2, data):
+    if not keyword or not keyword.strip() or not data:
+        return [], None, None
+    kw = keyword.strip().lower()
+    kw2 = keyword2.strip().lower() if keyword2 and keyword2.strip() else None
+    ws, _ = _parse(data)
+    occurrences = []
+    for w in ws:
+        if not w.verbal or not w.verbal.tokens:
+            continue
+        tokens = w.verbal.tokens
+        for i, tok in enumerate(tokens):
+            tok_clean = re.sub(r"^[^\w]+|[^\w]+$", "", tok.word, flags=re.UNICODE).lower()
+            if tok_clean == kw:
+                left  = " ".join(t.word for t in tokens[max(0, i - 4):i])
+                right = " ".join(t.word for t in tokens[i + 1:i + 5])
+                occurrences.append({
+                    "word":          tok.word,
+                    "start_s":       tok.start_s,
+                    "end_s":         tok.end_s,
+                    "context_left":  left,
+                    "context_right": right,
+                    "window_start":  w.window.start_s,
+                })
+    return occurrences, keyword, kw2
+
+
+@callback(
+    Output("kw-stats", "children"),
+    Input("keyword-occurrences", "data"),
+    Input("active-keyword", "data"),
+)
+def kw_stats(occ, keyword):
+    if not occ or not keyword:
+        return ""
+    return f'"{keyword}"  —  {len(occ)} occurrence{"s" if len(occ) != 1 else ""}'
+
+
+@callback(
+    Output("kw-concordance", "children"),
+    Input("keyword-occurrences", "data"),
+    Input("active-keyword", "data"),
+)
+def kw_concordance(occ, keyword):
+    if not keyword:
+        return html.Div()
+    if not occ:
+        return html.P(
+            f'No occurrences of "{keyword}" found in the transcript.',
+            style={"fontFamily": "DM Mono, monospace", "fontSize": "11px",
+                   "color": C["muted"], "marginTop": "8px"},
+        )
+
+    mono = {"fontFamily": "DM Mono, monospace", "fontSize": "11px"}
+    rows = []
+    for i, o in enumerate(occ):
+        m, s = divmod(int(o["start_s"]), 60)
+        ts_label = f"{m}:{s:02d}"
+        rows.append(html.Div(style={
+            "display": "flex", "alignItems": "baseline", "gap": "12px",
+            "padding": "5px 0",
+            "borderBottom": f"1px solid {C['border']}",
+        }, children=[
+            dbc.Button(ts_label, id={"type": "conc-seek", "index": i},
+                       size="sm", color="link",
+                       style={**mono, "color": KW_COLOUR, "padding": "0",
+                              "minWidth": "36px", "textAlign": "right"}),
+            html.Span(o["context_left"] + " ", style={**mono, "color": C["muted"],
+                                                       "textAlign": "right", "flex": "1"}),
+            html.Span(o["word"].upper(),
+                      style={**mono, "color": KW_COLOUR, "fontWeight": "600",
+                             "whiteSpace": "nowrap"}),
+            html.Span(" " + o["context_right"], style={**mono, "color": C["muted"], "flex": "1"}),
+        ]))
+
+    return html.Div([
+        html.P("CONCORDANCE", style={**LABEL_STYLE, "marginBottom": "8px"}),
+        html.Div(rows),
+    ])
+
+
+@callback(
+    Output("seek-to", "data"),
+    Input({"type": "conc-seek", "index": ALL}, "n_clicks"),
+    State("keyword-occurrences", "data"),
+    prevent_initial_call=True,
+)
+def conc_seek(_, occurrences):
+    ctx = dash.callback_context
+    if not ctx.triggered_id or not occurrences:
+        return dash.no_update
+    idx = ctx.triggered_id.get("index", -1)
+    if 0 <= idx < len(occurrences):
+        return occurrences[idx]["start_s"]
+    return dash.no_update
+
+
+
+@callback(
+    Output("kw-sketch-panel", "children"),
+    Input("active-keyword", "data"),
+    State("active-job-id", "data"),
+    prevent_initial_call=True,
+)
+def kw_sketch(keyword, job_id):
+    if not keyword or not job_id:
+        return html.Div()
+    collocations = store.get_collocations(job_id)
+    if not collocations:
+        return html.P("No collocations data — run analysis first.",
+                      style={"fontFamily": "DM Mono, monospace", "fontSize": "10px",
+                             "color": C["muted"]})
+    sketch = corpus_analysis.get_word_sketch(collocations, keyword)
+    if not sketch["found"]:
+        return html.P(f'"{keyword}" not found in transcript collocations.',
+                      style={"fontFamily": "DM Mono, monospace", "fontSize": "10px",
+                             "color": C["muted"]})
+    mono = {"fontFamily": "DM Mono, monospace", "fontSize": "10px"}
+    sections = []
+    for rel in sketch["relations"]:
+        words = rel["words"]
+        if not words:
+            continue
+        sections.append(html.Div([
+            html.P(rel["name"].upper(),
+                   style={**LABEL_STYLE, "marginBottom": "4px", "marginTop": "10px"}),
+            html.Div([
+                html.Span(
+                    f"{w[0]} ({w[1]})",
+                    style={**mono, "color": C["corpus"],
+                           "marginRight": "12px", "display": "inline-block"},
+                )
+                for w in words
+            ]),
+        ]))
+    return html.Div(sections) if sections else html.P(
+        "No collocational relations found.",
+        style={"fontFamily": "DM Mono, monospace", "fontSize": "10px", "color": C["muted"]})
+
+
+@callback(
+    Output("kw-thesaurus-panel", "children"),
+    Input("active-keyword", "data"),
+    State("active-job-id", "data"),
+    prevent_initial_call=True,
+)
+def kw_thesaurus(keyword, job_id):
+    if not keyword or not job_id:
+        return html.Div()
+    collocations = store.get_collocations(job_id)
+    if not collocations:
+        return html.P("No collocations data — run analysis first.",
+                      style={"fontFamily": "DM Mono, monospace", "fontSize": "10px",
+                             "color": C["muted"]})
+    similar = corpus_analysis.distributional_thesaurus(collocations, keyword, top_n=100)
+    if not similar:
+        return html.P(
+            f'No distributionally similar words found for "{keyword}". '
+            "The transcript may be too short for reliable similarity.",
+            style={"fontFamily": "DM Mono, monospace", "fontSize": "10px", "color": C["muted"]})
+
+    wl = store.get_wordlist(job_id)
+    freq_map: dict[str, int] = {}
+    if wl and wl.get("words"):
+        freq_map = {e["lemma"]: e["count"] for e in wl["words"]}
+
+    rows = [
+        {
+            "rank":     i + 1,
+            "word":     s["word"],
+            "freq":     freq_map.get(s["word"], 0),
+            "jaccard":  s["score"],
+            "shared":   s["shared"],
+        }
+        for i, s in enumerate(similar)
+    ]
+
+    mono_sm = "DM Mono, monospace"
+    return html.Div([
+        html.P(f"Top {len(similar)} similar words · Jaccard similarity",
+               style={**LABEL_STYLE, "marginBottom": "10px"}),
+        dash_table.DataTable(
+            data=rows,
+            columns=[
+                {"name": "#",                  "id": "rank"},
+                {"name": "Word",               "id": "word"},
+                {"name": "Frequency",          "id": "freq"},
+                {"name": "Jaccard Similarity", "id": "jaccard"},
+                {"name": "Shared Contexts",    "id": "shared"},
+            ],
+            sort_action="native",
+            page_size=25,
+            style_table={
+                "overflowY": "auto",
+                "maxHeight": "520px",
+                "border": f"1px solid {C['border']}",
+                "borderRadius": "4px",
+            },
+            style_cell={
+                "fontFamily":       mono_sm,
+                "fontSize":         "11px",
+                "color":            C["text"],
+                "backgroundColor":  C["surface"],
+                "border":           f"1px solid {C['border']}",
+                "padding":          "6px 14px",
+                "textAlign":        "left",
+                "whiteSpace":       "normal",
+            },
+            style_header={
+                "fontFamily":      mono_sm,
+                "fontSize":        "10px",
+                "letterSpacing":   "0.07em",
+                "textTransform":   "uppercase",
+                "color":           C["muted"],
+                "backgroundColor": C["bg"],
+                "border":          f"1px solid {C['border']}",
+                "padding":         "8px 14px",
+                "fontWeight":      "normal",
+            },
+            style_data_conditional=[
+                {"if": {"row_index": "odd"}, "backgroundColor": C["bg"]},
+            ],
+            style_cell_conditional=[
+                {"if": {"column_id": "rank"},    "width": "44px",  "textAlign": "right"},
+                {"if": {"column_id": "freq"},    "width": "100px", "textAlign": "right"},
+                {"if": {"column_id": "jaccard"}, "width": "140px", "textAlign": "right"},
+                {"if": {"column_id": "shared"},  "width": "130px", "textAlign": "right"},
+            ],
+        ),
+    ])
+
+
+@callback(
+    Output("kw-diff-panel", "children"),
+    Input("active-keyword", "data"),
+    Input("second-keyword", "data"),
+    State("active-job-id", "data"),
+    prevent_initial_call=True,
+)
+def kw_diff(kw1, kw2, job_id):
+    if not kw1 or not kw2 or not job_id:
+        return html.Div()
+    collocations = store.get_collocations(job_id)
+    if not collocations:
+        return html.Div()
+    diff = corpus_analysis.word_sketch_diff(collocations, kw1, kw2)
+    if not diff["relations"]:
+        return html.P(
+            f'No comparable collocations between "{kw1}" and "{kw2}".',
+            style={"fontFamily": "DM Mono, monospace", "fontSize": "10px", "color": C["muted"]})
+
+    mono = {"fontFamily": "DM Mono, monospace", "fontSize": "10px"}
+    col1_style = {**mono, "color": C["gesture"],  "display": "inline-block",
+                  "marginRight": "8px", "marginBottom": "3px"}
+    col2_style = {**mono, "color": C["prosody"],  "display": "inline-block",
+                  "marginRight": "8px", "marginBottom": "3px"}
+    shared_style = {**mono, "color": C["corpus"], "display": "inline-block",
+                    "marginRight": "8px", "marginBottom": "3px"}
+
+    blocks = [
+        html.P("WORD SKETCH DIFFERENCE", style={**LABEL_STYLE, "marginBottom": "10px"}),
+        html.Div(style={"display": "flex", "gap": "28px", "marginBottom": "8px"}, children=[
+            html.Span(f"● {kw1}", style={**mono, "color": C["gesture"], "fontWeight": "500"}),
+            html.Span(f"● {kw2}", style={**mono, "color": C["prosody"], "fontWeight": "500"}),
+            html.Span("● shared", style={**mono, "color": C["corpus"], "fontWeight": "500"}),
+        ]),
+    ]
+
+    for rel_key, rel_data in diff["relations"].items():
+        cells = []
+        for w, c in rel_data["only1"]:
+            cells.append(html.Span(f"{w}({c})", style=col1_style))
+        for w, c1, c2 in rel_data["shared"]:
+            cells.append(html.Span(f"{w}({c1}/{c2})", style=shared_style))
+        for w, c in rel_data["only2"]:
+            cells.append(html.Span(f"{w}({c})", style=col2_style))
+        if cells:
+            blocks.append(html.Div([
+                html.P(rel_data["name"].upper(),
+                       style={**LABEL_STYLE, "marginTop": "10px", "marginBottom": "4px"}),
+                html.Div(cells),
+            ]))
+
+    return html.Div(blocks, style={
+        "borderTop": f"1px solid {C['border']}", "paddingTop": "20px",
+    })
+
+
+@callback(
+    Output("transcript-view", "children"),
+    Output("window-times", "data"),
+    Input("fused-data", "data"),
+    prevent_initial_call=True,
+)
+def load_transcript(fused_raw):
+    if not fused_raw:
+        return html.Div(), []
+    ws, _ = _parse(fused_raw)
+    segs = []
+    times = []
+    mono = "DM Mono, monospace"
+    for idx, w in enumerate(ws):
+        start = w.window.start_s
+        end = w.window.end_s
+        text = (w.verbal.transcript if w.verbal else "") or ""
+        times.append({"start": start, "end": end})
+        ts_label = f"{int(start)//60}:{int(start)%60:02d} – {int(end)//60}:{int(end)%60:02d}"
+        segs.append(html.Div(
+            id=f"ts-seg-{idx}",
+            children=[
+                html.Span(ts_label, style={
+                    "fontFamily": mono, "fontSize": "9px",
+                    "color": C["muted"], "display": "block",
+                    "marginBottom": "5px",
+                }),
+                html.Span(text or "—", style={
+                    "fontFamily": "'Inter', 'DM Sans', sans-serif",
+                    "fontSize": "13px", "color": C["text"], "lineHeight": "1.75",
+                }),
+            ],
+            style={
+                "padding": "12px 16px",
+                "borderBottom": f"1px solid {C['border']}",
+                "transition": "background-color 0.25s ease",
+                "cursor": "default",
+            },
+        ))
+    return segs, times
+
+
+_POS_FILTER_SETS: dict[str, set[str]] = {
+    "NOUN":  {"NOUN", "PROPN"},
+    "VERB":  {"VERB", "AUX"},
+    "ADJ":   {"ADJ"},
+    "ADV":   {"ADV"},
+}
+_KNOWN_POS = {"NOUN", "PROPN", "VERB", "AUX", "ADJ", "ADV"}
+
+POS_COLOUR = {
+    "NOUN": C["verbal"],  "PROPN": C["verbal"],
+    "VERB": C["prosody"], "AUX":   C["prosody"],
+    "ADJ":  C["cursor"],  "ADV":   C["camera"],
+}
+
+@callback(
+    Output("kw-wordlist-chart", "figure"),
+    Input("fused-data", "data"),
+    Input("pos-filter", "value"),
+    State("active-job-id", "data"),
+)
+def kw_wordlist_chart(data, pos_filter, job_id):
+    if not data or not job_id:
+        return empty_fig("Word List")
+    wl = store.get_wordlist(job_id)
+    if not wl or not wl.get("words"):
+        return empty_fig("Word List")
+
+    pos_filter = pos_filter or "ALL"
+    all_entries = wl["words"]
+    if pos_filter == "ALL":
+        entries = all_entries
+    elif pos_filter == "OTHER":
+        entries = [e for e in all_entries if e["pos"] not in _KNOWN_POS]
+    else:
+        allowed = _POS_FILTER_SETS.get(pos_filter, set())
+        entries = [e for e in all_entries if e["pos"] in allowed]
+
+    if not entries:
+        return empty_fig("Word List — no words match this filter")
+
+    entries_rev = list(reversed(entries))
+    colours  = [POS_COLOUR.get(e["pos"], C["muted"]) for e in entries_rev]
+    labels   = [e["lemma"] for e in entries_rev]
+    counts   = [e["count"] for e in entries_rev]
+    pos_tags = [e["pos"] for e in entries_rev]
+
+    _PX_PER_BAR = 22
+    fig_height = max(420, len(entries_rev) * _PX_PER_BAR + 72)
+
+    fig = go.Figure(go.Bar(
+        x=counts,
+        y=labels,
+        orientation="h",
+        marker_color=colours,
+        customdata=pos_tags,
+        hovertemplate="%{y}  |  %{customdata}  |  count: %{x}<extra></extra>",
+        showlegend=False,
+    ))
+    fig.update_layout(
+        uirevision=f"{job_id}_{pos_filter or 'ALL'}",
+        autosize=False,
+        height=fig_height,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="DM Mono, monospace", color=C["text"], size=11),
+        title=dict(text=f"{len(entries)} Content Words  ·  NOUN  VERB  ADJ  ADV",
+                   font=dict(size=11, color=C["muted"])),
+        xaxis=dict(showgrid=True, gridcolor=C["border"], zeroline=False,
+                   side="bottom",
+                   tickmode="linear", dtick=1, tickformat="d",
+                   title=dict(text="count", font=dict(size=10, color=C["muted"])),
+                   tickfont=dict(size=10)),
+        yaxis=dict(showgrid=False, zeroline=False, tickfont=dict(size=10), automargin=True),
+        hovermode="y unified",
+        margin=dict(l=110, r=24, t=48, b=16),
+    )
+    return fig
+
+
+@callback(
+    Output("kw-ngrams-chart", "figure"),
+    Input("fused-data", "data"),
+    State("active-job-id", "data"),
+)
+def kw_ngrams_chart(data, job_id):
+    if not data or not job_id:
+        return empty_fig("N-grams")
+    ng = store.get_ngrams(job_id)
+    if not ng:
+        return empty_fig("N-grams")
+
+    bigrams  = ng.get("bigrams",  [])[:15]
+    trigrams = ng.get("trigrams", [])[:10]
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=("Top Bigrams", "Top Trigrams"),
+        horizontal_spacing=0.12,
+    )
+
+    if bigrams:
+        bg_rev = list(reversed(bigrams))
+        fig.add_trace(go.Bar(
+            x=[b["count"] for b in bg_rev],
+            y=[b["ngram"] for b in bg_rev],
+            orientation="h",
+            marker_color=C["verbal"],
+            showlegend=False,
+            hovertemplate="%{y}  |  %{x}<extra></extra>",
+        ), row=1, col=1)
+
+    if trigrams:
+        tg_rev = list(reversed(trigrams))
+        fig.add_trace(go.Bar(
+            x=[t["count"] for t in tg_rev],
+            y=[t["ngram"] for t in tg_rev],
+            orientation="h",
+            marker_color=C["camera"],
+            showlegend=False,
+            hovertemplate="%{y}  |  %{x}<extra></extra>",
+        ), row=1, col=2)
+
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="DM Mono, monospace", color=C["text"], size=11),
+        margin=dict(l=140, r=24, t=48, b=36),
+        hovermode="y",
+    )
+    fig.update_xaxes(
+        showgrid=True, gridcolor=C["border"], zeroline=False,
+        title_text="count", title_font=dict(size=9, color=C["muted"]),
+        tickfont=dict(size=9),
+    )
+    fig.update_yaxes(
+        showgrid=False, zeroline=False, tickfont=dict(size=9), automargin=True,
+    )
+    return fig
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers

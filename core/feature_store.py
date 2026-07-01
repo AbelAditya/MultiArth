@@ -94,6 +94,15 @@ class FeatureStore:
     def put_spectrogram(self, job_id: str, data: dict) -> None:
         self.r.set(f"job:{job_id}:spectrogram", json.dumps(data), ex=_TTL)
 
+    def put_wordlist(self, job_id: str, data: dict) -> None:
+        self.r.set(f"job:{job_id}:wordlist", json.dumps(data), ex=_TTL)
+
+    def put_ngrams(self, job_id: str, data: dict) -> None:
+        self.r.set(f"job:{job_id}:ngrams", json.dumps(data), ex=_TTL)
+
+    def put_collocations(self, job_id: str, data: dict) -> None:
+        self.r.set(f"job:{job_id}:collocations", json.dumps(data), ex=_TTL)
+
     # ------------------------------------------------------------------
     # Per-modality read
     # ------------------------------------------------------------------
@@ -120,6 +129,18 @@ class FeatureStore:
 
     def get_spectrogram(self, job_id: str) -> Optional[dict]:
         raw = self.r.get(f"job:{job_id}:spectrogram")
+        return json.loads(raw) if raw else None
+
+    def get_wordlist(self, job_id: str) -> Optional[dict]:
+        raw = self.r.get(f"job:{job_id}:wordlist")
+        return json.loads(raw) if raw else None
+
+    def get_ngrams(self, job_id: str) -> Optional[dict]:
+        raw = self.r.get(f"job:{job_id}:ngrams")
+        return json.loads(raw) if raw else None
+
+    def get_collocations(self, job_id: str) -> Optional[dict]:
+        raw = self.r.get(f"job:{job_id}:collocations")
         return json.loads(raw) if raw else None
 
     # ------------------------------------------------------------------

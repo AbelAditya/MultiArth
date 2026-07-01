@@ -43,7 +43,7 @@ def main(ctx, redis_host, redis_port):
 @main.command()
 @click.argument("video_path")
 @click.option("--window", default=5.0, show_default=True, help="Window size in seconds")
-@click.option("--whisper-model", default="base", show_default=True, help="Whisper model size")
+@click.option("--whisper-model", default="small", show_default=True, help="Whisper model size")
 @click.option("--device", default="cpu", show_default=True, help="cpu or cuda")
 @click.option("--sequential", is_flag=True, default=False, help="Disable parallel workers")
 @click.option("--work-dir", default="/tmp/mannerism", show_default=True)

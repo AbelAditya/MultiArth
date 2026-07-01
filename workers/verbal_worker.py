@@ -5,11 +5,12 @@ Faster-Whisper ASR + spaCy NLP worker.
 
 Transcribes the full audio once (word-level timestamps), then
 for each time window assigns tokens and computes linguistic features.
+Language is auto-detected by Whisper; the matching spaCy model is loaded
+lazily and cached so multi-language sessions don't reload unnecessarily.
 """
 
 from __future__ import annotations
 
-import re
 from collections import Counter
 from typing import Optional
 
@@ -17,40 +18,55 @@ import spacy
 from faster_whisper import WhisperModel
 from loguru import logger
 
+from core import corpus_analysis
 from core.feature_store import FeatureStore
 from core.models import TimeWindow, VerbalFeatures, WordToken
 from core.preprocessing import VideoMeta
 
-# Common English filler words
-_FILLERS = frozenset({
-    "uh", "um", "erm", "er", "ah", "like", "basically", "literally",
-    "actually", "right", "okay", "so", "you know", "i mean",
-})
-
-# Common hedging expressions (single-token approximation)
-_HEDGES = frozenset({
-    "maybe", "perhaps", "possibly", "probably", "might", "could",
-    "somewhat", "kind", "sort", "roughly", "approximately",
-})
+# Maps Whisper language codes to spaCy model names.
+# Add entries here to support additional languages.
+_SPACY_MODELS: dict[str, str] = {
+    "en": "en_core_web_sm",
+    "zh": "zh_core_web_sm",
+}
 
 
 class VerbalWorker:
     def __init__(
         self,
         store: FeatureStore,
-        model_size: str = "base",
+        model_size: str = "small",
         device: str = "cpu",
-        spacy_model: str = "en_core_web_sm",
     ):
         self.store = store
         logger.info(f"[verbal] Loading Whisper model '{model_size}' on {device}")
         self._whisper = WhisperModel(model_size, device=device, compute_type="int8")
-        logger.info(f"[verbal] Loading spaCy model '{spacy_model}'")
+        self._nlp_cache: dict[str, Optional[object]] = {}
+
+    def _get_nlp(self, lang_code: str):
+        """Return a cached spaCy model for *lang_code*, loading it on first use."""
+        if lang_code in self._nlp_cache:
+            return self._nlp_cache[lang_code]
+        model_name = _SPACY_MODELS.get(lang_code)
+        if not model_name:
+            logger.warning(
+                f"[verbal] No spaCy model configured for language '{lang_code}' — "
+                "word list will use raw counts, collocations skipped"
+            )
+            self._nlp_cache[lang_code] = None
+            return None
         try:
-            self._nlp = spacy.load(spacy_model)
+            nlp = spacy.load(model_name)
+            logger.info(f"[verbal] Loaded spaCy model '{model_name}' for '{lang_code}'")
+            self._nlp_cache[lang_code] = nlp
+            return nlp
         except OSError:
-            logger.warning(f"spaCy model '{spacy_model}' not found — run: python -m spacy download {spacy_model}")
-            self._nlp = None
+            logger.warning(
+                f"[verbal] spaCy model '{model_name}' not found — "
+                f"run: python -m spacy download {model_name}"
+            )
+            self._nlp_cache[lang_code] = None
+            return None
 
     def process_job(
         self,
@@ -59,9 +75,15 @@ class VerbalWorker:
         windows: list[tuple[float, float]],
     ) -> None:
         logger.info(f"[verbal] Transcribing {meta.audio_path}")
-        all_tokens = self._transcribe(meta.audio_path)
-        logger.info(f"[verbal] Transcription complete — {len(all_tokens)} word tokens")
-        self.store.log_event(job_id, "verbal", f"transcription done: {len(all_tokens)} tokens")
+        all_tokens, lang_code = self._transcribe(meta.audio_path)
+        logger.info(
+            f"[verbal] Transcription complete — {len(all_tokens)} word tokens "
+            f"(language: {lang_code})"
+        )
+        self.store.log_event(
+            job_id, "verbal",
+            f"transcription done: {len(all_tokens)} tokens, language={lang_code}"
+        )
 
         for idx, (start, end) in enumerate(windows):
             try:
@@ -73,16 +95,32 @@ class VerbalWorker:
                 logger.error(f"[verbal] Window {idx} failed: {exc}")
                 self.store.log_event(job_id, "verbal", f"window {idx} ERROR: {exc}")
 
+        try:
+            wordlist, ngrams, collocations = self._compute_corpus_stats(
+                all_tokens, lang_code
+            )
+            self.store.put_wordlist(job_id, wordlist)
+            self.store.put_ngrams(job_id, ngrams)
+            self.store.put_collocations(job_id, collocations)
+            self.store.log_event(job_id, "verbal", "corpus stats done")
+        except Exception as exc:
+            logger.error(f"[verbal] Corpus stats failed: {exc}")
+
         logger.info(f"[verbal] Job {job_id} complete")
 
     # ------------------------------------------------------------------
 
-    def _transcribe(self, audio_path: str) -> list[WordToken]:
-        segments, _ = self._whisper.transcribe(
+    def _transcribe(self, audio_path: str) -> tuple[list[WordToken], str]:
+        """Transcribe audio and return (tokens, detected_language_code)."""
+        segments, info = self._whisper.transcribe(
             audio_path,
             word_timestamps=True,
-            language="en",
             vad_filter=True,
+        )
+        lang_code = info.language
+        logger.info(
+            f"[verbal] Detected language: '{lang_code}' "
+            f"(confidence: {info.language_probability:.2f})"
         )
         tokens: list[WordToken] = []
         for seg in segments:
@@ -95,7 +133,7 @@ class VerbalWorker:
                     end_s=word.end,
                     confidence=word.probability,
                 ))
-        return tokens
+        return tokens, lang_code
 
     def _process_window(
         self,
@@ -103,71 +141,100 @@ class VerbalWorker:
         end_s: float,
         tokens: list[WordToken],
     ) -> VerbalFeatures:
-        window = TimeWindow(start_s=start_s, end_s=end_s)
-        transcript = " ".join(t.word for t in tokens)
-
-        word_count = len(tokens)
-        mean_conf = float(sum(t.confidence for t in tokens) / max(word_count, 1))
-
-        # Filler detection (case-insensitive single-token)
-        filler_count = sum(
-            1 for t in tokens if t.word.lower().strip(".,!?") in _FILLERS
-        )
-        duration_min = (end_s - start_s) / 60.0
-        filler_rate = filler_count / max(duration_min, 1e-6)
-
-        # Hedge detection
-        hedge_count = sum(
-            1 for t in tokens if t.word.lower().strip(".,!?") in _HEDGES
-        )
-
-        # Pause detection (inter-word gap > 250 ms)
-        pauses = []
-        for i in range(1, len(tokens)):
-            gap = tokens[i].start_s - tokens[i - 1].end_s
-            if gap > 0.25:
-                pauses.append(gap)
-        pause_count = len(pauses)
-        mean_pause = float(sum(pauses) / max(pause_count, 1))
-
-        # Sentence-level stats via spaCy
-        sentence_count, mean_sent_len = self._sentence_stats(transcript)
-
-        # Type-token ratio (vocabulary richness)
-        words_lower = [t.word.lower().strip(".,!?\"'") for t in tokens if t.word.strip()]
-        ttr = len(set(words_lower)) / max(len(words_lower), 1)
-
         return VerbalFeatures(
-            window=window,
-            transcript=transcript,
+            window=TimeWindow(start_s=start_s, end_s=end_s),
+            transcript=" ".join(t.word for t in tokens),
             tokens=tokens,
-            word_count=word_count,
-            filler_word_count=filler_count,
-            filler_word_rate=filler_rate,
-            mean_word_confidence=mean_conf,
-            sentence_count=sentence_count,
-            mean_sentence_length=mean_sent_len,
-            type_token_ratio=ttr,
-            hedge_count=hedge_count,
-            pause_count=pause_count,
-            mean_pause_duration_s=mean_pause,
+            word_count=len(tokens),
         )
 
-    def _sentence_stats(self, text: str) -> tuple[int, float]:
-        if not text.strip():
-            return 0, 0.0
-        if self._nlp:
-            doc = self._nlp(text)
-            sents = list(doc.sents)
-            if not sents:
-                return 0, 0.0
-            lengths = [len([t for t in s if not t.is_space]) for s in sents]
-            return len(sents), float(sum(lengths) / max(len(sents), 1))
+    def _compute_corpus_stats(
+        self, all_tokens: list[WordToken], lang_code: str
+    ) -> tuple[dict, dict, dict]:
+        """
+        Build word list, n-grams, and collocations from the full transcript.
+        Uses the spaCy model for *lang_code* if available.
+        Returns (wordlist, ngrams, collocations).
+        """
+        nlp = self._get_nlp(lang_code)
+        # Chinese (and other logographic scripts) must be joined without spaces
+        # so that spaCy's jieba-based tokenizer can segment words correctly.
+        join_sep = "" if lang_code in ("zh", "ja", "ko") else " "
+        text = join_sep.join(t.word for t in all_tokens)
+        raw_words = [t.word.lower().strip(".,!?\"'") for t in all_tokens if t.word.strip()]
+
+        # ── spaCy pass (word list) ───────────────────────────────────────
+        doc = None
+        if nlp and text.strip():
+            nlp_text = text[: nlp.max_length]
+            doc = nlp(nlp_text)
+
+            lemma_data: dict[str, dict] = {}
+            for token in doc:
+                if token.is_stop or token.is_punct or not token.is_alpha:
+                    continue
+                # zh_core_web_sm returns empty lemma_ for all tokens; fall back to surface form
+                lemma = (token.lemma_ or token.text).lower()
+                if not lemma:
+                    continue
+                if lemma not in lemma_data:
+                    lemma_data[lemma] = {"pos": token.pos_, "count": 0, "example": token.text}
+                lemma_data[lemma]["count"] += 1
+
+            total = max(sum(v["count"] for v in lemma_data.values()), 1)
+            word_entries = [
+                {
+                    "lemma":         lemma,
+                    "pos":           d["pos"],
+                    "example":       d["example"],
+                    "count":         d["count"],
+                    "freq_per_1000": round(d["count"] * 1000 / total, 2),
+                }
+                for lemma, d in sorted(lemma_data.items(), key=lambda x: -x[1]["count"])[:200]
+            ]
         else:
-            # Fallback: split on sentence-ending punctuation
-            sents = re.split(r"[.!?]+", text)
-            sents = [s.strip() for s in sents if s.strip()]
-            if not sents:
-                return 0, 0.0
-            lengths = [len(s.split()) for s in sents]
-            return len(sents), float(sum(lengths) / len(sents))
+            counts = Counter(w for w in raw_words if w.isalpha())
+            total = max(sum(counts.values()), 1)
+            word_entries = [
+                {
+                    "lemma":         w,
+                    "pos":           "?",
+                    "example":       w,
+                    "count":         c,
+                    "freq_per_1000": round(c * 1000 / total, 2),
+                }
+                for w, c in counts.most_common(200)
+            ]
+
+        wordlist = {"words": word_entries, "total_tokens": len(raw_words)}
+
+        # ── N-grams (including stop words for natural phrasing) ──────────
+        # For logographic scripts the spaCy doc gives proper word tokens;
+        # raw Whisper tokens are individual characters (not useful for n-grams).
+        if doc is not None and lang_code in ("zh", "ja", "ko"):
+            alpha = [t.text.lower() for t in doc if t.is_alpha]
+        else:
+            alpha = [w for w in raw_words if w.isalpha()]
+        bigram_counts: Counter = Counter()
+        trigram_counts: Counter = Counter()
+        for i in range(len(alpha)):
+            if i + 1 < len(alpha):
+                bigram_counts[f"{alpha[i]} {alpha[i+1]}"] += 1
+            if i + 2 < len(alpha):
+                trigram_counts[f"{alpha[i]} {alpha[i+1]} {alpha[i+2]}"] += 1
+
+        ngrams = {
+            "bigrams":  [{"ngram": ng, "count": c} for ng, c in bigram_counts.most_common(50)],
+            "trigrams": [{"ngram": ng, "count": c} for ng, c in trigram_counts.most_common(30)],
+        }
+
+        # ── Collocations (dep parse on same doc, isolated so failure
+        #    can't affect wordlist/ngrams above) ─────────────────────────
+        collocations: dict = {}
+        if doc is not None:
+            try:
+                collocations = corpus_analysis.extract_collocations(doc)
+            except Exception as exc:
+                logger.warning(f"[verbal] Collocations extraction failed: {exc}")
+
+        return wordlist, ngrams, collocations

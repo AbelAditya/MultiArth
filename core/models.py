@@ -108,20 +108,11 @@ class WordToken(BaseModel):
 
 
 class VerbalFeatures(BaseModel):
-    """Aggregated verbal features over a time window."""
+    """Transcription and token data for a time window."""
     window: TimeWindow
     transcript: str
     tokens: list[WordToken]
     word_count: int
-    filler_word_count: int                 # uh, um, like, you know, etc.
-    filler_word_rate: float                # fillers per minute
-    mean_word_confidence: float
-    sentence_count: int
-    mean_sentence_length: float            # words per sentence
-    type_token_ratio: float                # vocabulary richness proxy
-    hedge_count: int                       # maybe, perhaps, kind of, etc.
-    pause_count: int                       # inter-word gaps > 250 ms
-    mean_pause_duration_s: float
 
 
 # ---------------------------------------------------------------------------
