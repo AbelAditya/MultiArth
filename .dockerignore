@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.env
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.wav
+colocations.json
+rel_labels.json
+/tmp/

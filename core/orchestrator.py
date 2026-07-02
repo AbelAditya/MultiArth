@@ -15,6 +15,7 @@ bottleneck (each worker is I/O or C-extension bound, not pure Python).
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,14 +37,14 @@ class Orchestrator:
     def __init__(
         self,
         store: FeatureStore,
-        work_dir: str = "/tmp/mannerism",
+        work_dir: str | None = None,
         window_size_s: float = 5.0,
         whisper_model: str = "small",
         whisper_device: str = "cpu",
         parallel: bool = True,
     ):
         self.store = store
-        self.work_dir = Path(work_dir)
+        self.work_dir = Path(work_dir or os.environ.get("WORK_DIR", "/tmp/mannerism"))
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.window_size_s = window_size_s
         self.parallel = parallel

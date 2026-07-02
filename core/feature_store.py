@@ -21,6 +21,7 @@ All keys are set with a 24-hour TTL by default.
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Optional
 
@@ -41,7 +42,8 @@ _TTL = 86_400  # 24 hours
 
 
 class FeatureStore:
-    def __init__(self, host: str = "localhost", port: int = 6379, db: int = 0):
+    def __init__(self, host: str | None = None, port: int = 6379, db: int = 0):
+        host = host or os.environ.get("REDIS_HOST", "localhost")
         self.r = redis.Redis(host=host, port=port, db=db, decode_responses=True)
 
     # ------------------------------------------------------------------

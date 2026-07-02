@@ -739,7 +739,7 @@ clientside_callback(
 # Upload video → save to disk → launch analysis in background thread
 # ─────────────────────────────────────────────────────────────────────────────
 
-_UPLOAD_DIR = Path("/tmp/mannerism/uploads")
+_UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/tmp/mannerism/uploads"))
 
 @callback(
     Output("active-job-id", "data"),
