@@ -10,8 +10,6 @@ The heavy spaCy doc parsing is done once in verbal_worker and stored via Feature
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-import json
-import os
 
 _REL_LABELS: dict[str, str] = {
     "subj_of":         "subject of",
@@ -286,9 +284,6 @@ def get_word_sketch(collocations: dict, lemma: str) -> dict:
           "relations": [{"key": str, "name": str, "words": [[word, count], ...]}, ...]
         }
     """
-    if os.environ.get("DEBUG_COLLOCATIONS"):
-        with open("colocations.json", "w", encoding="utf-8") as _f:
-            json.dump(collocations, _f, ensure_ascii=False, indent=2)
 
     key = lemma.lower().strip()
     profile = collocations.get(key, {})
