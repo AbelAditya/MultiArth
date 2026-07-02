@@ -7,11 +7,10 @@ requires-python = ">=3.11"
 dependencies = [
     # Video / vision
     "opencv-python>=4.9.0",
-    "mediapipe>=0.10.0",
+    "mediapipe==0.10.9",
     "scenedetect[opencv]>=0.6.3",
     # Audio / prosody
     "praat-parselmouth>=0.4.3",
-    "librosa>=0.10.2",          # MFCCs + energy segmentation alongside parselmouth
     "soundfile>=0.12.1",
     # ASR / NLP
     "faster-whisper>=1.0.1",

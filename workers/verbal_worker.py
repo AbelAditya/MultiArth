@@ -118,6 +118,7 @@ class VerbalWorker:
             self.store.put_wordlist(job_id, wordlist)
             self.store.put_ngrams(job_id, ngrams)
             self.store.put_collocations(job_id, collocations)
+            logger.info(f"[verbal] Collocations stored: {len(collocations)} entries for job {job_id}")
             self.store.log_event(job_id, "verbal", "corpus stats done")
         except Exception as exc:
             logger.error(f"[verbal] Corpus stats failed: {exc}")

@@ -63,16 +63,15 @@ class ProsodyWorker:
         payload manageable for the dashboard.
         """
         sg = sound.to_spectrogram(
-            window_length=0.005,     # 5 ms → wide-band (resolves formants)
-            maximum_frequency=5000.0,
+            window_length=0.050,     # 25 ms → narrow-band (resolves harmonics)
+            maximum_frequency=2000.0,
             time_step=0.01,          # 10 ms time step
         )
         values = sg.values           # shape: (n_freq, n_time), power Pa²/Hz
         n_freq, n_time = values.shape
 
         t_step = max(1, n_time // 1000)
-        f_step = max(1, n_freq // 200)
-
+        f_step = 1
         ds = values[::f_step, ::t_step]
         db = 10.0 * np.log10(ds + 1e-10)
 

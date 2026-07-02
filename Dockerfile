@@ -14,6 +14,8 @@ RUN uv sync --no-dev --no-install-project
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM python:3.11-slim AS runtime
 
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
 # System deps: ffmpeg for audio extraction, OpenCV runtime libs
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \

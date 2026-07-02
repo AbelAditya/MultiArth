@@ -1501,8 +1501,11 @@ def conc_seek(_, occurrences):
     prevent_initial_call=True,
 )
 def kw_sketch(keyword, job_id):
-    if not keyword or not job_id:
+    if not keyword:
         return html.Div()
+    if not job_id:
+        return html.P("No active job — upload a video and run analysis first.",
+                      style={"fontFamily": "DM Mono, monospace", "fontSize": "10px", "color": C["muted"]})
     collocations = store.get_collocations(job_id)
     if not collocations:
         return html.P("No collocations data — run analysis first.",
