@@ -322,7 +322,7 @@ def add_cursor(fig, t, occ=None):
 
 CHART_IDS = [
     "g-velocity", "g-handedness",
-    "p-spectrogram", "p-f0", "p-intensity",
+    "p-spectrogram", "p-waveform", "p-f0", "p-intensity",
     "c-shot", "c-h-angle", "c-v-angle", "c-cutrate", "c-facearea", "c-trend",
 ]
 
@@ -478,6 +478,7 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
         html.Div(style=SECTION_STYLE, children=[
             section_header("Acoustic Properties", C["prosody"], "Parselmouth · Praat algorithms"),
             dcc.Graph(id="p-spectrogram", style={"height": "280px"}, config=CHART_CFG),
+            dcc.Graph(id="p-waveform",   style={"height": "220px", "marginTop": "4px"}, config=CHART_CFG),
             dcc.Graph(id="p-f0",        style={"height": "200px"}, config=CHART_CFG),
             dcc.Graph(id="p-intensity", style={"height": "200px"}, config=CHART_CFG),
         ]),
@@ -1180,6 +1181,49 @@ def p_spectrogram(data, occ, job_id):
         yaxis=dict(
             title=dict(text="Frequency (kHz)", font=dict(size=9, color=C["muted"])),
             showgrid=False, zeroline=False, showspikes=False,
+        ),
+    )
+    if occ:
+        for o in occ:
+            fig.add_vline(x=o["start_s"], line=dict(color=KW_COLOUR, width=2), opacity=0.7)
+    return fig
+
+
+@callback(
+    Output("p-waveform", "figure"),
+    Input("fused-data", "data"),
+    Input("keyword-occurrences", "data"),
+    State("active-job-id", "data"),
+)
+def p_waveform(data, occ, job_id):
+    if not data or not job_id:
+        return empty_fig("Waveform")
+    wf = store.get_waveform(job_id)
+    if not wf:
+        return empty_fig("Waveform")
+    times = wf["times"]
+    amps  = wf["amplitudes"]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=times, y=amps,
+        mode="lines",
+        line=dict(color=C["prosody"], width=1),
+        fill="tozeroy",
+        fillcolor="rgba(45,106,79,0.15)",
+        hovertemplate="<b>%{x:.2f}s</b>  %{y:.3f}<extra></extra>",
+        name="Amplitude",
+    ))
+    layout = {k: v for k, v in PLOT_LAYOUT.items() if k not in ("xaxis", "yaxis")}
+    fig.update_layout(
+        **layout,
+        title=dict(text="Waveform  (amplitude)", font=dict(size=11, color=C["muted"])),
+        xaxis=dict(**PLOT_LAYOUT["xaxis"], showspikes=False),
+        yaxis=dict(
+            title=dict(text="Amplitude", font=dict(size=9, color=C["muted"])),
+            range=[-1.05, 1.05],
+            showgrid=False, zeroline=True,
+            zerolinecolor=C["border"], zerolinewidth=1,
+            showspikes=False,
         ),
     )
     if occ:

@@ -103,6 +103,9 @@ class FeatureStore:
     def put_spectrogram(self, job_id: str, data: dict) -> None:
         self.r.set(f"job:{job_id}:spectrogram", json.dumps(data), ex=_TTL)
 
+    def put_waveform(self, job_id: str, data: dict) -> None:
+        self.r.set(f"job:{job_id}:waveform", json.dumps(data), ex=_TTL)
+
     def put_wordlist(self, job_id: str, data: dict) -> None:
         self.r.set(f"job:{job_id}:wordlist", json.dumps(data), ex=_TTL)
 
@@ -138,6 +141,10 @@ class FeatureStore:
 
     def get_spectrogram(self, job_id: str) -> Optional[dict]:
         raw = self.r.get(f"job:{job_id}:spectrogram")
+        return json.loads(raw) if raw else None
+
+    def get_waveform(self, job_id: str) -> Optional[dict]:
+        raw = self.r.get(f"job:{job_id}:waveform")
         return json.loads(raw) if raw else None
 
     def get_wordlist(self, job_id: str) -> Optional[dict]:

@@ -51,6 +51,13 @@ class ProsodyWorker:
         except Exception as exc:
             logger.error(f"[prosody] Spectrogram failed: {exc}")
 
+        try:
+            wf = self._compute_waveform(sound)
+            self.store.put_waveform(job_id, wf)
+            self.store.log_event(job_id, "prosody", "waveform done")
+        except Exception as exc:
+            logger.error(f"[prosody] Waveform failed: {exc}")
+
         logger.info(f"[prosody] Job {job_id} complete")
 
     # ------------------------------------------------------------------
@@ -84,6 +91,22 @@ class ProsodyWorker:
             "times": sg.xs()[::t_step].tolist(),
             "freqs": (sg.ys()[::f_step] / 1000.0).tolist(),  # Hz → kHz
             "data":  db.tolist(),
+        }
+
+    def _compute_waveform(self, sound: parselmouth.Sound) -> dict:
+        """
+        Downsample the raw audio to ~4000 points for waveform display.
+        Amplitude is normalised to [-1, 1].
+        """
+        samples = sound.values[0]
+        times = sound.xs()
+        n = len(samples)
+        step = max(1, n // 4000)
+        amp = samples[::step]
+        peak = float(np.max(np.abs(amp))) or 1.0
+        return {
+            "times":      times[::step].tolist(),
+            "amplitudes": (amp / peak).tolist(),
         }
 
     def _process_window(
