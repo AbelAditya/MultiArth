@@ -344,15 +344,21 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
         "position": "sticky", "top": "0", "zIndex": "100",
         "boxShadow": "0 1px 0 rgba(0,0,0,0.04)",
     }, children=[
-        html.Div([
-            html.Span("MULTI", style={
-                "fontFamily": "DM Mono, monospace", "fontSize": "13px",
-                "fontWeight": "500", "letterSpacing": "0.18em", "color": C["text"],
-            }),
-            html.Span("ARTH", style={
-                "fontFamily": "DM Mono, monospace", "fontSize": "13px",
-                "fontWeight": "300", "letterSpacing": "0.18em", "color": C["muted"],
-            }),
+        html.Div(style={"display": "flex", "alignItems": "center", "gap": "4px"}, children=[
+            html.Img(
+                src="/assets/MultiArth-removebg-preview.png",
+                style={"height": "35px", "width": "auto"},
+            ),
+            html.Div([
+                html.Span("MULTI", style={
+                    "fontFamily": "DM Mono, monospace", "fontSize": "13px",
+                    "fontWeight": "500", "letterSpacing": "0.18em", "color": C["text"],
+                }),
+                html.Span("ARTH", style={
+                    "fontFamily": "DM Mono, monospace", "fontSize": "13px",
+                    "fontWeight": "300", "letterSpacing": "0.18em", "color": C["muted"],
+                }),
+            ]),
         ]),
     ]),
 
