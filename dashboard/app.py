@@ -46,7 +46,7 @@ app = dash.Dash(
     __name__,
     server=server,
     external_stylesheets=[dbc.themes.BOOTSTRAP, FONT_URL],
-    title="Mannerism Analyzer",
+    title="MultiArth",
     update_title=None,
     suppress_callback_exceptions=True,
 )
@@ -225,10 +225,11 @@ def section_header(title, accent, subtitle=""):
     ], style={"display": "flex", "alignItems": "center", "marginBottom": "20px"})
 
 
-def _analysis_progress(state: str, message: str):
+def _analysis_progress(state: str, message: str, worker_progress: dict | None = None):
     """Inline status indicator shown below the upload zone."""
     if state == "idle":
         return html.Div()
+
     colour = {"running": C["camera"], "done": C["prosody"], "failed": C["gesture"]}.get(state, C["muted"])
     icon = (
         dbc.Spinner(size="sm", spinner_style={"width": "12px", "height": "12px", "borderWidth": "2px",
@@ -236,9 +237,67 @@ def _analysis_progress(state: str, message: str):
         if state == "running"
         else html.Span("✓ " if state == "done" else "✗ ", style={"marginRight": "4px", "fontWeight": "600"})
     )
-    return html.Div([icon, html.Span(message, style={
+    header = html.Div([icon, html.Span(message, style={
         "fontFamily": "DM Mono, monospace", "fontSize": "11px", "color": colour,
     })], style={"display": "flex", "alignItems": "center", "marginTop": "10px"})
+
+    if not worker_progress or state != "running":
+        return html.Div([header])
+
+    total = worker_progress.get("total", 0)
+    if not total:
+        return html.Div([header])
+
+    _WORKERS = [
+        ("gesture", "Pose Est.", C["gesture"]),
+        ("prosody", "Acoustic",  C["prosody"]),
+        ("verbal",  "Verbal",    C["verbal"]),
+        ("camera",  "Camera",    C["camera"]),
+    ]
+
+    rows = []
+    for key, label, bar_colour in _WORKERS:
+        done = worker_progress.get(key, 0)
+        pct = min(100, round(done * 100 / total))
+        is_complete = pct == 100
+        is_transcribing = (
+            key == "verbal" and done == 0
+            and worker_progress.get("gesture", 0) > 0
+        )
+
+        suffix = (
+            html.Span(" transcribing…", style={
+                "fontFamily": "DM Mono, monospace", "fontSize": "9px",
+                "color": C["muted"], "marginLeft": "4px",
+            }) if is_transcribing else html.Span()
+        )
+
+        rows.append(html.Div([
+            html.Span(label, style={
+                "fontFamily": "DM Mono, monospace", "fontSize": "10px",
+                "color": C["muted"], "width": "54px", "flexShrink": "0",
+            }),
+            html.Div(
+                html.Div(style={
+                    "width": f"{pct}%", "height": "100%",
+                    "background": C["prosody"] if is_complete else bar_colour,
+                    "borderRadius": "3px",
+                    "transition": "width 0.5s ease",
+                }),
+                style={
+                    "flex": "1", "height": "5px", "borderRadius": "3px",
+                    "background": C["border"],
+                },
+            ),
+            html.Span(f"{pct}%", style={
+                "fontFamily": "DM Mono, monospace", "fontSize": "10px",
+                "color": C["prosody"] if is_complete else C["muted"],
+                "width": "30px", "textAlign": "right", "flexShrink": "0",
+            }),
+            suffix,
+        ], style={"display": "flex", "alignItems": "center", "gap": "8px", "marginBottom": "5px"}))
+
+    return html.Div([header, html.Div(rows, style={"marginTop": "8px"})])
 
 
 def empty_fig(title=""):
@@ -286,11 +345,11 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
         "boxShadow": "0 1px 0 rgba(0,0,0,0.04)",
     }, children=[
         html.Div([
-            html.Span("MANNERISM", style={
+            html.Span("MULTI", style={
                 "fontFamily": "DM Mono, monospace", "fontSize": "13px",
                 "fontWeight": "500", "letterSpacing": "0.18em", "color": C["text"],
             }),
-            html.Span(" ANALYZER", style={
+            html.Span("ARTH", style={
                 "fontFamily": "DM Mono, monospace", "fontSize": "13px",
                 "fontWeight": "300", "letterSpacing": "0.18em", "color": C["muted"],
             }),
@@ -305,9 +364,9 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
             "display": "flex", "gap": "14px", "flexWrap": "wrap", "marginBottom": "28px",
         }),
 
-        # ── GESTURE ──────────────────────────────────────────────────────
+        # ── UPLOAD ───────────────────────────────────────────────────────
         html.Div(style=SECTION_STYLE, children=[
-            section_header("Pose Estimation", C["gesture"], "MediaPipe Holistic · Kinematic features"),
+            section_header("Video Upload", C["muted"], "Drop a video file to begin analysis"),
 
             dcc.Upload(
                 id="video-upload",
@@ -333,7 +392,12 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                     "backgroundColor": C["bg"],
                 },
             ),
-            html.Div(id="analysis-status", style={"marginBottom": "16px"}),
+            html.Div(id="analysis-status"),
+        ]),
+
+        # ── GESTURE ──────────────────────────────────────────────────────
+        html.Div(style=SECTION_STYLE, children=[
+            section_header("Pose Estimation", C["gesture"], "MediaPipe Holistic · Kinematic features"),
 
             html.Div(style={
                 "marginBottom": "28px", "paddingBottom": "24px",
@@ -356,7 +420,7 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                             dbc.Button("Torso",       id="seg-torso", size="sm",
                                        outline=True, color="success", className="me-2 mt-1"),
                             dbc.Button("Gaze",        id="seg-gaze",  size="sm",
-                                       outline=True, color="info",    className="mt-1"),
+                                       outline=True, color="pink", className="mt-1"),
                         ], style={"marginTop": "6px", "display": "flex", "flexWrap": "wrap"}),
                     ]),
                     html.Div([
@@ -750,12 +814,22 @@ def poll_analysis(_, job_id):
             dash.no_update,
         )
 
-    # Still running — show last log event as progress hint
-    events = store.read_events(job_id)
-    msg = f"[{events[-1]['worker']}] {events[-1]['msg']}" if events else "Processing…"
+    # Still running — show per-worker progress bars
+    job = store.get_job(job_id)
+    total = job.total_windows if job and job.total_windows else 0
+    worker_progress = None
+    if total:
+        worker_progress = {
+            "total":   total,
+            "gesture": store.count_windows(job_id, "gesture"),
+            "prosody": store.count_windows(job_id, "prosody"),
+            "verbal":  store.count_windows(job_id, "verbal"),
+            "camera":  store.count_windows(job_id, "camera"),
+        }
+
     return (
         dash.no_update,
-        _analysis_progress("running", msg),
+        _analysis_progress("running", "Processing…", worker_progress),
         False,
         dash.no_update,
     )
@@ -852,9 +926,9 @@ def select_segment(_h, _a, _ha, _t, _g, current_segs):
            "seg-gaze": "gaze"}.get(btn_id)
     active = list(current_segs or [])
     if seg in active:
-        active.remove(seg)   # click active segment → deselect
+        active.remove(seg)
     else:
-        active.append(seg)   # click inactive segment → add
+        active.append(seg)
     outlines = {s: (s not in active) for s in ["head", "arms", "hands", "torso", "gaze"]}
     return (active,
             outlines["head"], outlines["arms"],
@@ -905,7 +979,7 @@ clientside_callback(
         };
         var SEG_COLORS = {
             head:  '#4A90D9', arms:  '#F0A500',
-            hands: '#C84B31', torso: '#28a745', gaze: '#20c2d4'
+            hands: '#C84B31', torso: '#28a745', gaze: '#D63384'
         };
         var CONNECTIONS = [
             [0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],[9,10],

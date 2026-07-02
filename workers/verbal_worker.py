@@ -20,6 +20,7 @@ from loguru import logger
 
 from core import corpus_analysis
 from core.feature_store import FeatureStore
+from core.stopwords import load_stopwords
 from core.models import TimeWindow, VerbalFeatures, WordToken
 from core.preprocessing import VideoMeta
 
@@ -58,6 +59,21 @@ class VerbalWorker:
         try:
             nlp = spacy.load(model_name)
             logger.info(f"[verbal] Loaded spaCy model '{model_name}' for '{lang_code}'")
+
+            custom_stops = load_stopwords(lang_code)
+            if custom_stops:
+                # Clear the model's built-in stop word list and apply ours exclusively.
+                # zh_core_web_sm has no dedicated stop word list and its statistical
+                # is_stop flags incorrectly mark content words like 人/好/大.
+                for lex in nlp.vocab:
+                    lex.is_stop = False
+                for word in custom_stops:
+                    nlp.vocab[word].is_stop = True
+                logger.info(
+                    f"[verbal] Applied custom stop word list for '{lang_code}' "
+                    f"({len(custom_stops)} entries)"
+                )
+
             self._nlp_cache[lang_code] = nlp
             return nlp
         except OSError:

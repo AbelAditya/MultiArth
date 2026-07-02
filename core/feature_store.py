@@ -72,6 +72,13 @@ class FeatureStore:
         val = self.r.get(f"job:{job_id}:status")
         return JobStatus(val) if val else None
 
+    def set_total_windows(self, job_id: str, total: int) -> None:
+        raw = self.r.get(f"job:{job_id}:meta")
+        if raw:
+            meta = AnalysisJob.model_validate_json(raw)
+            meta.total_windows = total
+            self.r.set(f"job:{job_id}:meta", meta.model_dump_json(), ex=_TTL)
+
     # ------------------------------------------------------------------
     # Per-modality write
     # ------------------------------------------------------------------

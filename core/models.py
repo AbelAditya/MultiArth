@@ -200,6 +200,7 @@ class AnalysisJob(BaseModel):
     job_id: str
     video_path: str
     window_size_s: float = Field(default=5.0, description="Aggregation window in seconds")
+    total_windows: Optional[int] = None
     status: JobStatus = JobStatus.PENDING
     error: Optional[str] = None
     created_at: float = Field(default=0.0)

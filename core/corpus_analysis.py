@@ -21,10 +21,16 @@ _REL_LABELS: dict[str, str] = {
     "modifies":        "modifies",
     "and_or":          "coordinated with",
     "modified_by_adv": "modified by adverb",
+    "verb_comp_of":    "verb complement of",
+    "has_verb_comp":   "has verb complement",
+    "takes_aux":       "takes auxiliary",
+    "aux_of":          "auxiliary of",
 }
 
 _DISPLAY_ORDER = [
     "subj_of", "obj_of", "has_subj", "has_obj",
+    "verb_comp_of", "has_verb_comp",
+    "takes_aux", "aux_of",
     "modified_by", "modifies", "and_or", "modified_by_adv",
 ]
 
@@ -76,11 +82,20 @@ def extract_collocations(doc) -> dict[str, dict[str, list]]:
         elif dep in ("nmod", "compound", "compound:nn"):
             if token.head.pos_ in ("NOUN", "PROPN") and _alpha(token.head):
                 raw[t]["modifies"][h] += 1
+                raw[h]["modified_by"][t] += 1
 
         elif dep == "conj":
             if _alpha(token.head):
                 raw[t]["and_or"][h] += 1
                 raw[h]["and_or"][t] += 1
+
+        elif dep in ("ccomp", "xcomp"):
+            if token.pos_ in ("VERB", "AUX") and token.head.pos_ in ("VERB", "AUX") and _alpha(token.head):
+                raw[t]["verb_comp_of"][h] += 1
+
+        elif dep in ("aux", "aux:asp", "aux:modal"):
+            if token.head.pos_ in ("VERB", "AUX") and _alpha(token.head):
+                raw[t]["aux_of"][h] += 1
 
         # ── Token as head — inspect children ───────────────────────────────
         for child in token.children:
@@ -95,6 +110,10 @@ def extract_collocations(doc) -> dict[str, dict[str, list]]:
                 raw[t]["has_obj"][c] += 1
             elif cdep == "advmod" and token.pos_ in ("VERB", "ADJ", "AUX"):
                 raw[t]["modified_by_adv"][c] += 1
+            elif cdep in ("ccomp", "xcomp") and child.pos_ in ("VERB", "AUX") and token.pos_ in ("VERB", "AUX"):
+                raw[t]["has_verb_comp"][c] += 1
+            elif cdep in ("aux", "aux:asp", "aux:modal") and token.pos_ in ("VERB", "AUX"):
+                raw[t]["takes_aux"][c] += 1
 
     # Serialise: Counter → sorted [[word, count], ...] list
     result: dict[str, dict[str, list]] = {}
@@ -124,6 +143,9 @@ def get_word_sketch(collocations: dict, lemma: str) -> dict:
     """
     key = lemma.lower().strip()
     profile = collocations.get(key, {})
+
+    with open("colocations.json", "w", encoding="utf-8") as f:
+        json.dump(collocations, f, ensure_ascii=False, indent=2)
 
     relations = []
     seen = set()

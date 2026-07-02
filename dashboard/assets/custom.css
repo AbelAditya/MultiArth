@@ -1,0 +1,36 @@
+.btn-pink {
+    --bs-btn-color: #fff;
+    --bs-btn-bg: #D63384;
+    --bs-btn-border-color: #D63384;
+    --bs-btn-hover-color: #fff;
+    --bs-btn-hover-bg: #ab296a;
+    --bs-btn-hover-border-color: #a12664;
+    --bs-btn-active-color: #fff;
+    --bs-btn-active-bg: #a12664;
+    --bs-btn-active-border-color: #97235e;
+    --bs-btn-disabled-color: #fff;
+    --bs-btn-disabled-bg: #D63384;
+    --bs-btn-disabled-border-color: #D63384;
+}
+
+.btn-outline-pink {
+    --bs-btn-color: #D63384;
+    --bs-btn-border-color: #D63384;
+    --bs-btn-hover-color: #fff;
+    --bs-btn-hover-bg: #D63384;
+    --bs-btn-hover-border-color: #D63384;
+    --bs-btn-active-color: #fff;
+    --bs-btn-active-bg: #D63384;
+    --bs-btn-active-border-color: #D63384;
+    --bs-btn-active-shadow: inset 0 3px 5px rgba(0, 0, 0, 0.125);
+    --bs-btn-disabled-color: #D63384;
+    --bs-btn-disabled-bg: transparent;
+    --bs-btn-disabled-border-color: #D63384;
+}
+
+/* Darken the fill when hovering over an already-active pink button */
+.btn-pink:hover,
+.btn-outline-pink:not(.outline):hover {
+    --bs-btn-hover-bg: #ab296a;
+    --bs-btn-hover-border-color: #a12664;
+}

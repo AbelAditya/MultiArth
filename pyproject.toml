@@ -1,7 +1,7 @@
 [project]
-name = "mannerism-analyzer"
+name = "multiarth"
 version = "0.1.0"
-description = "Multimodal linguistic mannerism analysis of speech videos"
+description = "Multimodal linguistic analysis of speech videos"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

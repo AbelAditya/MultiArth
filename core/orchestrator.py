@@ -38,7 +38,7 @@ class Orchestrator:
         store: FeatureStore,
         work_dir: str = "/tmp/mannerism",
         window_size_s: float = 5.0,
-        whisper_model: str = "base",
+        whisper_model: str = "small",
         whisper_device: str = "cpu",
         parallel: bool = True,
     ):
@@ -78,6 +78,7 @@ class Orchestrator:
             audio_path = extract_audio(video_path, str(self.work_dir))
             meta = probe_video(video_path, audio_path)
             windows = compute_windows(meta.duration_s, self.window_size_s)
+            self.store.set_total_windows(job_id, len(windows))
 
             logger.info(
                 f"[orchestrator] Video: {meta.duration_s:.1f}s, "
