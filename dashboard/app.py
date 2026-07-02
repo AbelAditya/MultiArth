@@ -1165,6 +1165,16 @@ def p_spectrogram(data, occ, job_id):
         ),
         hovertemplate="<b>Time: %{x:.2f}s<br>Freq: %{y:.2f} kHz<br>%{z:.1f} dB</b><extra></extra>",
     ))
+    if sg.get("f0_times"):
+        fig.add_trace(go.Scatter(
+            x=sg["f0_times"],
+            y=sg["f0_values"],
+            mode="lines",
+            line=dict(color="#FFD700", width=2),
+            name="F0",
+            connectgaps=False,
+            hovertemplate="<b>%{x:.2f}s  F0: %{y:.3f} kHz</b><extra></extra>",
+        ))
     layout = {k: v for k, v in PLOT_LAYOUT.items() if k not in ("xaxis", "yaxis")}
     fig.update_layout(
         **layout,
@@ -1173,7 +1183,7 @@ def p_spectrogram(data, occ, job_id):
             bordercolor=C["muted"],
             font=dict(color="#FFFFFF", size=11, family="DM Mono, monospace"),
         ),
-        title=dict(text="Spectrogram  (wide-band)", font=dict(size=11, color=C["muted"])),
+        title=dict(text="Spectrogram  (narrow-band) + F0 contour", font=dict(size=11, color=C["muted"])),
         xaxis=dict(
             **PLOT_LAYOUT["xaxis"],
             showspikes=False,
@@ -1182,6 +1192,7 @@ def p_spectrogram(data, occ, job_id):
             title=dict(text="Frequency (kHz)", font=dict(size=9, color=C["muted"])),
             showgrid=False, zeroline=False, showspikes=False,
         ),
+        showlegend=False,
     )
     if occ:
         for o in occ:

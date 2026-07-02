@@ -70,15 +70,15 @@ class ProsodyWorker:
         payload manageable for the dashboard.
         """
         sg = sound.to_spectrogram(
-            window_length=0.050,     # 25 ms → narrow-band (resolves harmonics)
-            maximum_frequency=2000.0,
+            window_length=0.030,     # 25 ms → narrow-band (resolves harmonics)
+            maximum_frequency=2500.0,
             time_step=0.01,          # 10 ms time step
         )
         values = sg.values           # shape: (n_freq, n_time), power Pa²/Hz
         n_freq, n_time = values.shape
 
         t_step = max(1, n_time // 1000)
-        f_step = 1
+        f_step = max(1, n_freq // 200)
         ds = values[::f_step, ::t_step]
         db = 10.0 * np.log10(ds + 1e-10)
 
@@ -87,10 +87,27 @@ class ProsodyWorker:
         db_min = db_max - 60.0
         db = np.clip(db, db_min, db_max)
 
+        # ── F0 contour ───────────────────────────────────────────────────
+        pitch_obj = sound.to_pitch(
+            time_step=0.01,
+            pitch_floor=75.0,
+            pitch_ceiling=500.0,
+        )
+        raw_f0 = pitch_obj.selected_array["frequency"]  # 0 = unvoiced
+        pitch_times = pitch_obj.xs()
+        p_step = max(1, len(pitch_times) // 2000)
+        f0_times  = pitch_times[::p_step].tolist()
+        f0_values = [
+            float(v) / 1000.0 if v > 0 else None
+            for v in raw_f0[::p_step]
+        ]
+
         return {
-            "times": sg.xs()[::t_step].tolist(),
-            "freqs": (sg.ys()[::f_step] / 1000.0).tolist(),  # Hz → kHz
-            "data":  db.tolist(),
+            "times":     sg.xs()[::t_step].tolist(),
+            "freqs":     (sg.ys()[::f_step] / 1000.0).tolist(),  # Hz → kHz
+            "data":      db.tolist(),
+            "f0_times":  f0_times,
+            "f0_values": f0_values,
         }
 
     def _compute_waveform(self, sound: parselmouth.Sound) -> dict:
