@@ -10,6 +10,8 @@ The heavy spaCy doc parsing is done once in verbal_worker and stored via Feature
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+import json
+import os
 
 _REL_LABELS: dict[str, str] = {
     "subj_of":         "subject of",
@@ -32,6 +34,41 @@ _DISPLAY_ORDER = [
     "takes_aux", "aux_of",
     "modified_by", "modifies", "and_or", "modified_by_adv",
 ]
+
+# ── Chinese positional / POS-based relations ──────────────────────────────────
+
+_REL_LABELS_ZH: dict[str, str] = {
+    "next_left":  "next left",
+    "next_right": "next right",
+    "verb_left":  "verb left",
+    "verb_right": "verb right",
+    "noun_left":  "noun left",
+    "noun_right": "noun right",
+    "adj_left":   "adjective left",
+    "adj_right":  "adjective right",
+    "adv_left":   "adverb left",
+    "adv_right":  "adverb right",
+    "conj":       "conjunction",
+}
+
+_DISPLAY_ORDER_ZH = [
+    "next_left",  "next_right",
+    "verb_left",  "verb_right",
+    "noun_left",  "noun_right",
+    "adj_left",   "adj_right",
+    "adv_left",   "adv_right",
+    "conj",
+]
+
+_ZH_KEY_SET = frozenset(_DISPLAY_ORDER_ZH)
+
+_ZH_CONJUNCTIONS = frozenset({
+    "和", "与", "及", "或", "但", "而",
+    "但是", "然而", "不过", "可是", "还是",
+    "而且", "并且", "或者",
+})
+
+_ZH_SCAN_DEPTH = 6
 
 
 def extract_collocations(doc) -> dict[str, dict[str, list]]:
@@ -128,6 +165,114 @@ def extract_collocations(doc) -> dict[str, dict[str, list]]:
     return result
 
 
+def extract_collocations_zh(doc, stopwords: frozenset = frozenset()) -> dict[str, dict[str, list]]:
+    """
+    Positional + POS-filtered collocations for Chinese.
+
+    Scans linearly within each sentence rather than using dependency labels,
+    because zh_core_web_sm assigns the generic 'dep' label to most tokens,
+    making dep-based extraction almost always empty for Chinese text.
+
+    stopwords: explicit set to exclude — passed in rather than read from
+    token.is_stop, which is unreliable for lazily-created spaCy lexemes.
+    """
+    raw: dict[str, dict[str, Counter]] = defaultdict(lambda: defaultdict(Counter))
+
+    def _eff(token) -> str:
+        return (token.lemma_ or token.text).lower()
+
+    def _content(token) -> bool:
+        return token.text not in stopwords and token.is_alpha and not token.is_punct
+
+    def _nearest(toks, origin, direction, pos_filter=None):
+        """Return the first content token in *direction* whose POS is in
+        *pos_filter* (any content token if None), within _ZH_SCAN_DEPTH steps."""
+        n = len(toks)
+        j = origin + direction
+        content_seen = 0
+        while 0 <= j < n:
+            tok = toks[j]
+            if tok.is_punct:
+                j += direction
+                continue
+            if _content(tok):
+                if pos_filter is None or tok.pos_ in pos_filter:
+                    return _eff(tok)
+                content_seen += 1
+                if content_seen >= _ZH_SCAN_DEPTH:
+                    break
+            j += direction
+        return None
+
+    for sent in doc.sents:
+        toks = list(sent)
+        n = len(toks)
+
+        for i, token in enumerate(toks):
+            if not _content(token):
+                continue
+            t = _eff(token)
+
+            for rel, direction in (("next_left", -1), ("next_right", 1)):
+                hit = _nearest(toks, i, direction)
+                if hit and hit != t:
+                    raw[t][rel][hit] += 1
+
+            for rel, direction in (("verb_left", -1), ("verb_right", 1)):
+                hit = _nearest(toks, i, direction, {"VERB", "AUX"})
+                if hit and hit != t:
+                    raw[t][rel][hit] += 1
+
+            for rel, direction in (("noun_left", -1), ("noun_right", 1)):
+                hit = _nearest(toks, i, direction, {"NOUN", "PROPN"})
+                if hit and hit != t:
+                    raw[t][rel][hit] += 1
+
+            for rel, direction in (("adj_left", -1), ("adj_right", 1)):
+                hit = _nearest(toks, i, direction, {"ADJ"})
+                if hit and hit != t:
+                    raw[t][rel][hit] += 1
+
+            for rel, direction in (("adv_left", -1), ("adv_right", 1)):
+                hit = _nearest(toks, i, direction, {"ADV"})
+                if hit and hit != t:
+                    raw[t][rel][hit] += 1
+
+            # conjunction: look right for a conjunction particle then a content word
+            j = i + 1
+            while j < n and j <= i + _ZH_SCAN_DEPTH:
+                tok = toks[j]
+                if tok.is_punct:
+                    j += 1
+                    continue
+                if tok.text in _ZH_CONJUNCTIONS:
+                    k = j + 1
+                    while k < n and k <= j + 3:
+                        right = toks[k]
+                        if _content(right):
+                            c = _eff(right)
+                            if c != t:
+                                raw[t]["conj"][c] += 1
+                                raw[c]["conj"][t] += 1
+                            break
+                        k += 1
+                    break
+                if _content(tok):
+                    break
+                j += 1
+
+    result: dict[str, dict[str, list]] = {}
+    for lemma, rels in raw.items():
+        rel_dict: dict[str, list] = {}
+        for rel, counter in rels.items():
+            pairs = [[w, c] for w, c in counter.most_common()]
+            if pairs:
+                rel_dict[rel] = pairs
+        if rel_dict:
+            result[lemma] = rel_dict
+
+    return result
+
 
 def get_word_sketch(collocations: dict, lemma: str) -> dict:
     """
@@ -141,16 +286,24 @@ def get_word_sketch(collocations: dict, lemma: str) -> dict:
           "relations": [{"key": str, "name": str, "words": [[word, count], ...]}, ...]
         }
     """
+    if os.environ.get("DEBUG_COLLOCATIONS"):
+        with open("colocations.json", "w", encoding="utf-8") as _f:
+            json.dump(collocations, _f, ensure_ascii=False, indent=2)
+
     key = lemma.lower().strip()
     profile = collocations.get(key, {})
 
+    is_zh = bool(profile.keys() & _ZH_KEY_SET)
+    display_order = _DISPLAY_ORDER_ZH if is_zh else _DISPLAY_ORDER
+    label_map = _REL_LABELS_ZH if is_zh else _REL_LABELS
+
     relations = []
     seen = set()
-    for rel_key in _DISPLAY_ORDER:
+    for rel_key in display_order:
         if rel_key in profile:
             relations.append({
                 "key":   rel_key,
-                "name":  _REL_LABELS.get(rel_key, rel_key),
+                "name":  label_map.get(rel_key, rel_key),
                 "words": profile[rel_key][:12],
             })
             seen.add(rel_key)
@@ -158,7 +311,7 @@ def get_word_sketch(collocations: dict, lemma: str) -> dict:
         if rel_key not in seen:
             relations.append({
                 "key":   rel_key,
-                "name":  _REL_LABELS.get(rel_key, rel_key),
+                "name":  label_map.get(rel_key, rel_key),
                 "words": pairs[:12],
             })
 

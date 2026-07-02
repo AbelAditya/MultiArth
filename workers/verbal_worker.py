@@ -250,7 +250,12 @@ class VerbalWorker:
         collocations: dict = {}
         if doc is not None:
             try:
-                collocations = corpus_analysis.extract_collocations(doc)
+                if lang_code in ("zh", "ja", "ko"):
+                    collocations = corpus_analysis.extract_collocations_zh(
+                        doc, stopwords=frozenset(load_stopwords(lang_code))
+                    )
+                else:
+                    collocations = corpus_analysis.extract_collocations(doc)
             except Exception as exc:
                 logger.warning(f"[verbal] Collocations extraction failed: {exc}")
 
