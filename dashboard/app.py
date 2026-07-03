@@ -401,105 +401,6 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
             html.Div(id="analysis-status"),
         ]),
 
-        # ── GESTURE ──────────────────────────────────────────────────────
-        html.Div(style=SECTION_STYLE, children=[
-            section_header("Pose Estimation", C["gesture"], "MediaPipe Holistic · Kinematic features"),
-
-            html.Div(style={
-                "marginBottom": "28px", "paddingBottom": "24px",
-                "borderBottom": f"1px solid {C['border']}",
-            }, children=[
-                html.Div(style={
-                    "display": "flex", "alignItems": "flex-end",
-                    "justifyContent": "space-between", "flexWrap": "wrap",
-                    "gap": "12px", "marginBottom": "14px",
-                }, children=[
-                    html.Div([
-                        html.P("BODY SEGMENT", style=LABEL_STYLE),
-                        html.Div([
-                            dbc.Button("Head / Face", id="seg-head",  size="sm",
-                                       outline=True, color="primary", className="me-2 mt-1"),
-                            dbc.Button("Arms",        id="seg-arms",  size="sm",
-                                       outline=True, color="warning", className="me-2 mt-1"),
-                            dbc.Button("Hands",       id="seg-hands", size="sm",
-                                       outline=True, color="danger",  className="me-2 mt-1"),
-                            dbc.Button("Torso",       id="seg-torso", size="sm",
-                                       outline=True, color="success", className="me-2 mt-1"),
-                            dbc.Button("Gaze",        id="seg-gaze",  size="sm",
-                                       outline=True, color="pink", className="mt-1"),
-                        ], style={"marginTop": "6px", "display": "flex", "flexWrap": "wrap"}),
-                    ]),
-                    html.Div([
-                        html.P("POSE OVERLAY", style=LABEL_STYLE),
-                        dbc.Button("Landmarks  ON", id="landmark-toggle", size="sm",
-                                   color="success", className="mt-1", disabled=True),
-                    ]),
-                ]),
-
-                html.Div(style={"position": "relative", "lineHeight": "0"}, children=[
-                    html.Video(
-                        id="video-player",
-                        controls=True,
-                        style={
-                            "width": "100%", "maxHeight": "520px",
-                            "display": "block", "borderRadius": "8px",
-                            "backgroundColor": "#000",
-                        },
-                    ),
-                    html.Canvas(id="pose-canvas", style={
-                        "position": "absolute", "top": "0", "left": "0",
-                        "width": "100%", "height": "100%",
-                        "pointerEvents": "none", "borderRadius": "8px",
-                    }),
-                ]),
-
-                html.Div(style={
-                    "display": "flex", "gap": "32px", "alignItems": "flex-end",
-                    "marginTop": "12px", "flexWrap": "wrap",
-                }, children=[
-                    html.Div([
-                        html.P("CURRENT TIME", style=LABEL_STYLE),
-                        html.P(id="current-time-display", children="—", style={
-                            "fontFamily": "Fraunces, serif", "fontSize": "2rem",
-                            "color": C["cursor"], "margin": "4px 0 0 0", "lineHeight": "1",
-                        }),
-                    ]),
-                    html.Div(style={"flex": "1", "minWidth": "200px"}, children=[
-                        html.P("CURRENT WINDOW", style=LABEL_STYLE),
-                        html.P(id="current-window-display", children="—", style={
-                            "fontFamily": "DM Mono, monospace", "fontSize": "11px",
-                            "color": C["text"], "margin": "4px 0 0 0",
-                        }),
-                    ]),
-                ]),
-
-                dcc.Graph(id="g-handedness", style={"height": "160px", "marginTop": "20px"},
-                          config=CHART_CFG),
-            ]),
-
-            dcc.Graph(id="g-velocity", style={"height": "200px"}, config=CHART_CFG),
-        ]),
-
-        # ── ACOUSTIC ──────────────────────────────────────────────────────
-        html.Div(style=SECTION_STYLE, children=[
-            section_header("Acoustic Properties", C["prosody"], "Parselmouth · Praat algorithms"),
-            dcc.Graph(id="p-spectrogram", style={"height": "280px"}, config=CHART_CFG),
-            dcc.Graph(id="p-waveform",   style={"height": "220px", "marginTop": "4px"}, config=CHART_CFG),
-            dcc.Graph(id="p-f0",        style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="p-intensity", style={"height": "200px"}, config=CHART_CFG),
-        ]),
-
-        # ── CAMERA ────────────────────────────────────────────────────────
-        html.Div(style=SECTION_STYLE, children=[
-            section_header("Camera", C["camera"], "PySceneDetect · Haar cascade"),
-            dcc.Graph(id="c-shot",     style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="c-h-angle",  style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="c-v-angle",  style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="c-cutrate",  style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="c-facearea", style={"height": "200px"}, config=CHART_CFG),
-            dcc.Graph(id="c-trend",    style={"height": "200px"}, config=CHART_CFG),
-        ]),
-
         # ── CORPUS ANALYSIS ───────────────────────────────────────────────
         html.Div(style=SECTION_STYLE, children=[
             section_header("Verbal Language", C["corpus"],
@@ -627,6 +528,105 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                               style={"height": "380px"}, config=CHART_CFG),
                 ])]),
             ]),
+        ]),
+
+        # ── GESTURE ──────────────────────────────────────────────────────
+        html.Div(style=SECTION_STYLE, children=[
+            section_header("Pose Estimation", C["gesture"], "MediaPipe Holistic · Kinematic features"),
+
+            html.Div(style={
+                "marginBottom": "28px", "paddingBottom": "24px",
+                "borderBottom": f"1px solid {C['border']}",
+            }, children=[
+                html.Div(style={
+                    "display": "flex", "alignItems": "flex-end",
+                    "justifyContent": "space-between", "flexWrap": "wrap",
+                    "gap": "12px", "marginBottom": "14px",
+                }, children=[
+                    html.Div([
+                        html.P("BODY SEGMENT", style=LABEL_STYLE),
+                        html.Div([
+                            dbc.Button("Head / Face", id="seg-head",  size="sm",
+                                       outline=True, color="primary", className="me-2 mt-1"),
+                            dbc.Button("Arms",        id="seg-arms",  size="sm",
+                                       outline=True, color="warning", className="me-2 mt-1"),
+                            dbc.Button("Hands",       id="seg-hands", size="sm",
+                                       outline=True, color="danger",  className="me-2 mt-1"),
+                            dbc.Button("Torso",       id="seg-torso", size="sm",
+                                       outline=True, color="success", className="me-2 mt-1"),
+                            dbc.Button("Gaze",        id="seg-gaze",  size="sm",
+                                       outline=True, color="pink", className="mt-1"),
+                        ], style={"marginTop": "6px", "display": "flex", "flexWrap": "wrap"}),
+                    ]),
+                    html.Div([
+                        html.P("POSE OVERLAY", style=LABEL_STYLE),
+                        dbc.Button("Landmarks  ON", id="landmark-toggle", size="sm",
+                                   color="success", className="mt-1", disabled=True),
+                    ]),
+                ]),
+
+                html.Div(style={"position": "relative", "lineHeight": "0"}, children=[
+                    html.Video(
+                        id="video-player",
+                        controls=True,
+                        style={
+                            "width": "100%", "maxHeight": "520px",
+                            "display": "block", "borderRadius": "8px",
+                            "backgroundColor": "#000",
+                        },
+                    ),
+                    html.Canvas(id="pose-canvas", style={
+                        "position": "absolute", "top": "0", "left": "0",
+                        "width": "100%", "height": "100%",
+                        "pointerEvents": "none", "borderRadius": "8px",
+                    }),
+                ]),
+
+                html.Div(style={
+                    "display": "flex", "gap": "32px", "alignItems": "flex-end",
+                    "marginTop": "12px", "flexWrap": "wrap",
+                }, children=[
+                    html.Div([
+                        html.P("CURRENT TIME", style=LABEL_STYLE),
+                        html.P(id="current-time-display", children="—", style={
+                            "fontFamily": "Fraunces, serif", "fontSize": "2rem",
+                            "color": C["cursor"], "margin": "4px 0 0 0", "lineHeight": "1",
+                        }),
+                    ]),
+                    html.Div(style={"flex": "1", "minWidth": "200px"}, children=[
+                        html.P("CURRENT WINDOW", style=LABEL_STYLE),
+                        html.P(id="current-window-display", children="—", style={
+                            "fontFamily": "DM Mono, monospace", "fontSize": "11px",
+                            "color": C["text"], "margin": "4px 0 0 0",
+                        }),
+                    ]),
+                ]),
+
+                dcc.Graph(id="g-handedness", style={"height": "160px", "marginTop": "20px"},
+                          config=CHART_CFG),
+            ]),
+
+            dcc.Graph(id="g-velocity", style={"height": "200px"}, config=CHART_CFG),
+        ]),
+
+        # ── ACOUSTIC ──────────────────────────────────────────────────────
+        html.Div(style=SECTION_STYLE, children=[
+            section_header("Acoustic Properties", C["prosody"], "Parselmouth · Praat algorithms"),
+            dcc.Graph(id="p-spectrogram", style={"height": "280px"}, config=CHART_CFG),
+            dcc.Graph(id="p-waveform",   style={"height": "220px", "marginTop": "4px"}, config=CHART_CFG),
+            dcc.Graph(id="p-f0",        style={"height": "200px"}, config=CHART_CFG),
+            dcc.Graph(id="p-intensity", style={"height": "200px"}, config=CHART_CFG),
+        ]),
+
+        # ── CAMERA ────────────────────────────────────────────────────────
+        html.Div(style=SECTION_STYLE, children=[
+            section_header("Camera", C["camera"], "PySceneDetect · Haar cascade"),
+            dcc.Graph(id="c-shot",     style={"height": "200px"}, config=CHART_CFG),
+            dcc.Graph(id="c-h-angle",  style={"height": "200px"}, config=CHART_CFG),
+            dcc.Graph(id="c-v-angle",  style={"height": "200px"}, config=CHART_CFG),
+            dcc.Graph(id="c-cutrate",  style={"height": "200px"}, config=CHART_CFG),
+            dcc.Graph(id="c-facearea", style={"height": "200px"}, config=CHART_CFG),
+            dcc.Graph(id="c-trend",    style={"height": "200px"}, config=CHART_CFG),
         ]),
     ]),
 
