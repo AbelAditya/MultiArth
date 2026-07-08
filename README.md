@@ -47,12 +47,39 @@ uv run python -m spacy download en_core_web_sm
 
 ### Run with Docker instead
 
+Pre-built image: **[abx13/multiarth](https://hub.docker.com/r/abx13/multiarth)**
+on Docker Hub (bundles ffmpeg, the spaCy English/Chinese models, and a
+pre-downloaded Whisper `small` model so the first run doesn't need internet
+access).
+
 ```bash
+# Copy and adjust environment variables (Redis host, storage paths, etc.)
+cp .env.example .env
+
+# Start Redis + the dashboard app (pulls abx13/multiarth automatically)
 docker compose up
+
 # Dashboard available at http://localhost:8050
 ```
 
-The app image is published as `abx13/multiarth` (see `docker-compose.yml`).
+`docker-compose.yml` runs two services:
+- `redis` — the feature store backing all workers.
+- `app` — the `abx13/multiarth` image, serving the Dash dashboard via
+  gunicorn on port `8050`, with `app-data` and `redis-data` named volumes
+  for persistence across restarts.
+
+To run the image directly instead of via compose (e.g. against an existing
+Redis instance):
+
+```bash
+docker run -p 8050:8050 --env-file .env \
+  -e REDIS_HOST=<your-redis-host> \
+  -v multiarth-data:/data \
+  abx13/multiarth
+```
+
+For GPU-accelerated Whisper inference, uncomment the NVIDIA `deploy` block
+in `docker-compose.yml` and pass `--device cuda` where applicable.
 
 ---
 
