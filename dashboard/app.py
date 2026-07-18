@@ -14,12 +14,14 @@ import os
 import re
 import threading
 import uuid as _uuid_module
+from datetime import datetime
 from pathlib import Path
 
 import dash
 import dash_bootstrap_components as dbc
 import flask
 import plotly.graph_objects as go
+from loguru import logger
 from plotly.subplots import make_subplots
 from dash import ALL, Input, Output, State, callback, clientside_callback, dash_table, dcc, html
 from dotenv import load_dotenv
@@ -30,6 +32,7 @@ from core import corpus_analysis
 from core.feature_store import FeatureStore
 from core.models import FusedWindow, HorizontalAngle, VerticalAngle
 from core.orchestrator import Orchestrator
+from core.results_repository import ResultsRepository
 
 # ─────────────────────────────────────────────────────────────────────────────
 # App + video serving
@@ -37,6 +40,27 @@ from core.orchestrator import Orchestrator
 
 store = FeatureStore()
 _orch = Orchestrator(store=store)
+
+# Browse Corpus reads from Mongo. Optional at dashboard-startup time — if
+# MONGO_URI isn't configured or the cluster isn't reachable, the Browse
+# Corpus tab just reports that rather than crashing the whole app (Live
+# Analysis must keep working either way).
+try:
+    repo: ResultsRepository | None = ResultsRepository()
+except Exception as exc:
+    logger.warning(f"[dashboard] MongoDB unavailable, Browse Corpus disabled: {exc}")
+    repo = None
+
+
+_DRIVE_ID_RE = re.compile(r"/d/([a-zA-Z0-9_-]+)")
+
+
+def _drive_preview_url(drive_url: str | None) -> str | None:
+    if not drive_url:
+        return None
+    m = _DRIVE_ID_RE.search(drive_url)
+    file_id = m.group(1) if m else drive_url
+    return f"https://drive.google.com/file/d/{file_id}/preview"
 
 server = flask.Flask(__name__)
 server.config["MAX_CONTENT_LENGTH"] = None  # allow large video uploads
@@ -64,6 +88,22 @@ def serve_video():
     directory = str(Path(path).parent)
     filename   = Path(path).name
     return flask.send_from_directory(directory, filename, conditional=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Redis-vs-Mongo artifact lookup (Live Analysis vs Browse Corpus)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _artifacts(job_id: str, data_source: str, collection: str | None = None) -> dict:
+    if data_source == "mongo":
+        return (repo.get_artifacts(collection, job_id) if repo and collection else None) or {}
+    return {
+        "spectrogram":  store.get_spectrogram(job_id),
+        "waveform":     store.get_waveform(job_id),
+        "collocations": store.get_collocations(job_id),
+        "wordlist":     store.get_wordlist(job_id),
+        "ngrams":       store.get_ngrams(job_id),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -370,35 +410,63 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
             "display": "flex", "gap": "14px", "flexWrap": "wrap", "marginBottom": "28px",
         }),
 
-        # ── UPLOAD ───────────────────────────────────────────────────────
-        html.Div(style=SECTION_STYLE, children=[
-            section_header("Video Upload", C["muted"], "Drop a video file to begin analysis"),
+        # ── MODE TOGGLE ────────────────────────────────────────────────────
+        dcc.Tabs(id="mode-tabs", value="live", style={"marginBottom": "20px"}, children=[
+            dcc.Tab(label="Live Analysis", value="live",
+                    style=_TAB_BASE, selected_style=_tab_sel(C["muted"])),
+            dcc.Tab(label="Browse Corpus", value="browse",
+                    style=_TAB_BASE, selected_style=_tab_sel(C["muted"])),
+        ]),
 
-            dcc.Upload(
-                id="video-upload",
-                children=html.Div([
-                    html.P("Drop a video file here, or click to browse", style={
-                        "fontFamily": "DM Mono, monospace", "fontSize": "12px",
-                        "color": C["muted"], "margin": "0 0 4px 0",
-                    }),
-                    html.P("MP4 · MOV · MKV · AVI · WEBM", style={
-                        "fontFamily": "DM Mono, monospace", "fontSize": "10px",
-                        "letterSpacing": "0.1em", "color": C["border"], "margin": "0",
-                    }),
-                ], style={"textAlign": "center", "padding": "16px 0"}),
-                accept="video/*",
-                multiple=False,
-                max_size=-1,
-                style={
-                    "width": "100%",
-                    "border": f"1px dashed {C['border']}",
-                    "borderRadius": "8px",
-                    "cursor": "pointer",
-                    "marginBottom": "12px",
-                    "backgroundColor": C["bg"],
-                },
-            ),
-            html.Div(id="analysis-status"),
+        # ── UPLOAD (Live Analysis) ───────────────────────────────────────
+        html.Div(id="live-panel", children=[
+            html.Div(style=SECTION_STYLE, children=[
+                section_header("Video Upload", C["muted"], "Drop a video file to begin analysis"),
+
+                dcc.Upload(
+                    id="video-upload",
+                    children=html.Div([
+                        html.P("Drop a video file here, or click to browse", style={
+                            "fontFamily": "DM Mono, monospace", "fontSize": "12px",
+                            "color": C["muted"], "margin": "0 0 4px 0",
+                        }),
+                        html.P("MP4 · MOV · MKV · AVI · WEBM", style={
+                            "fontFamily": "DM Mono, monospace", "fontSize": "10px",
+                            "letterSpacing": "0.1em", "color": C["border"], "margin": "0",
+                        }),
+                    ], style={"textAlign": "center", "padding": "16px 0"}),
+                    accept="video/*",
+                    multiple=False,
+                    max_size=-1,
+                    style={
+                        "width": "100%",
+                        "border": f"1px dashed {C['border']}",
+                        "borderRadius": "8px",
+                        "cursor": "pointer",
+                        "marginBottom": "12px",
+                        "backgroundColor": C["bg"],
+                    },
+                ),
+                html.Div(id="analysis-status"),
+            ]),
+        ]),
+
+        # ── BROWSE CORPUS ────────────────────────────────────────────────
+        html.Div(id="browse-panel", style={"display": "none"}, children=[
+            html.Div(style=SECTION_STYLE, children=[
+                section_header("Browse Corpus", C["muted"],
+                               "Previously-processed videos, shipped to MongoDB"),
+                html.Div(id="browse-collection-buttons", style={
+                    "display": "flex", "gap": "10px", "marginBottom": "16px", "flexWrap": "wrap",
+                }),
+                dcc.Dropdown(
+                    id="browse-video-dropdown",
+                    placeholder="Select a video…",
+                    style={"fontFamily": "DM Mono, monospace", "fontSize": "12px",
+                           "marginBottom": "16px"},
+                ),
+                html.Div(id="browse-video-info"),
+            ]),
         ]),
 
         # ── CORPUS ANALYSIS ───────────────────────────────────────────────
@@ -411,7 +479,7 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                             "alignItems": "center"}, children=[
                 dcc.Input(
                     id="kw-input", type="text",
-                    placeholder="Enter keyword or lemma…",
+                    placeholder="Enter a word…",
                     debounce=False, n_submit=0,
                     style={
                         "fontFamily": "DM Mono, monospace", "fontSize": "12px",
@@ -575,6 +643,13 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                             "backgroundColor": "#000",
                         },
                     ),
+                    html.Iframe(
+                        id="drive-video-player",
+                        style={
+                            "width": "100%", "height": "520px",
+                            "display": "none", "border": "none", "borderRadius": "8px",
+                        },
+                    ),
                     html.Canvas(id="pose-canvas", style={
                         "position": "absolute", "top": "0", "left": "0",
                         "width": "100%", "height": "100%",
@@ -634,6 +709,10 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
     dcc.Store(id="fused-data"),
     dcc.Store(id="current-time", data=0.0),
     dcc.Store(id="active-job-id"),
+    dcc.Store(id="data-source", data="redis"),
+    dcc.Store(id="browse-collection", data=None),
+    dcc.Store(id="active-drive-url", data=None),
+    dcc.Store(id="active-collection", data=None),
     dcc.Store(id="pose-segment", data=[]),
     dcc.Store(id="pose-timeline", data=None),
     dcc.Store(id="pose-render-dummy"),
@@ -748,19 +827,46 @@ clientside_callback(
 
 _UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/tmp/mannerism/uploads"))
 
+
+def _cleanup_previous_upload() -> None:
+    """Delete the previously uploaded video and its extracted-audio cache.
+
+    The dashboard only ever plays back one active video at a time (`_VIDEO_PATH`
+    is a single global slot), so by the time a new upload arrives the old one
+    is guaranteed to no longer be needed — nothing else in the codebase ever
+    cleans these up for the live-analysis (non-bulk) path, so they'd otherwise
+    accumulate on disk with every upload.
+    """
+    old_path = _VIDEO_PATH.get("path")
+    if not old_path:
+        return
+    audio_path = _orch.work_dir / (Path(old_path).stem + "_audio.wav")
+    for p in (Path(old_path), audio_path):
+        try:
+            if p.exists():
+                p.unlink()
+        except OSError as exc:
+            logger.warning(f"[dashboard] Could not delete {p}: {exc}")
+
+
 @callback(
     Output("active-job-id", "data"),
     Output("poll-interval", "disabled"),
     Output("video-player", "src"),
     Output("analysis-status", "children"),
     Output("landmark-toggle", "disabled"),
+    Output("data-source", "data"),
+    Output("active-drive-url", "data"),
+    Output("active-collection", "data"),
     Input("video-upload", "contents"),
     State("video-upload", "filename"),
     prevent_initial_call=True,
 )
 def handle_upload(contents, filename):
     if not contents:
-        return dash.no_update, True, dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, True, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+    _cleanup_previous_upload()
 
     _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     _, b64 = contents.split(",", 1)
@@ -779,7 +885,202 @@ def handle_upload(contents, filename):
     ).start()
 
     video_src = f"/video?t={os.path.getmtime(video_path)}"
-    return job_id, False, video_src, _analysis_progress("running", f"Analysing {filename}…"), True
+    return job_id, False, video_src, _analysis_progress("running", f"Analysing {filename}…"), True, "redis", None, None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Browse Corpus — flat list of videos already shipped to MongoDB
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _format_duration(seconds) -> str:
+    if not seconds:
+        return "—"
+    m, s = divmod(int(seconds), 60)
+    return f"{m}:{s:02d}"
+
+
+def _format_timestamp(ts) -> str:
+    if not ts:
+        return "—"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def _build_video_info(collection: str | None, job_id: str | None, videos: list[dict] | None):
+    if repo is None:
+        return html.P(
+            "MongoDB is not configured (set MONGO_URI) — Browse Corpus is unavailable.",
+            style={"fontFamily": "DM Mono, monospace", "fontSize": "11px", "color": C["muted"]},
+        )
+    if not collection:
+        return html.P(
+            "Select a collection above to see its videos.",
+            style={"fontFamily": "DM Mono, monospace", "fontSize": "11px", "color": C["muted"]},
+        )
+    if videos is not None and not videos:
+        return html.P(
+            f'No videos have been shipped to "{collection}" yet — run `analyze bulk`.',
+            style={"fontFamily": "DM Mono, monospace", "fontSize": "11px", "color": C["muted"]},
+        )
+    if not job_id:
+        return html.P(
+            "Select a video above to load its analysis.",
+            style={"fontFamily": "DM Mono, monospace", "fontSize": "11px", "color": C["muted"]},
+        )
+    video = next((v for v in (videos or []) if v["_id"] == job_id), None)
+    if not video:
+        return html.Div()
+
+    mono_sm = "DM Mono, monospace"
+    fields = [
+        ("Filename",  video.get("video_filename", "—")),
+        ("Duration",  _format_duration(video.get("duration_s"))),
+        ("Processed", _format_timestamp(video.get("completed_at") or video.get("shipped_at"))),
+    ]
+    spans = []
+    for i, (name, value) in enumerate(fields):
+        prefix = "" if i == 0 else "  ·  "
+        spans.append(html.Span(f"{prefix}{name}: ",
+                                style={"fontFamily": mono_sm, "fontSize": "11px", "color": C["muted"]}))
+        spans.append(html.Span(value,
+                                style={"fontFamily": mono_sm, "fontSize": "11px", "color": C["text"]}))
+    return html.Div(spans)
+
+
+@callback(
+    Output("live-panel", "style"),
+    Output("browse-panel", "style"),
+    Input("mode-tabs", "value"),
+)
+def toggle_mode(mode):
+    live_style = {"display": "block" if mode == "live" else "none"}
+    browse_style = {"display": "block" if mode == "browse" else "none"}
+    return live_style, browse_style
+
+
+@callback(
+    Output("browse-collection-buttons", "children"),
+    Output("browse-collection", "data"),
+    Input("mode-tabs", "value"),
+    State("browse-collection", "data"),
+)
+def populate_browse_collections(mode, current_value):
+    if mode != "browse" or repo is None:
+        return dash.no_update, dash.no_update
+    collections = repo.list_collections()
+    value = current_value if current_value in collections else (collections[0] if collections else None)
+    buttons = [
+        dbc.Button(
+            name, id={"type": "collection-btn", "index": name},
+            size="sm", color="primary" if name == value else "secondary",
+            outline=(name != value),
+        )
+        for name in collections
+    ]
+    return buttons, value
+
+
+@callback(
+    Output("browse-collection", "data", allow_duplicate=True),
+    Input({"type": "collection-btn", "index": ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def select_collection_button(_):
+    ctx = dash.callback_context
+    if not ctx.triggered_id:
+        return dash.no_update
+    return ctx.triggered_id["index"]
+
+
+@callback(
+    Output({"type": "collection-btn", "index": ALL}, "color"),
+    Output({"type": "collection-btn", "index": ALL}, "outline"),
+    Input("browse-collection", "data"),
+    State({"type": "collection-btn", "index": ALL}, "id"),
+)
+def restyle_collection_buttons(selected, ids):
+    if not ids:
+        return [], []
+    colors   = ["primary" if i["index"] == selected else "secondary" for i in ids]
+    outlines = [i["index"] != selected for i in ids]
+    return colors, outlines
+
+
+@callback(
+    Output("browse-video-dropdown", "options"),
+    Output("browse-video-dropdown", "value"),
+    Input("browse-collection", "data"),
+)
+def populate_browse_videos(collection):
+    if repo is None or not collection:
+        return [], None
+    videos = repo.list_videos(collection)
+    options = [
+        {"label": v.get("label") or v.get("video_filename", v["_id"]), "value": v["_id"]}
+        for v in videos
+    ]
+    return options, None
+
+
+@callback(
+    Output("browse-video-info", "children"),
+    Input("browse-video-dropdown", "value"),
+    State("browse-collection", "data"),
+)
+def show_browse_video_info(job_id, collection):
+    if repo is None or not collection:
+        return _build_video_info(collection, job_id, None)
+    videos = repo.list_videos(collection)
+    return _build_video_info(collection, job_id, videos)
+
+
+@callback(
+    Output("active-job-id", "data", allow_duplicate=True),
+    Output("data-source", "data", allow_duplicate=True),
+    Output("active-drive-url", "data", allow_duplicate=True),
+    Output("active-collection", "data", allow_duplicate=True),
+    Output("fused-data", "data", allow_duplicate=True),
+    Output("analysis-status", "children", allow_duplicate=True),
+    Output("landmark-toggle", "disabled", allow_duplicate=True),
+    Output("poll-interval", "disabled", allow_duplicate=True),
+    Input("browse-video-dropdown", "value"),
+    State("browse-collection", "data"),
+    prevent_initial_call=True,
+)
+def handle_browse_select(job_id, collection):
+    if not job_id or repo is None or not collection:
+        return (dash.no_update,) * 8
+
+    videos = repo.list_videos(collection)
+    row = next((v for v in videos if v["_id"] == job_id), None)
+    drive_url = (row or {}).get("drive_url") or None
+
+    windows = repo.get_all_fused(collection, job_id)
+    serialised = [w.model_dump(mode="json") for w in windows]
+    status_msg = _analysis_progress("done", f"Loaded from corpus — {len(windows)} windows")
+    return job_id, "mongo", drive_url, collection, serialised, status_msg, False, True
+
+
+@callback(
+    Output("video-player", "style"),
+    Output("drive-video-player", "style"),
+    Output("drive-video-player", "src"),
+    Input("data-source", "data"),
+    Input("active-drive-url", "data"),
+)
+def toggle_video_source(data_source, drive_url):
+    video_style = {
+        "width": "100%", "maxHeight": "520px", "display": "block",
+        "borderRadius": "8px", "backgroundColor": "#000",
+    }
+    iframe_style = {
+        "width": "100%", "height": "520px", "display": "none",
+        "border": "none", "borderRadius": "8px",
+    }
+    if data_source == "mongo" and drive_url:
+        video_style["display"] = "none"
+        iframe_style["display"] = "block"
+        return video_style, iframe_style, _drive_preview_url(drive_url)
+    return video_style, iframe_style, dash.no_update
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1149,11 +1450,13 @@ def g_handedness(data, ct, occ):
     Input("fused-data", "data"),
     Input("keyword-occurrences", "data"),
     State("active-job-id", "data"),
+    State("data-source", "data"),
+    State("active-collection", "data"),
 )
-def p_spectrogram(data, occ, job_id):
+def p_spectrogram(data, occ, job_id, data_source, collection):
     if not data or not job_id:
         return empty_fig("Spectrogram")
-    sg = store.get_spectrogram(job_id)
+    sg = _artifacts(job_id, data_source, collection).get("spectrogram")
     if not sg:
         return empty_fig("Spectrogram")
     fig = go.Figure(go.Heatmap(
@@ -1211,11 +1514,13 @@ def p_spectrogram(data, occ, job_id):
     Input("fused-data", "data"),
     Input("keyword-occurrences", "data"),
     State("active-job-id", "data"),
+    State("data-source", "data"),
+    State("active-collection", "data"),
 )
-def p_waveform(data, occ, job_id):
+def p_waveform(data, occ, job_id, data_source, collection):
     if not data or not job_id:
         return empty_fig("Waveform")
-    wf = store.get_waveform(job_id)
+    wf = _artifacts(job_id, data_source, collection).get("waveform")
     if not wf:
         return empty_fig("Waveform")
     times = wf["times"]
@@ -1559,15 +1864,17 @@ def conc_seek(_, occurrences):
     Output("kw-sketch-panel", "children"),
     Input("active-keyword", "data"),
     State("active-job-id", "data"),
+    State("data-source", "data"),
+    State("active-collection", "data"),
     prevent_initial_call=True,
 )
-def kw_sketch(keyword, job_id):
+def kw_sketch(keyword, job_id, data_source, collection):
     if not keyword:
         return html.Div()
     if not job_id:
         return html.P("No active job — upload a video and run analysis first.",
                       style={"fontFamily": "DM Mono, monospace", "fontSize": "10px", "color": C["muted"]})
-    collocations = store.get_collocations(job_id)
+    collocations = _artifacts(job_id, data_source, collection).get("collocations")
     if not collocations:
         return html.P("No collocations data — run analysis first.",
                       style={"fontFamily": "DM Mono, monospace", "fontSize": "10px",
@@ -1604,12 +1911,15 @@ def kw_sketch(keyword, job_id):
     Output("kw-thesaurus-panel", "children"),
     Input("active-keyword", "data"),
     State("active-job-id", "data"),
+    State("data-source", "data"),
+    State("active-collection", "data"),
     prevent_initial_call=True,
 )
-def kw_thesaurus(keyword, job_id):
+def kw_thesaurus(keyword, job_id, data_source, collection):
     if not keyword or not job_id:
         return html.Div()
-    collocations = store.get_collocations(job_id)
+    artifacts = _artifacts(job_id, data_source, collection)
+    collocations = artifacts.get("collocations")
     if not collocations:
         return html.P("No collocations data — run analysis first.",
                       style={"fontFamily": "DM Mono, monospace", "fontSize": "10px",
@@ -1621,7 +1931,7 @@ def kw_thesaurus(keyword, job_id):
             "The transcript may be too short for reliable similarity.",
             style={"fontFamily": "DM Mono, monospace", "fontSize": "10px", "color": C["muted"]})
 
-    wl = store.get_wordlist(job_id)
+    wl = artifacts.get("wordlist")
     freq_map: dict[str, int] = {}
     if wl and wl.get("words"):
         freq_map = {e["lemma"]: e["count"] for e in wl["words"]}
@@ -1697,12 +2007,14 @@ def kw_thesaurus(keyword, job_id):
     Input("active-keyword", "data"),
     Input("second-keyword", "data"),
     State("active-job-id", "data"),
+    State("data-source", "data"),
+    State("active-collection", "data"),
     prevent_initial_call=True,
 )
-def kw_diff(kw1, kw2, job_id):
+def kw_diff(kw1, kw2, job_id, data_source, collection):
     if not kw1 or not kw2 or not job_id:
         return html.Div()
-    collocations = store.get_collocations(job_id)
+    collocations = _artifacts(job_id, data_source, collection).get("collocations")
     if not collocations:
         return html.Div()
     diff = corpus_analysis.word_sketch_diff(collocations, kw1, kw2)
@@ -1809,11 +2121,13 @@ POS_COLOUR = {
     Input("fused-data", "data"),
     Input("pos-filter", "value"),
     State("active-job-id", "data"),
+    State("data-source", "data"),
+    State("active-collection", "data"),
 )
-def kw_wordlist_chart(data, pos_filter, job_id):
+def kw_wordlist_chart(data, pos_filter, job_id, data_source, collection):
     if not data or not job_id:
         return empty_fig("Word List")
-    wl = store.get_wordlist(job_id)
+    wl = _artifacts(job_id, data_source, collection).get("wordlist")
     if not wl or not wl.get("words"):
         return empty_fig("Word List")
 
@@ -1873,11 +2187,13 @@ def kw_wordlist_chart(data, pos_filter, job_id):
     Output("kw-ngrams-chart", "figure"),
     Input("fused-data", "data"),
     State("active-job-id", "data"),
+    State("data-source", "data"),
+    State("active-collection", "data"),
 )
-def kw_ngrams_chart(data, job_id):
+def kw_ngrams_chart(data, job_id, data_source, collection):
     if not data or not job_id:
         return empty_fig("N-grams")
-    ng = store.get_ngrams(job_id)
+    ng = _artifacts(job_id, data_source, collection).get("ngrams")
     if not ng:
         return empty_fig("N-grams")
 

@@ -96,20 +96,15 @@ class VerbalWorker:
             f"[verbal] Transcription complete — {len(all_tokens)} word tokens "
             f"(language: {lang_code})"
         )
-        self.store.log_event(
-            job_id, "verbal",
-            f"transcription done: {len(all_tokens)} tokens, language={lang_code}"
-        )
 
         for idx, (start, end) in enumerate(windows):
             try:
                 window_tokens = [t for t in all_tokens if start <= t.start_s < end]
                 features = self._process_window(start, end, window_tokens)
                 self.store.put_verbal(job_id, idx, features)
-                self.store.log_event(job_id, "verbal", f"window {idx} done")
+                logger.debug(f"[verbal] window {idx} done")
             except Exception as exc:
                 logger.error(f"[verbal] Window {idx} failed: {exc}")
-                self.store.log_event(job_id, "verbal", f"window {idx} ERROR: {exc}")
 
         try:
             wordlist, ngrams, collocations = self._compute_corpus_stats(
@@ -119,7 +114,6 @@ class VerbalWorker:
             self.store.put_ngrams(job_id, ngrams)
             self.store.put_collocations(job_id, collocations)
             logger.info(f"[verbal] Collocations stored: {len(collocations)} entries for job {job_id}")
-            self.store.log_event(job_id, "verbal", "corpus stats done")
         except Exception as exc:
             logger.error(f"[verbal] Corpus stats failed: {exc}")
 

@@ -13,9 +13,11 @@ Key schema
   job:{job_id}:camera:{w}      STRING  CameraFeatures JSON
   job:{job_id}:fused:{w}       STRING  FusedWindow JSON
   job:{job_id}:meta            STRING  AnalysisJob JSON
-  job:{job_id}:stream          STREAM  progress/log events
 
 All keys are set with a 24-hour TTL by default.
+
+Per-window progress/log events go straight to loguru instead of Redis —
+they're transient console output, not a scratch artifact anything reads back.
 """
 
 from __future__ import annotations
@@ -179,22 +181,10 @@ class FeatureStore:
     def count_windows(self, job_id: str, modality: str) -> int:
         return len(self.r.keys(f"job:{job_id}:{modality}:*"))
 
-    # ------------------------------------------------------------------
-    # Progress stream
-    # ------------------------------------------------------------------
-
-    def log_event(self, job_id: str, worker: str, message: str) -> None:
-        self.r.xadd(
-            f"job:{job_id}:stream",
-            {"worker": worker, "msg": message, "ts": str(time.time())},
-        )
-
-    def read_events(self, job_id: str, last_id: str = "0") -> list[dict]:
-        entries = self.r.xread({f"job:{job_id}:stream": last_id}, count=100)
-        if not entries:
-            return []
-        events = []
-        for _, messages in entries:
-            for msg_id, fields in messages:
-                events.append({"id": msg_id, **fields})
-        return events
+    def delete_job(self, job_id: str) -> None:
+        """Remove every Redis key for a job, freeing its scratch data early
+        instead of waiting out the 24h TTL — e.g. once results have been
+        durably shipped to MongoDB."""
+        keys = list(self.r.scan_iter(match=f"job:{job_id}:*", count=200))
+        if keys:
+            self.r.delete(*keys)

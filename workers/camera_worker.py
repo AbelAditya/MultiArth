@@ -42,16 +42,14 @@ class CameraWorker:
         logger.info(f"[camera] Detecting scene cuts in {meta.path}")
         cuts = self._detect_cuts(meta.path)
         logger.info(f"[camera] Found {len(cuts)} cuts")
-        self.store.log_event(job_id, "camera", f"detected {len(cuts)} cuts")
 
         for idx, (start, end) in enumerate(windows):
             try:
                 features = self._process_window(meta, start, end, cuts)
                 self.store.put_camera(job_id, idx, features)
-                self.store.log_event(job_id, "camera", f"window {idx} done")
+                logger.debug(f"[camera] window {idx} done")
             except Exception as exc:
                 logger.error(f"[camera] Window {idx} failed: {exc}")
-                self.store.log_event(job_id, "camera", f"window {idx} ERROR: {exc}")
 
         logger.info(f"[camera] Job {job_id} complete")
 

@@ -1,6 +1,6 @@
 [project]
 name = "multiarth"
-version = "alberto"
+version = "1.0.0"
 description = "Multimodal linguistic analysis of speech videos"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,6 +17,8 @@ dependencies = [
     "spacy>=3.7.4",
     # Orchestration / data
     "redis>=5.0.3",
+    "pymongo>=4.7",
+    "pyyaml>=6.0",
     "numpy>=1.26.4",
     "pandas>=2.2.1",
     "scipy>=1.13.0",
@@ -43,6 +45,7 @@ dev-dependencies = [
     "pytest>=8.1.1",
     "pytest-asyncio>=0.23.6",
     "ipykernel>=6.29.4",
+    "mongomock>=4.3.0",
 ]
 
 [project.scripts]

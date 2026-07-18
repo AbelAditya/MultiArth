@@ -55,10 +55,9 @@ class GestureWorker:
             try:
                 features = self._process_window(meta, start, end)
                 self.store.put_gesture(job_id, idx, features)
-                self.store.log_event(job_id, "gesture", f"window {idx} done")
+                logger.debug(f"[gesture] window {idx} done")
             except Exception as exc:
                 logger.error(f"[gesture] Window {idx} failed: {exc}")
-                self.store.log_event(job_id, "gesture", f"window {idx} ERROR: {exc}")
         logger.info(f"[gesture] Job {job_id} complete")
 
     # ------------------------------------------------------------------

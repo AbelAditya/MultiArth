@@ -20,14 +20,21 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 import click
+from dotenv import load_dotenv
 from loguru import logger
+from tqdm import tqdm
 
+load_dotenv()
+
+from core.bulk_orchestrator import BulkOrchestrator, load_manifest
 from core.feature_store import FeatureStore
 from core.models import JobStatus
 from core.orchestrator import Orchestrator
+from core.results_repository import ResultsRepository
 
 
 @click.group()
@@ -70,6 +77,114 @@ def run(ctx, video_path, window, whisper_model, device, sequential, work_dir):
         orchestrator.close()
 
 
+def _make_bulk_progress_reporter():
+    """
+    Renders BulkOrchestrator's progress events as two tqdm bars: an outer
+    one advancing once per video (skipped/succeeded/failed all count), and
+    an inner single-line status showing live per-modality window counts
+    while the current video is being processed. Returns (on_progress, close).
+    """
+    outer = None
+    inner = tqdm(total=0, bar_format="{desc}", leave=False)
+
+    def on_progress(evt: dict) -> None:
+        nonlocal outer
+        if outer is None:
+            outer = tqdm(total=evt["total"], desc="Bulk processing", unit="video", position=0)
+
+        index, total = evt["index"], evt["total"]
+        name = evt.get("label") or os.path.basename(evt["path"])
+        tag = f"[{evt['collection']}][{index}/{total}] {name}"
+        etype = evt["type"]
+
+        if etype == "start":
+            inner.set_description_str(f"{tag}: starting…")
+        elif etype == "tick":
+            counts, total_windows = evt.get("counts"), evt.get("total_windows")
+            if counts and total_windows:
+                inner.set_description_str(
+                    f"{tag}: gesture {counts['gesture']}/{total_windows} · "
+                    f"prosody {counts['prosody']}/{total_windows} · "
+                    f"verbal {counts['verbal']}/{total_windows} · "
+                    f"camera {counts['camera']}/{total_windows}"
+                )
+            else:
+                inner.set_description_str(f"{tag}: processing…")
+        elif etype == "skip":
+            tqdm.write(f"  − {tag}: already shipped, skipped")
+            outer.update(1)
+        elif etype == "done":
+            symbol = "✓" if evt["result"] == "succeeded" else "✗"
+            colour = "green" if evt["result"] == "succeeded" else "red"
+            msg = f"  {symbol} {tag}: {evt['result']}"
+            if evt.get("error"):
+                msg += f" — {evt['error']}"
+            tqdm.write(click.style(msg, fg=colour))
+            outer.update(1)
+
+    def close():
+        inner.close()
+        if outer:
+            outer.close()
+
+    return on_progress, close
+
+
+@main.command()
+@click.argument("manifest_path")
+@click.option("--force", is_flag=True, default=False, help="Reprocess even if already shipped to Mongo")
+@click.option("--mongo-uri", default=None, help="MongoDB Atlas connection string (default: $MONGO_URI)")
+@click.option("--mongo-db", default=None, help="MongoDB database name (default: $MONGO_DB or 'multiarth')")
+@click.option("--window", default=5.0, show_default=True, help="Window size in seconds")
+@click.option("--whisper-model", default="small", show_default=True, help="Whisper model size")
+@click.option("--device", default="cpu", show_default=True, help="cpu or cuda")
+@click.option("--work-dir", default="/tmp/mannerism", show_default=True)
+@click.pass_context
+def bulk(ctx, manifest_path, force, mongo_uri, mongo_db, window, whisper_model, device, work_dir):
+    """
+    Sequentially process every video listed in a manifest JSON file and ship
+    each result to MongoDB. Manifest format: a JSON list of
+    {"path": "...", "collection": "...", "drive_url": "...", "label": "..."}
+    objects. "collection" names the corpus (e.g. "TedX", "Yixi") a video's
+    results are shipped into — see core/results_repository.py.
+    """
+    store = ctx.obj["store"]
+    try:
+        repo = ResultsRepository(uri=mongo_uri, db_name=mongo_db)
+    except Exception as exc:
+        click.echo(click.style(f"Could not connect to MongoDB: {exc}", fg="red"), err=True)
+        sys.exit(1)
+
+    runner = BulkOrchestrator(
+        feature_store=store,
+        repo=repo,
+        orchestrator_kwargs={
+            "work_dir": work_dir,
+            "window_size_s": window,
+            "whisper_model": whisper_model,
+            "whisper_device": device,
+        },
+    )
+    on_progress, close_progress = _make_bulk_progress_reporter()
+    try:
+        entries = load_manifest(manifest_path)
+        click.echo(f"Loaded {len(entries)} entries from {manifest_path}\n")
+        summary = runner.run(entries, force=force, progress_cb=on_progress)
+    finally:
+        close_progress()
+        repo.close()
+
+    click.echo("")
+    click.echo(click.style(f"✓ Succeeded: {len(summary['succeeded'])}", fg="green", bold=True))
+    click.echo(click.style(f"− Skipped:   {len(summary['skipped'])}", fg="blue"))
+    click.echo(click.style(f"✗ Failed:    {len(summary['failed'])}", fg="red"))
+    for failure in summary["failed"]:
+        click.echo(f"    {failure['path']}: {failure['error']}")
+
+    if summary["failed"]:
+        sys.exit(1)
+
+
 @main.command()
 @click.argument("job_id")
 @click.pass_context
@@ -89,12 +204,6 @@ def status(ctx, job_id):
     }.get(s, "white")
 
     click.echo(f"Job {job_id}: {click.style(s.value.upper(), fg=colour, bold=True)}")
-
-    events = store.read_events(job_id)
-    if events:
-        click.echo(f"\nLast {min(10, len(events))} events:")
-        for e in events[-10:]:
-            click.echo(f"  [{e.get('worker','?'):10s}] {e.get('msg','')}")
 
 
 @main.command()

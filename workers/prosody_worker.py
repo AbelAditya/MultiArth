@@ -39,22 +39,21 @@ class ProsodyWorker:
             try:
                 features = self._process_window(sound, start, end)
                 self.store.put_prosody(job_id, idx, features)
-                self.store.log_event(job_id, "prosody", f"window {idx} done")
+                logger.debug(f"[prosody] window {idx} done")
             except Exception as exc:
                 logger.error(f"[prosody] Window {idx} failed: {exc}")
-                self.store.log_event(job_id, "prosody", f"window {idx} ERROR: {exc}")
 
         try:
             sg = self._compute_spectrogram(sound)
             self.store.put_spectrogram(job_id, sg)
-            self.store.log_event(job_id, "prosody", "spectrogram done")
+            logger.debug("[prosody] spectrogram done")
         except Exception as exc:
             logger.error(f"[prosody] Spectrogram failed: {exc}")
 
         try:
             wf = self._compute_waveform(sound)
             self.store.put_waveform(job_id, wf)
-            self.store.log_event(job_id, "prosody", "waveform done")
+            logger.debug("[prosody] waveform done")
         except Exception as exc:
             logger.error(f"[prosody] Waveform failed: {exc}")
 

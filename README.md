@@ -120,6 +120,85 @@ uv run analyze dashboard
 uv run analyze export a3f2b1c9 --out results.json
 ```
 
+### Bulk-process a corpus of videos
+
+Sequentially processes a manifest of already-staged local videos and ships
+each finished result to **MongoDB Atlas** — the durable store for a corpus
+of many videos, as opposed to Redis's 24h-TTL scratch store for whichever
+single job is currently in flight.
+
+```bash
+cp .env.example .env   # then set MONGO_URI to your Atlas connection string
+
+uv run analyze bulk vids/manifest.yml
+```
+
+The manifest is a YAML (`.yml`/`.yaml`) or JSON list of videos to process,
+each already downloaded locally (e.g. from a shared Google Drive folder),
+tagged with the named corpus its results should ship into. A starter file
+with dummy entries to overwrite lives at `vids/manifest.yml`.
+
+```yaml
+- path: /data/staging/talk1.mp4
+  collection: TedX
+  drive_url: https://drive.google.com/file/d/xxxx/view
+  label: "Speaker A — Talk 1"
+- path: /data/staging/talk2.mp4
+  collection: Yixi
+  drive_url: https://drive.google.com/file/d/yyyy/view
+  label: "Speaker B — Talk 1"
+```
+
+(equivalently, as JSON:)
+
+```json
+[
+  {"path": "/data/staging/talk1.mp4", "collection": "TedX", "drive_url": "https://drive.google.com/file/d/xxxx/view", "label": "Speaker A — Talk 1"},
+  {"path": "/data/staging/talk2.mp4", "collection": "Yixi", "drive_url": "https://drive.google.com/file/d/yyyy/view", "label": "Speaker B — Talk 1"}
+]
+```
+
+- `path` (required) — local file to process.
+- `collection` (required) — names the corpus this video belongs to (e.g.
+  `"TedX"`, `"Yixi"`). Each distinct collection gets its own set of three
+  MongoDB collections (`{collection}_videos`, `{collection}_fused_windows`,
+  `{collection}_artifacts`) in the `MONGO_DB` database, so corpora stay
+  fully separate — a video shipped under `"TedX"` is invisible when browsing
+  `"Yixi"`, including for dedup checks. Letters, digits, `_` and `-` only.
+- `drive_url` (optional) — a shareable Drive link, kept only so the
+  dashboard's Browse Corpus tab can embed playback later; it is not used to
+  fetch the video.
+- `label` (optional) — free-text tag shown in the Browse Corpus list.
+
+Videos are processed **one at a time**. Once a video's fused results are
+shipped to Mongo successfully, its local video file and extracted-audio
+cache are deleted automatically (the durable copies are now Drive + Mongo).
+If shipping fails after a few inline retries, the local files are left in
+place and the failure is reported in the run summary — just re-run the same
+manifest later; already-shipped videos are skipped automatically (dedup'd
+by `drive_url`, falling back to the local path, scoped per `collection`).
+
+Options:
+```
+--force           Reprocess and re-ship even if already present in Mongo
+--mongo-uri       MongoDB Atlas connection string (default: $MONGO_URI)
+--mongo-db        MongoDB database name (default: $MONGO_DB or "multiarth")
+--window          Window size in seconds (default: 5.0)
+--whisper-model   Whisper model size (default: small)
+--device          cpu or cuda (default: cpu)
+--work-dir        Directory for extracted audio cache (default: /tmp/mannerism)
+```
+
+### Browse a processed corpus in the dashboard
+
+With `MONGO_URI` configured, the dashboard's **Browse Corpus** tab (next to
+**Live Analysis**) shows a dropdown of every collection that has at least
+one shipped video (e.g. `TedX`, `Yixi`); picking one lists its videos —
+label, filename, duration, processed date. Clicking a row loads that
+video's charts, transcript, and word-sketch tools exactly like a live
+analysis job, with video playback embedded from its Google Drive link
+instead of a local file.
+
 ---
 
 ## Architecture
@@ -178,11 +257,13 @@ mannerism_analyzer/
 ├── pyproject.toml          # uv / hatch build config; package name "multiarth"
 ├── cli.py                  # click CLI entry point
 ├── core/
-│   ├── models.py           # Pydantic data models (shared across workers)
-│   ├── feature_store.py    # Redis interface
-│   ├── preprocessing.py    # ffmpeg, cv2 video/audio utilities
-│   ├── orchestrator.py     # Pipeline coordinator
-│   └── fusion_engine.py    # Cross-modal merging + enrichment
+│   ├── models.py               # Pydantic data models (shared across workers)
+│   ├── feature_store.py        # Redis interface (24h-TTL working store)
+│   ├── results_repository.py   # MongoDB Atlas interface (durable corpus store)
+│   ├── preprocessing.py        # ffmpeg, cv2 video/audio utilities
+│   ├── orchestrator.py         # Single-video pipeline coordinator
+│   ├── bulk_orchestrator.py    # Sequential multi-video runner + Mongo shipping
+│   └── fusion_engine.py        # Cross-modal merging + enrichment
 ├── workers/
 │   ├── gesture_worker.py   # MediaPipe Holistic
 │   ├── prosody_worker.py   # parselmouth (Praat) — shown as "Acoustic" in the UI
@@ -210,7 +291,9 @@ uv run pytest tests/ -v
 
 - Audio is extracted to `--work-dir` and cached; re-running on the same
   video skips re-extraction.
-- All Redis keys expire after 24 hours. Use `export` to persist results.
+- All Redis keys expire after 24 hours. Use `export` to persist a single
+  job's results, or `analyze bulk` to process and durably persist a whole
+  corpus of videos to MongoDB (see "Bulk-process a corpus of videos" above).
 - For GPU inference, install `faster-whisper` with CUDA support and pass
   `--device cuda`.
 - The Haar cascade face detector in `camera_worker.py` is a lightweight

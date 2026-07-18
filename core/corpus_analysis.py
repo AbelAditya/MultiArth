@@ -74,7 +74,10 @@ def extract_collocations(doc) -> dict[str, dict[str, list]]:
     Build a collocations dict from a spaCy Doc.
 
     Returns:
-        { lemma: { relation_key: [[collocate_lemma, count], ...] } }
+        { word: { relation_key: [[collocate_word, count], ...] } }
+
+    Keyed by surface form (not lemma) — inflected forms of the same word
+    (e.g. "run" / "running") get separate profiles.
 
     Only content words (non-stop, alpha, length >= 2) appear as targets.
     Collocates are filtered to alpha-only but may include light function words
@@ -83,7 +86,7 @@ def extract_collocations(doc) -> dict[str, dict[str, list]]:
     raw: dict[str, dict[str, Counter]] = defaultdict(lambda: defaultdict(Counter))
 
     def _eff(token) -> str:
-        return (token.lemma_ or token.text).lower()
+        return token.text.lower()
 
     def _content(token) -> bool:
         return not token.is_stop and token.is_alpha and not token.is_punct
@@ -151,14 +154,14 @@ def extract_collocations(doc) -> dict[str, dict[str, list]]:
 
     # Serialise: Counter → sorted [[word, count], ...] list
     result: dict[str, dict[str, list]] = {}
-    for lemma, rels in raw.items():
+    for word, rels in raw.items():
         rel_dict: dict[str, list] = {}
         for rel, counter in rels.items():
             pairs = [[w, c] for w, c in counter.most_common()]
             if pairs:
                 rel_dict[rel] = pairs
         if rel_dict:
-            result[lemma] = rel_dict
+            result[word] = rel_dict
 
     return result
 
@@ -177,7 +180,7 @@ def extract_collocations_zh(doc, stopwords: frozenset = frozenset()) -> dict[str
     raw: dict[str, dict[str, Counter]] = defaultdict(lambda: defaultdict(Counter))
 
     def _eff(token) -> str:
-        return (token.lemma_ or token.text).lower()
+        return token.text.lower()
 
     def _content(token) -> bool:
         return token.text not in stopwords and token.is_alpha and not token.is_punct
@@ -260,32 +263,32 @@ def extract_collocations_zh(doc, stopwords: frozenset = frozenset()) -> dict[str
                 j += 1
 
     result: dict[str, dict[str, list]] = {}
-    for lemma, rels in raw.items():
+    for word, rels in raw.items():
         rel_dict: dict[str, list] = {}
         for rel, counter in rels.items():
             pairs = [[w, c] for w, c in counter.most_common()]
             if pairs:
                 rel_dict[rel] = pairs
         if rel_dict:
-            result[lemma] = rel_dict
+            result[word] = rel_dict
 
     return result
 
 
-def get_word_sketch(collocations: dict, lemma: str) -> dict:
+def get_word_sketch(collocations: dict, word: str) -> dict:
     """
-    Return the collocation profile for *lemma*.
+    Return the collocation profile for *word*.
 
     Returns:
         {
-          "lemma":           str,
+          "word":            str,
           "found":           bool,
           "total_relations": int,
           "relations": [{"key": str, "name": str, "words": [[word, count], ...]}, ...]
         }
     """
 
-    key = lemma.lower().strip()
+    key = word.lower().strip()
     profile = collocations.get(key, {})
 
     is_zh = bool(profile.keys() & _ZH_KEY_SET)
@@ -311,20 +314,20 @@ def get_word_sketch(collocations: dict, lemma: str) -> dict:
             })
 
     return {
-        "lemma":           key,
+        "word":            key,
         "found":           bool(profile),
         "total_relations": len(relations),
         "relations":       relations,
     }
 
 
-def word_sketch_diff(collocations: dict, lemma1: str, lemma2: str) -> dict:
+def word_sketch_diff(collocations: dict, word1: str, word2: str) -> dict:
     """
-    Compare the collocational profiles of two lemmas.
+    Compare the collocational profiles of two words.
 
     Returns:
         {
-          "lemma1": str, "lemma2": str,
+          "word1": str, "word2": str,
           "found1": bool, "found2": bool,
           "relations": {
             rel_key: {
@@ -336,7 +339,7 @@ def word_sketch_diff(collocations: dict, lemma1: str, lemma2: str) -> dict:
           }
         }
     """
-    k1, k2 = lemma1.lower().strip(), lemma2.lower().strip()
+    k1, k2 = word1.lower().strip(), word2.lower().strip()
     p1 = collocations.get(k1, {})
     p2 = collocations.get(k2, {})
 
@@ -374,8 +377,8 @@ def word_sketch_diff(collocations: dict, lemma1: str, lemma2: str) -> dict:
             }
 
     return {
-        "lemma1":    k1,
-        "lemma2":    k2,
+        "word1":     k1,
+        "word2":     k2,
         "found1":    bool(p1),
         "found2":    bool(p2),
         "relations": diff_rels,
@@ -384,7 +387,7 @@ def word_sketch_diff(collocations: dict, lemma1: str, lemma2: str) -> dict:
 
 def distributional_thesaurus(
     collocations: dict,
-    lemma: str,
+    word: str,
     top_n: int = 12,
 ) -> list[dict]:
     """
@@ -394,7 +397,7 @@ def distributional_thesaurus(
     Returns list of {"word": str, "score": float, "shared": int}
     sorted by score descending.
     """
-    key = lemma.lower().strip()
+    key = word.lower().strip()
     profile = collocations.get(key, {})
     if not profile:
         return []
