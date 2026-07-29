@@ -21,6 +21,7 @@ import dash
 import dash_bootstrap_components as dbc
 import flask
 import plotly.graph_objects as go
+import spacy
 from loguru import logger
 from plotly.subplots import make_subplots
 from dash import ALL, Input, Output, State, callback, clientside_callback, dash_table, dcc, html
@@ -40,6 +41,10 @@ from core.results_repository import ResultsRepository
 
 store = FeatureStore()
 _orch = Orchestrator(store=store)
+
+# Used only to detect/decompose contractions typed into the keyword search
+# box (see kw_search) — English-specific, same as extract_collocations.
+_nlp_en = spacy.load("en_core_web_sm")
 
 # Browse Corpus reads from Mongo. Optional at dashboard-startup time — if
 # MONGO_URI isn't configured or the cluster isn't reachable, the Browse
@@ -917,8 +922,9 @@ def _build_video_info(collection: str | None, job_id: str | None, videos: list[d
             style={"fontFamily": "DM Mono, monospace", "fontSize": "11px", "color": C["muted"]},
         )
     if videos is not None and not videos:
+        display_name = _COLLECTION_DISPLAY_NAMES.get(collection, collection)
         return html.P(
-            f'No videos have been shipped to "{collection}" yet — run `analyze bulk`.',
+            f'No videos have been shipped to "{display_name}" yet — run `analyze bulk`.',
             style={"fontFamily": "DM Mono, monospace", "fontSize": "11px", "color": C["muted"]},
         )
     if not job_id:
@@ -957,6 +963,18 @@ def toggle_mode(mode):
     return live_style, browse_style
 
 
+# Display-only labels for Browse Corpus collection buttons — the underlying
+# collection name (manifest `collection:`, Mongo collection prefix, dedupe
+# scope) is unchanged; only what's shown on the button differs. Collection
+# names can't contain spaces (see _validate_collection in
+# core/results_repository.py), so renames that need one go here rather than
+# in the stored data.
+_COLLECTION_DISPLAY_NAMES = {
+    "TedX": "Ted Talks",
+    "YiXi": "YiXi"
+}
+
+
 @callback(
     Output("browse-collection-buttons", "children"),
     Output("browse-collection", "data"),
@@ -970,7 +988,8 @@ def populate_browse_collections(mode, current_value):
     value = current_value if current_value in collections else (collections[0] if collections else None)
     buttons = [
         dbc.Button(
-            name, id={"type": "collection-btn", "index": name},
+            _COLLECTION_DISPLAY_NAMES.get(name, name),
+            id={"type": "collection-btn", "index": name},
             size="sm", color="primary" if name == value else "secondary",
             outline=(name != value),
         )
@@ -1767,6 +1786,20 @@ def kw_search(_, __, keyword, keyword2, data):
         return [], None, None
     kw = keyword.strip().lower()
     kw2 = keyword2.strip().lower() if keyword2 and keyword2.strip() else None
+
+    # A contraction typed as-is ("don't", "it's") never matches a collocations
+    # key, but its two constituent words might. If the user hasn't manually
+    # filled in a second keyword for comparison, detect a contraction via
+    # spaCy's own tokenizer and route to the word-sketch-diff view for its
+    # two parts instead of a single (empty) word sketch. Concordance below
+    # keeps matching the literal typed string either way.
+    active_kw, second_kw = keyword, kw2
+    if not kw2:
+        query_toks = [t for t in _nlp_en(keyword.strip()) if not t.is_space and not t.is_punct]
+        if len(query_toks) == 2:
+            active_kw = corpus_analysis._eff(query_toks[0])
+            second_kw = corpus_analysis._eff(query_toks[1])
+
     ws, _ = _parse(data)
     occurrences = []
     for w in ws:
@@ -1786,7 +1819,7 @@ def kw_search(_, __, keyword, keyword2, data):
                     "context_right": right,
                     "window_start":  w.window.start_s,
                 })
-    return occurrences, keyword, kw2
+    return occurrences, active_kw, second_kw
 
 
 @callback(

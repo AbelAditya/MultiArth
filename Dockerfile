@@ -11,6 +11,14 @@ WORKDIR /app
 COPY pyproject.toml ./
 RUN uv sync --no-dev --no-install-project
 
+# scenedetect and mediapipe pull in opencv-python and opencv-contrib-python
+# respectively — both packages, both hard dependencies of something we need,
+# both write overlapping files into site-packages/cv2/ (including the Haar
+# cascade data camera_worker.py needs). Reinstalling opencv-contrib-python
+# last forces its complete file set to win the merge deterministically,
+# instead of leaving the outcome to whatever order uv happened to install in.
+RUN uv pip install --reinstall-package opencv-contrib-python "opencv-contrib-python==4.13.0.92"
+
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM python:3.11-slim AS runtime
 

@@ -1,3 +1,5 @@
 vids/
 __pycache__
 .env
+labels.py
+dep_labels.txt

@@ -25,8 +25,21 @@ lexical statistics with **spaCy**.
    - **N-grams** — bigrams/trigrams (including stop words, for natural
      phrasing) over alphabetic tokens.
    - **Collocations** — dependency-parse-based collocations
-     ([`core/corpus_analysis.py`](../core/corpus_analysis.py)), with a
-     dedicated Chinese/Japanese/Korean path (`extract_collocations_zh`).
+     ([`core/corpus_analysis.py`](../core/corpus_analysis.py):
+     `extract_collocations`), with a dedicated Chinese/Japanese/Korean path
+     (`extract_collocations_zh`) that scans positionally instead, since
+     `zh_core_web_sm` mostly assigns the generic `dep` label.
+     `extract_collocations` keys words by **surface form, not lemma**, so
+     inflected forms (`run`/`running`) get separate profiles — except
+     copula/auxiliary forms of `be`/`will`/`have` (`is`/`'s`/`are`/`'re`/...),
+     which are normalised to one shared lemma so a construction isn't split
+     apart by contraction spelling. Relations covered: subject (incl. clausal
+     subjects), object (incl. predicate nominals/adjectives, dative, object
+     predicates), prepositional and passive-agent attachment, negation,
+     modification (adjectives, compounds, numerics, determiners, possessives,
+     relative clauses, adverbs), coordination, verb complements, and
+     auxiliaries — each as a symmetric pair (e.g. `subj_of`/`has_subj`) so
+     either side of a relation is searchable.
 
 ## Multi-language support
 

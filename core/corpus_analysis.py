@@ -11,11 +11,54 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 
+
+# "'s"/"'re"/"'m" all lemmatise to "be", which would throw away real
+# tense/person distinctions (is vs are vs am) if we just used the lemma —
+# so these three get an explicit override in extract_collocations' _eff()
+# to preserve that. Every other contraction fragment ("'ll", "'ve", the
+# "wo"/"ca"/"sha" stems of won't/can't/shan't, "n't", pronoun contractions
+# like "let's" -> "us") doesn't have that problem: its lemma is already the
+# correct, unambiguous expansion, so no table entry is needed for those.
+_BE_CONTRACTION_EXPANSIONS = {
+    "'s":  "is",
+    "'re": "are",
+    "'m":  "am",
+}
+
+
+def _eff(token) -> str:
+    """
+    Effective surface key for an English spaCy token in extract_collocations.
+
+    Expands contraction fragments to their spelled-out form, so "he's happy"/
+    "he is happy" key the same, "don't"/"do not" key the same, etc. — but
+    tense/person stay distinct (is/are/am/was/were don't merge into one
+    another). Content words keep surface-form keying (see extract_collocations'
+    docstring); this only touches the closed set of apostrophe/truncated-stem
+    fragments below.
+
+    Also used by the dashboard's keyword search (dashboard/app.py) to resolve
+    a typed contraction into its constituent words for the word-sketch-diff
+    view, so both places normalise contractions identically.
+    """
+    text = token.text.lower()
+    if "'" not in text and text not in ("wo", "ca", "sha"):
+        return text
+    lemma = token.lemma_.lower()
+    if lemma == text:
+        # Lemma adds no information — e.g. possessive "'s" ("John's"),
+        # which spaCy leaves un-lemmatised, unlike copula/auxiliary "'s".
+        return text
+    if lemma == "be" and text in _BE_CONTRACTION_EXPANSIONS:
+        return _BE_CONTRACTION_EXPANSIONS[text]
+    return lemma
+
 _REL_LABELS: dict[str, str] = {
     "subj_of":         "subject of",
     "obj_of":          "object of",
     "has_subj":        "has subject",
     "has_obj":         "has object",
+    "pobj_of":         "object of preposition",
     "modified_by":     "modified by",
     "modifies":        "modifies",
     "and_or":          "coordinated with",
@@ -24,13 +67,18 @@ _REL_LABELS: dict[str, str] = {
     "has_verb_comp":   "has verb complement",
     "takes_aux":       "takes auxiliary",
     "aux_of":          "auxiliary of",
+    "negates":         "negates",
+    "negated_by":      "negated by",
+    "takes_prep":      "takes preposition",
+    "prep_of":         "preposition of",
 }
 
 _DISPLAY_ORDER = [
-    "subj_of", "obj_of", "has_subj", "has_obj",
+    "subj_of", "obj_of", "has_subj", "has_obj", "pobj_of",
     "verb_comp_of", "has_verb_comp",
-    "takes_aux", "aux_of",
+    "takes_aux", "aux_of", "negates", "negated_by",
     "modified_by", "modifies", "and_or", "modified_by_adv",
+    "takes_prep", "prep_of",
 ]
 
 # ── Chinese positional / POS-based relations ──────────────────────────────────
@@ -85,14 +133,11 @@ def extract_collocations(doc) -> dict[str, dict[str, list]]:
     """
     raw: dict[str, dict[str, Counter]] = defaultdict(lambda: defaultdict(Counter))
 
-    def _eff(token) -> str:
-        return token.text.lower()
-
     def _content(token) -> bool:
-        return not token.is_stop and token.is_alpha and not token.is_punct
+        return not token.is_punct and token.text.replace("'", "").isalpha()
 
     def _alpha(token) -> bool:
-        return token.is_alpha and not token.is_punct
+        return not token.is_punct and token.text.replace("'", "").isalpha()
 
     for token in doc:
         if not _content(token):
@@ -103,15 +148,33 @@ def extract_collocations(doc) -> dict[str, dict[str, list]]:
         dep = token.dep_
 
         # ── Token as dependent ──────────────────────────────────────────────
-        if dep in ("nsubj", "nsubjpass", "nsubj:pass"):
+        if dep in ("nsubj", "nsubjpass", "nsubj:pass", "csubj", "csubjpass"):
+            # csubj/csubjpass = clausal subject ("what she said surprised me")
+            # — the clause's own verb stands in for the whole clause here.
             if token.head.pos_ in ("VERB", "AUX") and _alpha(token.head):
                 raw[t]["subj_of"][h] += 1
 
-        elif dep in ("obj", "dobj", "iobj"):
+        elif dep in ("obj", "dobj", "iobj", "attr", "acomp", "dative", "oprd"):
+            # attr/acomp = predicate nominal/adjective of a copula ("it's an
+            # accident", "it seems fine"); dative = indirect object; oprd =
+            # object predicate ("painted the house red"). All treated like an
+            # object since they complete the verb's meaning the same way.
             if token.head.pos_ in ("VERB", "AUX") and _alpha(token.head):
                 raw[t]["obj_of"][h] += 1
 
-        elif dep == "amod":
+        elif dep == "pobj":
+            # Object of a preposition ("in an accident") — the preposition
+            # itself becomes the collocate, e.g. accident -> pobj_of -> [in, by].
+            # The preposition is always a stopword so it can never become a
+            # target itself, only ever a collocate here.
+            if token.head.pos_ == "ADP" and _alpha(token.head):
+                raw[t]["pobj_of"][h] += 1
+
+        elif dep in ("amod", "nummod", "quantmod", "det", "poss", "relcl"):
+            # nummod/quantmod = numeric modifiers ("three years", "about five");
+            # det = determiners ("the", "this" — incl. demonstratives, a real
+            # mannerism signal); poss = possessives ("my book"); relcl = relative
+            # clause modifier ("the vase that broke"). All are "X modifies Y".
             if _alpha(token.head):
                 raw[t]["modifies"][h] += 1
                 raw[h]["modified_by"][t] += 1
@@ -134,6 +197,16 @@ def extract_collocations(doc) -> dict[str, dict[str, list]]:
             if token.head.pos_ in ("VERB", "AUX") and _alpha(token.head):
                 raw[t]["aux_of"][h] += 1
 
+        elif dep == "neg":
+            if token.head.pos_ in ("VERB", "ADJ", "AUX") and _alpha(token.head):
+                raw[t]["negates"][h] += 1
+
+        elif dep in ("prep", "agent"):
+            # agent = the "by" marker in passives ("broken by him") — same
+            # shape as a regular prep attachment.
+            if _alpha(token.head):
+                raw[t]["prep_of"][h] += 1
+
         # ── Token as head — inspect children ───────────────────────────────
         for child in token.children:
             if not _alpha(child):
@@ -141,16 +214,20 @@ def extract_collocations(doc) -> dict[str, dict[str, list]]:
             c = _eff(child)
             cdep = child.dep_
 
-            if cdep in ("nsubj", "nsubjpass", "nsubj:pass") and token.pos_ in ("VERB", "AUX"):
+            if cdep in ("nsubj", "nsubjpass", "nsubj:pass", "csubj", "csubjpass") and token.pos_ in ("VERB", "AUX"):
                 raw[t]["has_subj"][c] += 1
-            elif cdep in ("obj", "dobj") and token.pos_ in ("VERB", "AUX"):
+            elif cdep in ("obj", "dobj", "attr", "acomp", "dative", "oprd") and token.pos_ in ("VERB", "AUX"):
                 raw[t]["has_obj"][c] += 1
-            elif cdep == "advmod" and token.pos_ in ("VERB", "ADJ", "AUX"):
+            elif cdep in ("advmod", "npadvmod") and token.pos_ in ("VERB", "ADJ", "AUX"):
                 raw[t]["modified_by_adv"][c] += 1
             elif cdep in ("ccomp", "xcomp") and child.pos_ in ("VERB", "AUX") and token.pos_ in ("VERB", "AUX"):
                 raw[t]["has_verb_comp"][c] += 1
             elif cdep in ("aux", "aux:asp", "aux:modal") and token.pos_ in ("VERB", "AUX"):
                 raw[t]["takes_aux"][c] += 1
+            elif cdep == "neg" and token.pos_ in ("VERB", "ADJ", "AUX"):
+                raw[t]["negated_by"][c] += 1
+            elif cdep in ("prep", "agent"):
+                raw[t]["takes_prep"][c] += 1
 
     # Serialise: Counter → sorted [[word, count], ...] list
     result: dict[str, dict[str, list]] = {}
