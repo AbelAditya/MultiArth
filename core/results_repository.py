@@ -187,6 +187,12 @@ class ResultsRepository:
             return None
         return AnalysisJob(**{k: v for k, v in doc.items() if k in AnalysisJob.model_fields})
 
+    def get_video_doc(self, collection: str, job_id: str) -> Optional[dict]:
+        """Raw video doc, unfiltered — unlike get_job, keeps fields outside
+        AnalysisJob's own schema (drive_url, label, video_filename, ...)."""
+        videos, _, _ = self._collections(collection)
+        return videos.find_one({"_id": job_id})
+
     def get_all_fused(self, collection: str, job_id: str) -> list[FusedWindow]:
         _, fused_windows, _ = self._collections(collection)
         docs = fused_windows.find({"job_id": job_id}).sort("window_idx", 1)

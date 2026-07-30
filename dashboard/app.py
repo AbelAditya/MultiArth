@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import os
 import re
+import tempfile
 import threading
 import uuid as _uuid_module
 from datetime import datetime
@@ -30,6 +31,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from core import corpus_analysis
+from core.bulk_orchestrator import BulkOrchestrator, load_manifest
+from core.drive_download import download_drive_file
 from core.feature_store import FeatureStore
 from core.models import FusedWindow, HorizontalAngle, VerticalAngle
 from core.orchestrator import Orchestrator
@@ -57,16 +60,6 @@ except Exception as exc:
     repo = None
 
 
-_DRIVE_ID_RE = re.compile(r"/d/([a-zA-Z0-9_-]+)")
-
-
-def _drive_preview_url(drive_url: str | None) -> str | None:
-    if not drive_url:
-        return None
-    m = _DRIVE_ID_RE.search(drive_url)
-    file_id = m.group(1) if m else drive_url
-    return f"https://drive.google.com/file/d/{file_id}/preview"
-
 server = flask.Flask(__name__)
 server.config["MAX_CONTENT_LENGTH"] = None  # allow large video uploads
 FONT_URL = "https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Fraunces:ital,wght@0,300;0,600;1,300&display=swap"
@@ -83,10 +76,82 @@ app = dash.Dash(
 # Store the video path globally so the Flask route can serve it
 _VIDEO_PATH: dict = {"path": None}
 
+# Bulk Upload tab's background-thread progress, polled by poll_bulk_progress.
+# Guarded by a lock since progress_cb fires from the background thread while
+# the poll callback reads it from Dash's own request-handling thread.
+_BULK_LOCK = threading.Lock()
+_BULK_STATE: dict = {"running": False, "last_event": None, "summary": None}
+
+# Browse Corpus videos live on Drive, not locally — but a same-origin
+# <video> tag (needed for the pose overlay's currentTime/videoWidth access,
+# which a cross-origin Drive iframe can never expose) means fetching the
+# bytes ourselves first. Cached under a bounded, LRU-evicted directory so
+# this doesn't re-accumulate the same unbounded-local-storage problem the
+# upload cleanup elsewhere in this file was written to avoid.
+_BROWSE_CACHE_DIR = Path(os.environ.get("WORK_DIR", "/tmp/mannerism")) / "browse_cache"
+_BROWSE_CACHE_MAX_VIDEOS = 3
+_BROWSE_CACHE_LOCKS: dict[str, threading.Lock] = {}
+_BROWSE_CACHE_LOCKS_GUARD = threading.Lock()
+
+
+def _browse_cache_lock(job_id: str) -> threading.Lock:
+    # A lock per job_id (not one global lock) so concurrent requests for
+    # *different* cached videos don't block each other — only concurrent
+    # requests for the *same* not-yet-cached video need to serialise.
+    with _BROWSE_CACHE_LOCKS_GUARD:
+        return _BROWSE_CACHE_LOCKS.setdefault(job_id, threading.Lock())
+
+
+def _evict_browse_cache(keep: Path) -> None:
+    files = sorted(
+        (p for p in _BROWSE_CACHE_DIR.iterdir() if p.is_file() and p != keep),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for stale in files[_BROWSE_CACHE_MAX_VIDEOS - 1:]:
+        try:
+            stale.unlink()
+        except OSError as exc:
+            logger.warning(f"[dashboard] Could not evict browse cache file {stale}: {exc}")
+
+
+def _serve_browse_video(job_id: str, collection: str) -> flask.Response:
+    if repo is None:
+        return flask.Response("MongoDB not configured", status=404)
+
+    _BROWSE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = _BROWSE_CACHE_DIR / f"{job_id}.mp4"
+
+    with _browse_cache_lock(job_id):
+        if cache_path.exists():
+            cache_path.touch()  # bump mtime so eviction treats this as recently used
+        else:
+            doc = repo.get_video_doc(collection, job_id)
+            drive_url = (doc or {}).get("drive_url")
+            if not drive_url:
+                return flask.Response("No source video for this job", status=404)
+            try:
+                download_drive_file(drive_url, str(cache_path))
+            except Exception as exc:
+                logger.error(f"[dashboard] Could not fetch {drive_url}: {exc}")
+                return flask.Response(f"Could not fetch video: {exc}", status=502)
+            _evict_browse_cache(keep=cache_path)
+
+    return flask.send_from_directory(str(_BROWSE_CACHE_DIR), cache_path.name, conditional=True)
+
 
 @server.route("/video")
 def serve_video():
-    """Serve the analysis video file so the browser <video> tag can load it."""
+    """Serve the analysis video file so the browser <video> tag can load it.
+
+    Live Analysis videos are served straight from local disk; Browse Corpus
+    videos (?job_id=&collection=) are downloaded from Drive on first request
+    and cached — see _serve_browse_video."""
+    job_id = flask.request.args.get("job_id")
+    collection = flask.request.args.get("collection")
+    if job_id and collection:
+        return _serve_browse_video(job_id, collection)
+
     path = _VIDEO_PATH.get("path")
     if not path or not os.path.exists(path):
         return flask.Response("Video not found", status=404)
@@ -421,6 +486,8 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                     style=_TAB_BASE, selected_style=_tab_sel(C["muted"])),
             dcc.Tab(label="Browse Corpus", value="browse",
                     style=_TAB_BASE, selected_style=_tab_sel(C["muted"])),
+            dcc.Tab(label="Bulk Upload", value="bulk",
+                    style=_TAB_BASE, selected_style=_tab_sel(C["muted"])),
         ]),
 
         # ── UPLOAD (Live Analysis) ───────────────────────────────────────
@@ -474,7 +541,59 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
             ]),
         ]),
 
+        # ── BULK UPLOAD ──────────────────────────────────────────────────
+        html.Div(id="bulk-panel", style={"display": "none"}, children=[
+            html.Div(style=SECTION_STYLE, children=[
+                section_header("Bulk Upload", C["muted"],
+                               "Process a manifest of videos and ship them to MongoDB"),
+
+                dcc.Upload(
+                    id="manifest-upload",
+                    children=html.Div([
+                        html.P("Drop a manifest file here, or click to browse", style={
+                            "fontFamily": "DM Mono, monospace", "fontSize": "12px",
+                            "color": C["muted"], "margin": "0 0 4px 0",
+                        }),
+                        html.P("YAML · JSON — {collection, drive_url, label} per entry", style={
+                            "fontFamily": "DM Mono, monospace", "fontSize": "10px",
+                            "letterSpacing": "0.1em", "color": C["border"], "margin": "0",
+                        }),
+                    ], style={"textAlign": "center", "padding": "16px 0"}),
+                    accept=".yml,.yaml,.json",
+                    multiple=False,
+                    style={
+                        "width": "100%",
+                        "border": f"1px dashed {C['border']}",
+                        "borderRadius": "8px",
+                        "cursor": "pointer",
+                        "marginBottom": "12px",
+                        "backgroundColor": C["bg"],
+                    },
+                ),
+
+                html.Div(id="bulk-manifest-summary", style={
+                    "fontFamily": "DM Mono, monospace", "fontSize": "11px",
+                    "color": C["muted"], "marginBottom": "12px",
+                }),
+
+                html.Div(style={"display": "flex", "gap": "10px", "alignItems": "center",
+                                 "marginBottom": "16px"}, children=[
+                    dbc.Checkbox(id="bulk-force", value=False, label="Reprocess already-shipped videos",
+                                 style={"fontFamily": "DM Mono, monospace", "fontSize": "11px"}),
+                    dbc.Button("Start", id="bulk-start-btn", size="sm", disabled=True,
+                               style={"backgroundColor": C["muted"], "border": "none",
+                                      "fontFamily": "DM Mono, monospace", "fontSize": "11px"}),
+                ]),
+
+                dcc.Interval(id="bulk-poll-interval", interval=1500, disabled=True),
+                html.Div(id="bulk-status"),
+            ]),
+        ]),
+
         # ── CORPUS ANALYSIS ───────────────────────────────────────────────
+        # Per-video windowed analysis — irrelevant while bulk-processing many
+        # videos at once, so hidden for that tab (see toggle_mode).
+        html.Div(id="analysis-charts-section", children=[
         html.Div(style=SECTION_STYLE, children=[
             section_header("Verbal Language", C["corpus"],
                            "spaCy dep parse · local corpus"),
@@ -648,13 +767,6 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                             "backgroundColor": "#000",
                         },
                     ),
-                    html.Iframe(
-                        id="drive-video-player",
-                        style={
-                            "width": "100%", "height": "520px",
-                            "display": "none", "border": "none", "borderRadius": "8px",
-                        },
-                    ),
                     html.Canvas(id="pose-canvas", style={
                         "position": "absolute", "top": "0", "left": "0",
                         "width": "100%", "height": "100%",
@@ -708,6 +820,7 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
             dcc.Graph(id="c-facearea", style={"height": "200px"}, config=CHART_CFG),
             dcc.Graph(id="c-trend",    style={"height": "200px"}, config=CHART_CFG),
         ]),
+        ]),  # /analysis-charts-section
     ]),
 
     # ── Hidden stores ─────────────────────────────────────────────────────────
@@ -716,6 +829,7 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
     dcc.Store(id="active-job-id"),
     dcc.Store(id="data-source", data="redis"),
     dcc.Store(id="browse-collection", data=None),
+    dcc.Store(id="bulk-manifest-entries", data=None),
     dcc.Store(id="active-drive-url", data=None),
     dcc.Store(id="active-collection", data=None),
     dcc.Store(id="pose-segment", data=[]),
@@ -894,6 +1008,143 @@ def handle_upload(contents, filename):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Bulk Upload — manifest upload, background-threaded BulkOrchestrator run
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_bulk_manifest(entries: list[dict], force: bool) -> None:
+    """Runs in a background thread; publishes progress into _BULK_STATE for
+    poll_bulk_progress to read, mirroring how Live Analysis's job status is
+    polled via Redis instead of a shared in-memory dict — bulk runs don't
+    have a Redis-backed job of their own to poll, so this fills that role."""
+    with _BULK_LOCK:
+        _BULK_STATE["running"] = True
+        _BULK_STATE["last_event"] = None
+        _BULK_STATE["summary"] = None
+
+    def _progress_cb(evt: dict) -> None:
+        with _BULK_LOCK:
+            _BULK_STATE["last_event"] = evt
+
+    try:
+        bulk_orch = BulkOrchestrator(feature_store=store, repo=repo, orchestrator_kwargs={})
+        summary = bulk_orch.run(entries, force=force, progress_cb=_progress_cb)
+    except Exception as exc:
+        logger.error(f"[dashboard] Bulk run failed: {exc}")
+        summary = {"succeeded": [], "skipped": [],
+                   "failed": [{"path": "(manifest)", "error": str(exc)}]}
+
+    with _BULK_LOCK:
+        _BULK_STATE["summary"] = summary
+        _BULK_STATE["running"] = False
+
+
+@callback(
+    Output("bulk-manifest-entries", "data"),
+    Output("bulk-manifest-summary", "children"),
+    Output("bulk-start-btn", "disabled"),
+    Input("manifest-upload", "contents"),
+    State("manifest-upload", "filename"),
+    prevent_initial_call=True,
+)
+def handle_manifest_upload(contents, filename):
+    if not contents:
+        return dash.no_update, dash.no_update, dash.no_update
+
+    _, b64 = contents.split(",", 1)
+    suffix = Path(filename).suffix.lower() or ".yml"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", suffix=suffix, delete=False) as fh:
+            fh.write(base64.b64decode(b64))
+            tmp_path = fh.name
+        entries = load_manifest(tmp_path)
+    except Exception as exc:
+        return None, f'Could not parse "{filename}": {exc}', True
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    collections = sorted({e["collection"] for e in entries})
+    summary = f'Loaded {len(entries)} entries from "{filename}" — collections: {", ".join(collections)}'
+    return entries, summary, False
+
+
+@callback(
+    Output("bulk-poll-interval", "disabled"),
+    Output("bulk-start-btn", "disabled", allow_duplicate=True),
+    Input("bulk-start-btn", "n_clicks"),
+    State("bulk-manifest-entries", "data"),
+    State("bulk-force", "value"),
+    prevent_initial_call=True,
+)
+def start_bulk_run(_, entries, force):
+    if not entries or _BULK_STATE["running"]:
+        return dash.no_update, dash.no_update
+    if repo is None:
+        return dash.no_update, dash.no_update
+
+    threading.Thread(
+        target=_run_bulk_manifest,
+        args=(entries, bool(force)),
+        daemon=True,
+    ).start()
+    return False, True
+
+
+@callback(
+    Output("bulk-status", "children"),
+    Output("bulk-poll-interval", "disabled", allow_duplicate=True),
+    Output("bulk-start-btn", "disabled", allow_duplicate=True),
+    Input("bulk-poll-interval", "n_intervals"),
+    prevent_initial_call=True,
+)
+def poll_bulk_progress(_):
+    mono = {"fontFamily": "DM Mono, monospace", "fontSize": "11px"}
+    with _BULK_LOCK:
+        running = _BULK_STATE["running"]
+        evt = _BULK_STATE["last_event"]
+        summary = _BULK_STATE["summary"]
+
+    if running:
+        if not evt:
+            return _analysis_progress("running", "Starting…"), False, True
+
+        kind = {"download": "downloading", "start": "analysing",
+                "tick": "analysing", "skip": "skipped", "done": "done"}.get(evt["type"], evt["type"])
+        message = f'[{evt["index"]}/{evt["total"]}] {evt.get("label") or evt["path"]} — {kind}'
+
+        # Same per-worker progress bars as Live Analysis — "tick" events
+        # already carry the same total_windows/counts shape poll_analysis
+        # builds worker_progress from.
+        worker_progress = None
+        if evt["type"] == "tick" and evt.get("total_windows"):
+            worker_progress = {"total": evt["total_windows"], **(evt.get("counts") or {})}
+
+        return _analysis_progress("running", message, worker_progress), False, True
+
+    if summary is None:
+        return dash.no_update, True, False
+
+    children = [
+        html.P([
+            html.Span(f"✓ Succeeded: {len(summary['succeeded'])}   ",
+                      style={**mono, "color": C['prosody']}),
+            html.Span(f"− Skipped: {len(summary['skipped'])}   ",
+                      style={**mono, "color": C['muted']}),
+            html.Span(f"✗ Failed: {len(summary['failed'])}",
+                      style={**mono, "color": C['gesture']}),
+        ]),
+    ]
+    for failure in summary["failed"]:
+        children.append(html.P(f"{failure['path']}: {failure['error']}",
+                                style={**mono, "color": C["gesture"], "fontSize": "10px"}))
+    return html.Div(children), True, False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Browse Corpus — flat list of videos already shipped to MongoDB
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -955,12 +1206,24 @@ def _build_video_info(collection: str | None, job_id: str | None, videos: list[d
 @callback(
     Output("live-panel", "style"),
     Output("browse-panel", "style"),
+    Output("bulk-panel", "style"),
+    Output("kpi-strip", "style"),
+    Output("analysis-charts-section", "style"),
     Input("mode-tabs", "value"),
 )
 def toggle_mode(mode):
     live_style = {"display": "block" if mode == "live" else "none"}
     browse_style = {"display": "block" if mode == "browse" else "none"}
-    return live_style, browse_style
+    bulk_style = {"display": "block" if mode == "bulk" else "none"}
+    # Per-video windowed analysis (KPIs + all the modality charts) is
+    # irrelevant while bulk-processing many videos at once.
+    charts_display = "none" if mode == "bulk" else "block"
+    kpi_style = {
+        "display": "flex" if mode != "bulk" else "none",
+        "gap": "14px", "flexWrap": "wrap", "marginBottom": "28px",
+    }
+    charts_style = {"display": charts_display}
+    return live_style, browse_style, bulk_style, kpi_style, charts_style
 
 
 # Display-only labels for Browse Corpus collection buttons — the underlying
@@ -1061,13 +1324,14 @@ def show_browse_video_info(job_id, collection):
     Output("analysis-status", "children", allow_duplicate=True),
     Output("landmark-toggle", "disabled", allow_duplicate=True),
     Output("poll-interval", "disabled", allow_duplicate=True),
+    Output("video-player", "src", allow_duplicate=True),
     Input("browse-video-dropdown", "value"),
     State("browse-collection", "data"),
     prevent_initial_call=True,
 )
 def handle_browse_select(job_id, collection):
     if not job_id or repo is None or not collection:
-        return (dash.no_update,) * 8
+        return (dash.no_update,) * 9
 
     videos = repo.list_videos(collection)
     row = next((v for v in videos if v["_id"] == job_id), None)
@@ -1076,30 +1340,12 @@ def handle_browse_select(job_id, collection):
     windows = repo.get_all_fused(collection, job_id)
     serialised = [w.model_dump(mode="json") for w in windows]
     status_msg = _analysis_progress("done", f"Loaded from corpus — {len(windows)} windows")
-    return job_id, "mongo", drive_url, collection, serialised, status_msg, False, True
-
-
-@callback(
-    Output("video-player", "style"),
-    Output("drive-video-player", "style"),
-    Output("drive-video-player", "src"),
-    Input("data-source", "data"),
-    Input("active-drive-url", "data"),
-)
-def toggle_video_source(data_source, drive_url):
-    video_style = {
-        "width": "100%", "maxHeight": "520px", "display": "block",
-        "borderRadius": "8px", "backgroundColor": "#000",
-    }
-    iframe_style = {
-        "width": "100%", "height": "520px", "display": "none",
-        "border": "none", "borderRadius": "8px",
-    }
-    if data_source == "mongo" and drive_url:
-        video_style["display"] = "none"
-        iframe_style["display"] = "block"
-        return video_style, iframe_style, _drive_preview_url(drive_url)
-    return video_style, iframe_style, dash.no_update
+    # video-player is served same-origin (via /video's Drive-download-and-cache
+    # path) rather than a cross-origin Drive iframe, specifically so the pose
+    # overlay's clientside draw loop can read currentTime/videoWidth — an
+    # iframe from a different origin can never expose those to this page's JS.
+    video_src = f"/video?job_id={job_id}&collection={collection}" if drive_url else dash.no_update
+    return job_id, "mongo", drive_url, collection, serialised, status_msg, False, True, video_src
 
 
 # ─────────────────────────────────────────────────────────────────────────────

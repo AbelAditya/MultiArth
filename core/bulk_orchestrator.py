@@ -1,23 +1,34 @@
 """
 core/bulk_orchestrator.py
 --------------------------
-Sequential multi-video runner for `analyze bulk`.
+Sequential multi-video runner for `analyze bulk` and the dashboard's Bulk
+Upload tab.
 
-Each manifest entry is a manually-staged local video (already downloaded
-from wherever it lives, e.g. Google Drive) tagged with a "collection" —
-the named corpus (e.g. "TedX", "Yixi") its results should be shipped into;
-see core/results_repository.py for how that maps to Mongo collections.
+Each manifest entry is tagged with a "collection" — the named corpus (e.g.
+"TedX", "Yixi") its results should be shipped into; see
+core/results_repository.py for how that maps to Mongo collections. A manifest
+entry's local `path` may either already exist (manually staged in advance,
+the `analyze bulk` CLI workflow) or not — if it doesn't and a `drive_url` is
+given, it's downloaded there first (core/drive_download.py), the Bulk Upload
+tab's workflow, where entries only carry a Drive link.
+
 Videos are processed one at a time, reusing Orchestrator.analyze() unchanged
 for the per-video pipeline. Once a video finishes, its full result is
-shipped to MongoDB (via ResultsRepository) with a few inline retries; on a
-successful ship the local video file and its extracted-audio cache are
-deleted, since the durable copies now live on Drive (source) and Mongo
-(results) — and that job's Redis scratch data (FeatureStore) is deleted too,
+shipped to MongoDB (via ResultsRepository) with a few inline retries. That
+job's Redis scratch data (FeatureStore) is deleted on a successful ship,
 rather than waiting out its 24h TTL, so a long bulk run doesn't pile up
-Redis memory for jobs that are already durably stored. On failure, local
-files and Redis data are left in place and the video stays a candidate for
-a future re-run of the same manifest — its Redis data simply expires on the
-normal TTL if the manifest is never re-run.
+Redis memory for jobs that are already durably stored.
+
+Local file cleanup differs by how the video got there: a video this run
+downloaded itself is always deleted afterwards, success or failure — the
+durable copy is on Drive regardless, so there's no reason to keep a local
+copy around after a failed attempt (and no expectation that whoever
+triggered the run will manually retry the same path later). A
+manually-staged video (the CLI workflow, no download involved) is only
+deleted on success, exactly as before, since a maintainer re-running the
+same manifest after fixing a failure expects their staged files to still
+be there — its Redis job data is likewise left in place on failure so the
+job can be inspected/retried before its 24h TTL expires.
 """
 
 from __future__ import annotations
@@ -34,6 +45,7 @@ from typing import Callable, Optional
 import yaml
 from loguru import logger
 
+from core.drive_download import download_drive_file, extract_file_id
 from core.feature_store import FeatureStore
 from core.models import JobStatus
 from core.orchestrator import Orchestrator
@@ -60,15 +72,33 @@ def load_manifest(path: str) -> list[dict]:
             "{path, collection, drive_url, label} objects"
         )
     for entry in entries:
-        for required in ("path", "collection"):
-            if required not in entry:
-                raise ValueError(f"Manifest entry missing required {required!r}: {entry}")
+        if "collection" not in entry:
+            raise ValueError(f"Manifest entry missing required 'collection': {entry}")
+        # `path` is only required for a manually-staged local video (the CLI
+        # workflow); an entry with no local file yet must give a drive_url so
+        # BulkOrchestrator knows what to download.
+        if "path" not in entry and "drive_url" not in entry:
+            raise ValueError(
+                f"Manifest entry needs a 'path' (pre-staged local file) or a "
+                f"'drive_url' (downloaded automatically): {entry}"
+            )
     return entries
 
 
 def _dedupe_key(entry: dict) -> str:
     basis = entry.get("drive_url") or str(Path(entry["path"]).resolve())
     return hashlib.sha1(basis.encode("utf-8")).hexdigest()
+
+
+def _resolve_path(entry: dict, work_dir: str) -> str:
+    """Local path for a manifest entry — its own `path` if given, otherwise
+    a stable destination derived from the Drive file ID (so re-running the
+    same manifest downloads to the same place rather than a fresh temp name
+    each time)."""
+    if "path" in entry:
+        return entry["path"]
+    file_id = extract_file_id(entry["drive_url"])
+    return str(Path(work_dir) / f"{file_id}.mp4")
 
 
 def _audio_cache_path(video_path: str, work_dir: str) -> Path:
@@ -118,11 +148,13 @@ class BulkOrchestrator:
         orchestrator: Orchestrator,
         summary: dict,
     ) -> None:
-        path = entry["path"]
+        work_dir = self._work_dir()
+        path = _resolve_path(entry, work_dir)
         collection = entry["collection"]
         drive_url = entry.get("drive_url")
         label = entry.get("label")
         dedupe_key = _dedupe_key(entry)
+        downloaded_by_us = False
 
         def _emit(evt: dict) -> None:
             if progress_cb:
@@ -140,37 +172,58 @@ class BulkOrchestrator:
                 return
 
         if not os.path.exists(path):
-            logger.error(f"[bulk] File not found, skipping: {path}")
-            summary["failed"].append({"path": path, "error": "file not found"})
-            _emit({"type": "done", "result": "failed", "error": "file not found"})
-            return
+            if not drive_url:
+                logger.error(f"[bulk] File not found, skipping: {path}")
+                summary["failed"].append({"path": path, "error": "file not found"})
+                _emit({"type": "done", "result": "failed", "error": "file not found"})
+                return
+            downloaded_by_us = True
+            _emit({"type": "download"})
+            try:
+                download_drive_file(drive_url, path)
+            except Exception as exc:
+                logger.error(f"[bulk] Download failed for {drive_url}: {exc}")
+                summary["failed"].append({"path": path, "error": f"download failed: {exc}"})
+                _emit({"type": "done", "result": "failed", "error": f"download failed: {exc}"})
+                self._cleanup_local_files(path)  # in case a partial file was left behind
+                return
 
         _emit({"type": "start"})
 
-        job_id = self._analyze_with_progress(orchestrator, path, _emit)
-
-        status = self.store.get_status(job_id)
-        if status != JobStatus.DONE:
-            job = self.store.get_job(job_id)
-            error = job.error if job else "unknown error"
-            logger.error(f"[bulk] Processing failed for {path} (job {job_id}): {error}")
-            summary["failed"].append({"path": path, "error": error})
-            _emit({"type": "done", "result": "failed", "job_id": job_id, "error": error})
-            return
-
+        succeeded = False
         try:
-            self._ship(collection, job_id, path, drive_url, label, dedupe_key)
-        except Exception as exc:
-            logger.error(f"[bulk] Shipping failed for {path} (job {job_id}) after retries: {exc}")
-            summary["failed"].append({"path": path, "error": f"shipping failed: {exc}"})
-            _emit({"type": "done", "result": "failed", "job_id": job_id, "error": f"shipping failed: {exc}"})
-            return
+            job_id = self._analyze_with_progress(orchestrator, path, _emit)
 
-        self._cleanup_local_files(path)
-        self.store.delete_job(job_id)
-        logger.info(f"[bulk] Shipped {path} as job {job_id}")
-        summary["succeeded"].append(job_id)
-        _emit({"type": "done", "result": "succeeded", "job_id": job_id})
+            status = self.store.get_status(job_id)
+            if status != JobStatus.DONE:
+                job = self.store.get_job(job_id)
+                error = job.error if job else "unknown error"
+                logger.error(f"[bulk] Processing failed for {path} (job {job_id}): {error}")
+                summary["failed"].append({"path": path, "error": error})
+                _emit({"type": "done", "result": "failed", "job_id": job_id, "error": error})
+                return
+
+            try:
+                self._ship(collection, job_id, path, drive_url, label, dedupe_key)
+            except Exception as exc:
+                logger.error(f"[bulk] Shipping failed for {path} (job {job_id}) after retries: {exc}")
+                summary["failed"].append({"path": path, "error": f"shipping failed: {exc}"})
+                _emit({"type": "done", "result": "failed", "job_id": job_id, "error": f"shipping failed: {exc}"})
+                return
+
+            self.store.delete_job(job_id)
+            logger.info(f"[bulk] Shipped {path} as job {job_id}")
+            summary["succeeded"].append(job_id)
+            _emit({"type": "done", "result": "succeeded", "job_id": job_id})
+            succeeded = True
+        finally:
+            # A video we downloaded ourselves is always cleaned up — the
+            # durable copy is on Drive regardless of outcome. A manually
+            # staged video (no download involved) is only cleaned up on
+            # success, so a failed attempt stays in place for a future
+            # re-run of the same manifest (see module docstring).
+            if downloaded_by_us or succeeded:
+                self._cleanup_local_files(path)
 
     # ------------------------------------------------------------------
 
@@ -241,8 +294,11 @@ class BulkOrchestrator:
 
         raise last_exc
 
+    def _work_dir(self) -> str:
+        return self.orchestrator_kwargs.get("work_dir") or os.environ.get("WORK_DIR", "/tmp/mannerism")
+
     def _cleanup_local_files(self, video_path: str) -> None:
-        work_dir = self.orchestrator_kwargs.get("work_dir") or os.environ.get("WORK_DIR", "/tmp/mannerism")
+        work_dir = self._work_dir()
         for p in (Path(video_path), _audio_cache_path(video_path, work_dir)):
             try:
                 if p.exists():
