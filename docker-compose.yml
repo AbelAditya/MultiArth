@@ -7,7 +7,7 @@ services:
 
   app:
     build: .
-    image: abx13/multiarth:hugo
+    image: abx13/multiarth:jj
     restart: unless-stopped
     ports:
       - "8050:8050"

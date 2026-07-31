@@ -13,6 +13,12 @@ writes its output to a shared Redis [`FeatureStore`](../core/feature_store.py).
 | [`VerbalWorker`](../workers/verbal_worker.py) | Transcript, lexical stats | Verbal Language | [Verbal-Worker.md](Verbal-Worker.md) |
 | [`CameraWorker`](../workers/camera_worker.py) | Scene cuts, framing | Camera | [Camera-Worker.md](Camera-Worker.md) |
 
+## Guides
+
+| Guide | Covers |
+|---|---|
+| [Bulk-Upload.md](Bulk-Upload.md) | Using the dashboard's Bulk Upload tab to process a manifest of videos |
+
 > Naming note: the `ProsodyWorker` module/class/Redis-key names were kept as
 > `prosody` when the dashboard label was rebranded to **"Acoustic"** — see the
 > main [README](../README.md) for the full history of the **MultiArth**
