@@ -168,11 +168,12 @@ def _artifacts(job_id: str, data_source: str, collection: str | None = None) -> 
     if data_source == "mongo":
         return (repo.get_artifacts(collection, job_id) if repo and collection else None) or {}
     return {
-        "spectrogram":  store.get_spectrogram(job_id),
-        "waveform":     store.get_waveform(job_id),
-        "collocations": store.get_collocations(job_id),
-        "wordlist":     store.get_wordlist(job_id),
-        "ngrams":       store.get_ngrams(job_id),
+        "spectrogram":      store.get_spectrogram(job_id),
+        "waveform":         store.get_waveform(job_id),
+        "collocations":     store.get_collocations(job_id),
+        "wordlist":         store.get_wordlist(job_id),
+        "ngrams":           store.get_ngrams(job_id),
+        "segmented_tokens": store.get_segmented_tokens(job_id),
     }
 
 
@@ -195,6 +196,20 @@ C = {
 }
 
 KW_COLOUR = "#00B4D8"  # cyan-teal — distinct from all section colours and cursor amber
+
+_POS_FILTER_SETS: dict[str, set[str]] = {
+    "NOUN":  {"NOUN", "PROPN"},
+    "VERB":  {"VERB", "AUX"},
+    "ADJ":   {"ADJ"},
+    "ADV":   {"ADV"},
+}
+_KNOWN_POS = {"NOUN", "PROPN", "VERB", "AUX", "ADJ", "ADV"}
+
+POS_COLOUR = {
+    "NOUN": C["verbal"],  "PROPN": C["verbal"],
+    "VERB": C["prosody"], "AUX":   C["prosody"],
+    "ADJ":  C["cursor"],  "ADV":   C["camera"],
+}
 
 PLOT_LAYOUT = dict(
     paper_bgcolor="rgba(0,0,0,0)",
@@ -714,7 +729,42 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                                    "fontSize": "11px"},
                         ),
                     ]),
-                    dcc.Graph(id="kw-wordlist-chart", config=CHART_CFG),
+                    dash_table.DataTable(
+                        id="kw-wordlist-table",
+                        columns=[
+                            {"name": "Word",       "id": "lemma"},
+                            {"name": "POS",        "id": "pos"},
+                            {"name": "Count",      "id": "count",         "type": "numeric"},
+                            {"name": "Freq/1000",  "id": "freq_per_1000", "type": "numeric"},
+                            {"name": "Example",    "id": "example"},
+                        ],
+                        data=[],
+                        sort_action="native",
+                        filter_action="native",
+                        page_action="native",
+                        page_size=25,
+                        style_table={"overflowX": "auto"},
+                        style_header={
+                            "backgroundColor": C["surface"], "color": C["muted"],
+                            "fontFamily": "DM Mono, monospace", "fontSize": "10px",
+                            "fontWeight": "600", "border": f"1px solid {C['border']}",
+                            "textTransform": "uppercase", "letterSpacing": "0.05em",
+                        },
+                        style_cell={
+                            "backgroundColor": C["bg"], "color": C["text"],
+                            "fontFamily": "DM Mono, monospace", "fontSize": "11px",
+                            "border": f"1px solid {C['border']}",
+                            "padding": "6px 10px", "textAlign": "left",
+                        },
+                        style_filter={
+                            "backgroundColor": C["bg"], "color": C["text"],
+                            "fontFamily": "DM Mono, monospace", "fontSize": "10px",
+                        },
+                        style_data_conditional=[
+                            {"if": {"filter_query": f'{{pos}} = "{pos}"'}, "borderLeft": f"3px solid {colour}"}
+                            for pos, colour in POS_COLOUR.items()
+                        ],
+                    ),
                     html.P("N-GRAMS", style={**LABEL_STYLE, "marginTop": "28px"}),
                     dcc.Graph(id="kw-ngrams-chart",
                               style={"height": "380px"}, config=CHART_CFG),
@@ -2025,9 +2075,12 @@ def c_trend(data, ct, occ):
     State("kw-input", "value"),
     State("kw-input2", "value"),
     State("fused-data", "data"),
+    State("active-job-id", "data"),
+    State("data-source", "data"),
+    State("active-collection", "data"),
     prevent_initial_call=True,
 )
-def kw_search(_, __, keyword, keyword2, data):
+def kw_search(_, __, keyword, keyword2, data, job_id, data_source, collection):
     if not keyword or not keyword.strip() or not data:
         return [], None, None
     kw = keyword.strip().lower()
@@ -2046,8 +2099,34 @@ def kw_search(_, __, keyword, keyword2, data):
             active_kw = corpus_analysis._eff(query_toks[0])
             second_kw = corpus_analysis._eff(query_toks[1])
 
-    ws, _ = _parse(data)
     occurrences = []
+
+    # CJK transcripts: raw Whisper tokens are individual characters, so a
+    # multi-character search would never match a single one. Use the
+    # properly word-segmented list built once during processing instead,
+    # when available (see VerbalWorker._segment_cjk_words) — falls back to
+    # per-window Whisper tokens for everything else, unchanged.
+    segmented = None
+    if job_id:
+        segmented = _artifacts(job_id, data_source, collection).get("segmented_tokens")
+
+    if segmented:
+        for i, tok in enumerate(segmented):
+            tok_clean = re.sub(r"^[^\w]+|[^\w]+$", "", tok["word"], flags=re.UNICODE).lower()
+            if tok_clean == kw:
+                left  = "".join(t["word"] for t in segmented[max(0, i - 4):i])
+                right = "".join(t["word"] for t in segmented[i + 1:i + 5])
+                occurrences.append({
+                    "word":          tok["word"],
+                    "start_s":       tok["start_s"],
+                    "end_s":         tok["end_s"],
+                    "context_left":  left,
+                    "context_right": right,
+                    "window_start":  tok["start_s"],
+                })
+        return occurrences, active_kw, second_kw
+
+    ws, _ = _parse(data)
     for w in ws:
         if not w.verbal or not w.verbal.tokens:
             continue
@@ -2381,34 +2460,20 @@ def load_transcript(fused_raw):
     return segs, times
 
 
-_POS_FILTER_SETS: dict[str, set[str]] = {
-    "NOUN":  {"NOUN", "PROPN"},
-    "VERB":  {"VERB", "AUX"},
-    "ADJ":   {"ADJ"},
-    "ADV":   {"ADV"},
-}
-_KNOWN_POS = {"NOUN", "PROPN", "VERB", "AUX", "ADJ", "ADV"}
-
-POS_COLOUR = {
-    "NOUN": C["verbal"],  "PROPN": C["verbal"],
-    "VERB": C["prosody"], "AUX":   C["prosody"],
-    "ADJ":  C["cursor"],  "ADV":   C["camera"],
-}
-
 @callback(
-    Output("kw-wordlist-chart", "figure"),
+    Output("kw-wordlist-table", "data"),
     Input("fused-data", "data"),
     Input("pos-filter", "value"),
     State("active-job-id", "data"),
     State("data-source", "data"),
     State("active-collection", "data"),
 )
-def kw_wordlist_chart(data, pos_filter, job_id, data_source, collection):
+def kw_wordlist_table(data, pos_filter, job_id, data_source, collection):
     if not data or not job_id:
-        return empty_fig("Word List")
+        return []
     wl = _artifacts(job_id, data_source, collection).get("wordlist")
     if not wl or not wl.get("words"):
-        return empty_fig("Word List")
+        return []
 
     pos_filter = pos_filter or "ALL"
     all_entries = wl["words"]
@@ -2420,46 +2485,7 @@ def kw_wordlist_chart(data, pos_filter, job_id, data_source, collection):
         allowed = _POS_FILTER_SETS.get(pos_filter, set())
         entries = [e for e in all_entries if e["pos"] in allowed]
 
-    if not entries:
-        return empty_fig("Word List — no words match this filter")
-
-    entries_rev = list(reversed(entries))
-    colours  = [POS_COLOUR.get(e["pos"], C["muted"]) for e in entries_rev]
-    labels   = [e["lemma"] for e in entries_rev]
-    counts   = [e["count"] for e in entries_rev]
-    pos_tags = [e["pos"] for e in entries_rev]
-
-    _PX_PER_BAR = 22
-    fig_height = max(420, len(entries_rev) * _PX_PER_BAR + 72)
-
-    fig = go.Figure(go.Bar(
-        x=counts,
-        y=labels,
-        orientation="h",
-        marker_color=colours,
-        customdata=pos_tags,
-        hovertemplate="%{y}  |  %{customdata}  |  count: %{x}<extra></extra>",
-        showlegend=False,
-    ))
-    fig.update_layout(
-        uirevision=f"{job_id}_{pos_filter or 'ALL'}",
-        autosize=False,
-        height=fig_height,
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family="DM Mono, monospace", color=C["text"], size=11),
-        title=dict(text=f"{len(entries)} Content Words  ·  NOUN  VERB  ADJ  ADV",
-                   font=dict(size=11, color=C["muted"])),
-        xaxis=dict(showgrid=True, gridcolor=C["border"], zeroline=False,
-                   side="bottom",
-                   tickmode="linear", dtick=1, tickformat="d",
-                   title=dict(text="count", font=dict(size=10, color=C["muted"])),
-                   tickfont=dict(size=10)),
-        yaxis=dict(showgrid=False, zeroline=False, tickfont=dict(size=10), automargin=True),
-        hovermode="y unified",
-        margin=dict(l=110, r=24, t=48, b=16),
-    )
-    return fig
+    return entries
 
 
 @callback(

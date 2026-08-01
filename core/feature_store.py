@@ -117,6 +117,9 @@ class FeatureStore:
     def put_collocations(self, job_id: str, data: dict) -> None:
         self.r.set(f"job:{job_id}:collocations", json.dumps(data), ex=_TTL)
 
+    def put_segmented_tokens(self, job_id: str, data: list[dict]) -> None:
+        self.r.set(f"job:{job_id}:segmented_tokens", json.dumps(data), ex=_TTL)
+
     # ------------------------------------------------------------------
     # Per-modality read
     # ------------------------------------------------------------------
@@ -159,6 +162,10 @@ class FeatureStore:
 
     def get_collocations(self, job_id: str) -> Optional[dict]:
         raw = self.r.get(f"job:{job_id}:collocations")
+        return json.loads(raw) if raw else None
+
+    def get_segmented_tokens(self, job_id: str) -> Optional[list[dict]]:
+        raw = self.r.get(f"job:{job_id}:segmented_tokens")
         return json.loads(raw) if raw else None
 
     # ------------------------------------------------------------------

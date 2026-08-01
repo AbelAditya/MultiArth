@@ -107,12 +107,14 @@ class VerbalWorker:
                 logger.error(f"[verbal] Window {idx} failed: {exc}")
 
         try:
-            wordlist, ngrams, collocations = self._compute_corpus_stats(
+            wordlist, ngrams, collocations, segmented_tokens = self._compute_corpus_stats(
                 all_tokens, lang_code
             )
             self.store.put_wordlist(job_id, wordlist)
             self.store.put_ngrams(job_id, ngrams)
             self.store.put_collocations(job_id, collocations)
+            if segmented_tokens:
+                self.store.put_segmented_tokens(job_id, segmented_tokens)
             logger.info(f"[verbal] Collocations stored: {len(collocations)} entries for job {job_id}")
         except Exception as exc:
             logger.error(f"[verbal] Corpus stats failed: {exc}")
@@ -159,13 +161,58 @@ class VerbalWorker:
             word_count=len(tokens),
         )
 
+    @staticmethod
+    def _segment_cjk_words(doc, all_tokens: list[WordToken]) -> list[dict]:
+        """
+        For CJK: raw Whisper tokens are individual characters (see the
+        n-grams comment below), but spaCy's jieba-based tokenizer re-segments
+        the concatenated (no-separator) transcript into proper multi-character
+        words. Map each spaCy word's character span back to the original
+        per-character Whisper tokens it came from, so Concordance can search
+        these properly-segmented words (with real timestamps) instead of
+        being limited to matching single Whisper characters.
+        """
+        # (start_char, end_char) for each Whisper token, in the same
+        # concatenated-string coordinate space the spaCy doc was built from.
+        spans = []
+        offset = 0
+        for tok in all_tokens:
+            n = len(tok.word)
+            spans.append((offset, offset + n, tok))
+            offset += n
+
+        segmented: list[dict] = []
+        span_i = 0
+        for token in doc:
+            if not token.text.strip():
+                continue
+            w_start, w_end = token.idx, token.idx + len(token.text)
+            while span_i < len(spans) - 1 and spans[span_i][1] <= w_start:
+                span_i += 1
+            if span_i >= len(spans):
+                break
+            start_tok = spans[span_i][2]
+            end_i = span_i
+            while end_i < len(spans) - 1 and spans[end_i][1] < w_end:
+                end_i += 1
+            end_tok = spans[end_i][2]
+            segmented.append({
+                "word": token.text,
+                "start_s": start_tok.start_s,
+                "end_s": end_tok.end_s,
+            })
+            span_i = end_i
+
+        return segmented
+
     def _compute_corpus_stats(
         self, all_tokens: list[WordToken], lang_code: str
-    ) -> tuple[dict, dict, dict]:
+    ) -> tuple[dict, dict, dict, list]:
         """
-        Build word list, n-grams, and collocations from the full transcript.
-        Uses the spaCy model for *lang_code* if available.
-        Returns (wordlist, ngrams, collocations).
+        Build word list, n-grams, collocations, and (for CJK) a properly
+        word-segmented token list from the full transcript. Uses the spaCy
+        model for *lang_code* if available.
+        Returns (wordlist, ngrams, collocations, segmented_tokens).
         """
         nlp = self._get_nlp(lang_code)
         # Chinese (and other logographic scripts) must be joined without spaces
@@ -253,4 +300,14 @@ class VerbalWorker:
             except Exception as exc:
                 logger.warning(f"[verbal] Collocations extraction failed: {exc}")
 
-        return wordlist, ngrams, collocations
+        # ── Word-segmented tokens for Concordance (CJK only — Whisper's own
+        #    per-character tokens are already word-granular for other
+        #    languages, so Concordance keeps using those there) ───────────
+        segmented_tokens: list[dict] = []
+        if doc is not None and lang_code in ("zh", "ja", "ko"):
+            try:
+                segmented_tokens = self._segment_cjk_words(doc, all_tokens)
+            except Exception as exc:
+                logger.warning(f"[verbal] CJK word segmentation failed: {exc}")
+
+        return wordlist, ngrams, collocations, segmented_tokens

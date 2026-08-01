@@ -14,6 +14,14 @@ dependencies = [
     # ASR / NLP
     "faster-whisper>=1.0.1",
     "spacy>=3.7.4",
+    # zh_core_web_sm's proper multi-character word segmenter — without this,
+    # spaCy's Chinese tokenizer silently falls back to splitting every single
+    # character into its own token, which breaks Word Sketch, Distributional
+    # Thesaurus, and Concordance for any multi-character Chinese word.
+    # zh_core_web_sm itself isn't a pyproject.toml dependency (installed via
+    # `spacy download` in the Dockerfile instead), so this needs to be listed
+    # explicitly rather than relying on it coming along transitively.
+    "spacy-pkuseg>=0.0.32",
     # Orchestration / data
     "redis>=5.0.3",
     "pymongo>=4.7",

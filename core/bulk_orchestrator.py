@@ -284,6 +284,7 @@ class BulkOrchestrator:
                     collocations=self.store.get_collocations(job_id),
                     spectrogram=self.store.get_spectrogram(job_id),
                     waveform=self.store.get_waveform(job_id),
+                    segmented_tokens=self.store.get_segmented_tokens(job_id),
                 )
                 return
             except Exception as exc:

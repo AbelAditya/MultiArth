@@ -139,6 +139,7 @@ class ResultsRepository:
         collocations: Optional[dict],
         spectrogram: Optional[dict],
         waveform: Optional[dict],
+        segmented_tokens: Optional[list] = None,
     ) -> None:
         _, _, artifacts = self._collections(collection)
         artifacts.replace_one(
@@ -150,6 +151,7 @@ class ResultsRepository:
                 "collocations": collocations,
                 "spectrogram": spectrogram,
                 "waveform": waveform,
+                "segmented_tokens": segmented_tokens,
             },
             upsert=True,
         )
