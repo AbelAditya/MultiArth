@@ -19,27 +19,36 @@ lexical statistics with **spaCy**.
    token list, word count) is stored per window.
 3. **Corpus statistics** (`_compute_corpus_stats`), computed once for the
    whole transcript and stored separately:
-   - **Word list** — lemma frequency table (top 200), using the spaCy model
-     matched to the detected language when available, otherwise raw
-     lower-cased word counts.
+   - **Word list** — surface-form frequency table for every content word
+     (inflected forms like "run"/"running" stay separate, not merged under
+     one lemma), using the spaCy model matched to the detected language when
+     available, otherwise raw lower-cased word counts.
    - **N-grams** — bigrams/trigrams (including stop words, for natural
      phrasing) over alphabetic tokens.
    - **Collocations** — dependency-parse-based collocations
      ([`core/corpus_analysis.py`](../core/corpus_analysis.py):
-     `extract_collocations`), with a dedicated Chinese/Japanese/Korean path
-     (`extract_collocations_zh`) that scans positionally instead, since
-     `zh_core_web_sm` mostly assigns the generic `dep` label.
-     `extract_collocations` keys words by **surface form, not lemma**, so
+     `extract_collocation_en`), with a separate Chinese/Japanese/Korean
+     function (`extract_collocations_zh`) that keeps its own positional scan
+     (nearest neighbour by direction/POS, plus a small conjunction-particle
+     list) alongside the *same* generic dependency-relation capture English
+     uses, shared via an internal `_capture_dep_relations` helper so both
+     languages get identical relation names for anything the dependency
+     parser itself provides. Chinese applies no stopword filtering — every
+     alphabetic, non-punctuation token is a valid target.
+     `extract_collocation_en` keys words by **surface form, not lemma**, so
      inflected forms (`run`/`running`) get separate profiles — except
      copula/auxiliary forms of `be`/`will`/`have` (`is`/`'s`/`are`/`'re`/...),
      which are normalised to one shared lemma so a construction isn't split
-     apart by contraction spelling. Relations covered: subject (incl. clausal
-     subjects), object (incl. predicate nominals/adjectives, dative, object
-     predicates), prepositional and passive-agent attachment, negation,
-     modification (adjectives, compounds, numerics, determiners, possessives,
-     relative clauses, adverbs), coordination, verb complements, and
-     auxiliaries — each as a symmetric pair (e.g. `subj_of`/`has_subj`) so
-     either side of a relation is searchable.
+     apart by contraction spelling. Relations covered generically (both
+     languages): subject (incl. clausal subjects), object (incl. predicate
+     nominals/adjectives, dative, object predicates), prepositional and
+     passive-agent attachment, negation, modification (adjectives, compounds,
+     numerics, determiners, possessives, relative clauses, adverbs),
+     coordination, verb complements, auxiliaries, and subordinating
+     conjunctions/markers — each as a symmetric pair (e.g. `subj_of`/
+     `has_subj`) so either side of a relation is searchable, plus, for
+     anything without an established name, an automatic `{dep}_of`/
+     `has_{dep}` fallback using spaCy's raw dependency label.
 
 ## Multi-language support
 

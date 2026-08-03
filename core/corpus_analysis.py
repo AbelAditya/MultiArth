@@ -14,8 +14,9 @@ from collections import Counter, defaultdict
 
 # "'s"/"'re"/"'m" all lemmatise to "be", which would throw away real
 # tense/person distinctions (is vs are vs am) if we just used the lemma —
-# so these three get an explicit override in extract_collocations' _eff()
-# to preserve that. Every other contraction fragment ("'ll", "'ve", the
+# so these three get an explicit override in _eff() (shared by
+# extract_collocation_en and the dashboard's keyword search) to preserve
+# that. Every other contraction fragment ("'ll", "'ve", the
 # "wo"/"ca"/"sha" stems of won't/can't/shan't, "n't", pronoun contractions
 # like "let's" -> "us") doesn't have that problem: its lemma is already the
 # correct, unambiguous expansion, so no table entry is needed for those.
@@ -28,14 +29,14 @@ _BE_CONTRACTION_EXPANSIONS = {
 
 def _eff(token) -> str:
     """
-    Effective surface key for an English spaCy token in extract_collocations.
+    Effective surface key for an English spaCy token in extract_collocation_en.
 
     Expands contraction fragments to their spelled-out form, so "he's happy"/
     "he is happy" key the same, "don't"/"do not" key the same, etc. — but
     tense/person stay distinct (is/are/am/was/were don't merge into one
-    another). Content words keep surface-form keying (see extract_collocations'
-    docstring); this only touches the closed set of apostrophe/truncated-stem
-    fragments below.
+    another). Content words keep surface-form keying (see
+    extract_collocation_en's docstring); this only touches the closed set of
+    apostrophe/truncated-stem fragments below.
 
     Also used by the dashboard's keyword search (dashboard/app.py) to resolve
     a typed contraction into its constituent words for the word-sketch-diff
@@ -59,6 +60,7 @@ _REL_LABELS: dict[str, str] = {
     "has_subj":        "has subject",
     "has_obj":         "has object",
     "pobj_of":         "object of preposition",
+    "has_pobj":        "has object of preposition",
     "modified_by":     "modified by",
     "modifies":        "modifies",
     "and_or":          "coordinated with",
@@ -71,19 +73,81 @@ _REL_LABELS: dict[str, str] = {
     "negated_by":      "negated by",
     "takes_prep":      "takes preposition",
     "prep_of":         "preposition of",
+    "modifies_adv":    "modifies (adverb)",
+    "mark_of":         "marks clause of",
+    "takes_mark":      "takes marker",
 }
 
 _DISPLAY_ORDER = [
-    "subj_of", "obj_of", "has_subj", "has_obj", "pobj_of",
+    "subj_of", "obj_of", "has_subj", "has_obj", "pobj_of", "has_pobj",
     "verb_comp_of", "has_verb_comp",
     "takes_aux", "aux_of", "negates", "negated_by",
-    "modified_by", "modifies", "and_or", "modified_by_adv",
-    "takes_prep", "prep_of",
+    "modified_by", "modifies", "and_or", "modified_by_adv", "modifies_adv",
+    "takes_prep", "prep_of", "mark_of", "takes_mark",
 ]
 
-# ── Chinese positional / POS-based relations ──────────────────────────────────
+# extract_collocation_en (and, via the shared _capture_dep_relations helper,
+# extract_collocations_zh too) captures every dependency relation generically
+# (using spaCy's own dep_ labels) rather than hand-enumerating specific ones —
+# see _capture_dep_relations' docstring. These three control that:
+#   _EXCLUDED_DEPS      — purely structural/punctuation labels, never captured.
+#   _SYMMETRIC_DEPS      — relations where both sides play the same role
+#                          (recorded under one shared name both ways).
+#   _DEP_RELATION_NAMES — (dependent-side name, head-side name) for the
+#                          relations common enough to have an established
+#                          readable name; anything else automatically falls
+#                          back to "{dep}_of" / "has_{dep}" using the raw
+#                          dependency label, so a new/uncommon relation still
+#                          gets captured without needing an entry here.
+_EXCLUDED_DEPS = frozenset({})
+
+_SYMMETRIC_DEPS = frozenset({"conj"})
+
+_DEP_RELATION_NAMES: dict[str, tuple[str, str]] = {
+    "nsubj": ("subj_of", "has_subj"), "nsubjpass": ("subj_of", "has_subj"),
+    "nsubj:pass": ("subj_of", "has_subj"),
+    "csubj": ("subj_of", "has_subj"), "csubjpass": ("subj_of", "has_subj"),
+    "obj": ("obj_of", "has_obj"), "dobj": ("obj_of", "has_obj"),
+    "iobj": ("obj_of", "has_obj"), "attr": ("obj_of", "has_obj"),
+    "acomp": ("obj_of", "has_obj"), "dative": ("obj_of", "has_obj"),
+    "oprd": ("obj_of", "has_obj"),
+    "pobj": ("pobj_of", "has_pobj"),
+    "amod": ("modifies", "modified_by"), "nummod": ("modifies", "modified_by"),
+    "quantmod": ("modifies", "modified_by"), "det": ("modifies", "modified_by"),
+    "poss": ("modifies", "modified_by"), "relcl": ("modifies", "modified_by"),
+    "nmod": ("modifies", "modified_by"), "compound": ("modifies", "modified_by"),
+    "compound:nn": ("modifies", "modified_by"),
+    "ccomp": ("verb_comp_of", "has_verb_comp"), "xcomp": ("verb_comp_of", "has_verb_comp"),
+    "aux": ("aux_of", "takes_aux"), "aux:asp": ("aux_of", "takes_aux"),
+    "aux:modal": ("aux_of", "takes_aux"),
+    "neg": ("negates", "negated_by"),
+    "prep": ("prep_of", "takes_prep"), "agent": ("prep_of", "takes_prep"),
+    "advmod": ("modifies_adv", "modified_by_adv"),
+    "npadvmod": ("modifies_adv", "modified_by_adv"),
+    "mark": ("mark_of", "takes_mark"), "mark:clf": ("mark_of", "takes_mark"),
+}
+
+# ── Chinese: positional relations (own heuristics) + the same generic
+#    dependency relations extract_collocation_en uses (shared names) ─────────
+
+_DISPLAY_ORDER_ZH_POSITIONAL = [
+    "next_left",  "next_right",
+    "verb_left",  "verb_right",
+    "noun_left",  "noun_right",
+    "adj_left",   "adj_right",
+    "adv_left",   "adv_right",
+    "conj",
+]
+
+# Used only by get_word_sketch to detect whether a profile came from the
+# Chinese extractor. Must stay exclusive to Chinese's own positional relation
+# names — extract_collocations_zh's profiles now also carry the shared
+# dependency-relation names (subj_of, modifies, ...) that English profiles
+# have too, so including those here would misdetect English words as Chinese.
+_ZH_KEY_SET = frozenset(_DISPLAY_ORDER_ZH_POSITIONAL)
 
 _REL_LABELS_ZH: dict[str, str] = {
+    **_REL_LABELS,
     "next_left":  "next left",
     "next_right": "next right",
     "verb_left":  "verb left",
@@ -97,16 +161,7 @@ _REL_LABELS_ZH: dict[str, str] = {
     "conj":       "conjunction",
 }
 
-_DISPLAY_ORDER_ZH = [
-    "next_left",  "next_right",
-    "verb_left",  "verb_right",
-    "noun_left",  "noun_right",
-    "adj_left",   "adj_right",
-    "adv_left",   "adv_right",
-    "conj",
-]
-
-_ZH_KEY_SET = frozenset(_DISPLAY_ORDER_ZH)
+_DISPLAY_ORDER_ZH = _DISPLAY_ORDER_ZH_POSITIONAL + _DISPLAY_ORDER
 
 _ZH_CONJUNCTIONS = frozenset({
     "和", "与", "及", "或", "但", "而",
@@ -117,119 +172,10 @@ _ZH_CONJUNCTIONS = frozenset({
 _ZH_SCAN_DEPTH = 6
 
 
-def extract_collocations(doc) -> dict[str, dict[str, list]]:
-    """
-    Build a collocations dict from a spaCy Doc.
-
-    Returns:
-        { word: { relation_key: [[collocate_word, count], ...] } }
-
-    Keyed by surface form (not lemma) — inflected forms of the same word
-    (e.g. "run" / "running") get separate profiles.
-
-    Only content words (non-stop, alpha, length >= 2) appear as targets.
-    Collocates are filtered to alpha-only but may include light function words
-    when they are verbs/adjectives headwords.
-    """
-    raw: dict[str, dict[str, Counter]] = defaultdict(lambda: defaultdict(Counter))
-
-    def _content(token) -> bool:
-        return not token.is_punct and token.text.replace("'", "").isalpha()
-
-    def _alpha(token) -> bool:
-        return not token.is_punct and token.text.replace("'", "").isalpha()
-
-    for token in doc:
-        if not _content(token):
-            continue
-
-        t = _eff(token)
-        h = _eff(token.head)
-        dep = token.dep_
-
-        # ── Token as dependent ──────────────────────────────────────────────
-        if dep in ("nsubj", "nsubjpass", "nsubj:pass", "csubj", "csubjpass"):
-            # csubj/csubjpass = clausal subject ("what she said surprised me")
-            # — the clause's own verb stands in for the whole clause here.
-            if token.head.pos_ in ("VERB", "AUX") and _alpha(token.head):
-                raw[t]["subj_of"][h] += 1
-
-        elif dep in ("obj", "dobj", "iobj", "attr", "acomp", "dative", "oprd"):
-            # attr/acomp = predicate nominal/adjective of a copula ("it's an
-            # accident", "it seems fine"); dative = indirect object; oprd =
-            # object predicate ("painted the house red"). All treated like an
-            # object since they complete the verb's meaning the same way.
-            if token.head.pos_ in ("VERB", "AUX") and _alpha(token.head):
-                raw[t]["obj_of"][h] += 1
-
-        elif dep == "pobj":
-            # Object of a preposition ("in an accident") — the preposition
-            # itself becomes the collocate, e.g. accident -> pobj_of -> [in, by].
-            # The preposition is always a stopword so it can never become a
-            # target itself, only ever a collocate here.
-            if token.head.pos_ == "ADP" and _alpha(token.head):
-                raw[t]["pobj_of"][h] += 1
-
-        elif dep in ("amod", "nummod", "quantmod", "det", "poss", "relcl"):
-            # nummod/quantmod = numeric modifiers ("three years", "about five");
-            # det = determiners ("the", "this" — incl. demonstratives, a real
-            # mannerism signal); poss = possessives ("my book"); relcl = relative
-            # clause modifier ("the vase that broke"). All are "X modifies Y".
-            if _alpha(token.head):
-                raw[t]["modifies"][h] += 1
-                raw[h]["modified_by"][t] += 1
-
-        elif dep in ("nmod", "compound", "compound:nn"):
-            if token.head.pos_ in ("NOUN", "PROPN") and _alpha(token.head):
-                raw[t]["modifies"][h] += 1
-                raw[h]["modified_by"][t] += 1
-
-        elif dep == "conj":
-            if _alpha(token.head):
-                raw[t]["and_or"][h] += 1
-                raw[h]["and_or"][t] += 1
-
-        elif dep in ("ccomp", "xcomp"):
-            if token.pos_ in ("VERB", "AUX") and token.head.pos_ in ("VERB", "AUX") and _alpha(token.head):
-                raw[t]["verb_comp_of"][h] += 1
-
-        elif dep in ("aux", "aux:asp", "aux:modal"):
-            if token.head.pos_ in ("VERB", "AUX") and _alpha(token.head):
-                raw[t]["aux_of"][h] += 1
-
-        elif dep == "neg":
-            if token.head.pos_ in ("VERB", "ADJ", "AUX") and _alpha(token.head):
-                raw[t]["negates"][h] += 1
-
-        elif dep in ("prep", "agent"):
-            # agent = the "by" marker in passives ("broken by him") — same
-            # shape as a regular prep attachment.
-            if _alpha(token.head):
-                raw[t]["prep_of"][h] += 1
-
-        # ── Token as head — inspect children ───────────────────────────────
-        for child in token.children:
-            if not _alpha(child):
-                continue
-            c = _eff(child)
-            cdep = child.dep_
-
-            if cdep in ("nsubj", "nsubjpass", "nsubj:pass", "csubj", "csubjpass") and token.pos_ in ("VERB", "AUX"):
-                raw[t]["has_subj"][c] += 1
-            elif cdep in ("obj", "dobj", "attr", "acomp", "dative", "oprd") and token.pos_ in ("VERB", "AUX"):
-                raw[t]["has_obj"][c] += 1
-            elif cdep in ("advmod", "npadvmod") and token.pos_ in ("VERB", "ADJ", "AUX"):
-                raw[t]["modified_by_adv"][c] += 1
-            elif cdep in ("ccomp", "xcomp") and child.pos_ in ("VERB", "AUX") and token.pos_ in ("VERB", "AUX"):
-                raw[t]["has_verb_comp"][c] += 1
-            elif cdep in ("aux", "aux:asp", "aux:modal") and token.pos_ in ("VERB", "AUX"):
-                raw[t]["takes_aux"][c] += 1
-            elif cdep == "neg" and token.pos_ in ("VERB", "ADJ", "AUX"):
-                raw[t]["negated_by"][c] += 1
-            elif cdep in ("prep", "agent"):
-                raw[t]["takes_prep"][c] += 1
-
-    # Serialise: Counter → sorted [[word, count], ...] list
+def _serialise(raw: dict[str, dict[str, Counter]]) -> dict[str, dict[str, list]]:
+    """Shared by extract_collocation_en and extract_collocations_zh: Counter
+    -> sorted [[word, count], ...] list, dropping any word left with no
+    non-empty relations."""
     result: dict[str, dict[str, list]] = {}
     for word, rels in raw.items():
         rel_dict: dict[str, list] = {}
@@ -239,20 +185,91 @@ def extract_collocations(doc) -> dict[str, dict[str, list]]:
                 rel_dict[rel] = pairs
         if rel_dict:
             result[word] = rel_dict
-
     return result
 
 
-def extract_collocations_zh(doc, stopwords: frozenset = frozenset()) -> dict[str, dict[str, list]]:
+def _capture_dep_relations(doc, raw, eff, is_valid_word) -> None:
     """
-    Positional + POS-filtered collocations for Chinese.
+    Shared by extract_collocation_en and extract_collocations_zh: walks every
+    token's relation to its head generically, using spaCy's own dep_ labels,
+    rather than hand-enumerating specific ones — so a new relation doesn't
+    need to be added one at a time as gaps are found. Mutates *raw* in place
+    so a caller can accumulate additional relations of its own (e.g.
+    Chinese's positional ones) into the same structure.
 
-    Scans linearly within each sentence rather than using dependency labels,
-    because zh_core_web_sm assigns the generic 'dep' label to most tokens,
-    making dep-based extraction almost always empty for Chinese text.
+    Both sides of every relation are recorded in one pass (dependent's view
+    via _DEP_RELATION_NAMES' first name, head's view via its second) — a
+    small exclude list (_EXCLUDED_DEPS) drops purely structural/punctuation
+    labels, and anything not explicitly named in _DEP_RELATION_NAMES
+    automatically falls back to "{dep}_of" / "has_{dep}" using the raw
+    dependency label.
 
-    stopwords: explicit set to exclude — passed in rather than read from
-    token.is_stop, which is unreliable for lazily-created spaCy lexemes.
+    This favours recall over precision on purpose: earlier versions gated
+    specific relations on the head's or token's POS tag (e.g. "only count
+    subj_of if the head is a VERB/AUX"), but that gating turned out to
+    silently drop real relations whenever spaCy's POS tagger — not the
+    dependency parser — got a word wrong (e.g. tagging "masculine" as NOUN
+    instead of ADJ in predicate position). The only filter is *is_valid_word*
+    (a real word, not punctuation).
+
+    *eff*: surface-key function (contraction-normalising for English,
+    plain lowercased text for Chinese).
+    """
+    for token in doc:
+        if not is_valid_word(token):
+            continue
+
+        dep = token.dep_
+        if dep in _EXCLUDED_DEPS or token.head is token or not is_valid_word(token.head):
+            continue
+
+        t = eff(token)
+        h = eff(token.head)
+
+        if dep in _SYMMETRIC_DEPS:
+            raw[t]["and_or"][h] += 1
+            raw[h]["and_or"][t] += 1
+        else:
+            dep_of, has_dep = _DEP_RELATION_NAMES.get(dep, (f"{dep}_of", f"has_{dep}"))
+            raw[t][dep_of][h] += 1
+            raw[h][has_dep][t] += 1
+
+
+def extract_collocation_en(doc) -> dict[str, dict[str, list]]:
+    """
+    Build a collocations dict from an English spaCy Doc.
+
+    Returns:
+        { word: { relation_key: [[collocate_word, count], ...] } }
+
+    Keyed by surface form (not lemma) — inflected forms of the same word
+    (e.g. "run" / "running") get separate profiles. See _capture_dep_relations
+    for how relations are captured.
+    """
+    raw: dict[str, dict[str, Counter]] = defaultdict(lambda: defaultdict(Counter))
+
+    def _is_valid(token) -> bool:
+        return not token.is_punct and token.text.replace("'", "").isalpha()
+
+    _capture_dep_relations(doc, raw, _eff, _is_valid)
+
+    return _serialise(raw)
+
+
+def extract_collocations_zh(doc) -> dict[str, dict[str, list]]:
+    """
+    Collocations for Chinese: this function's own positional relations
+    (proximity-based — nearest neighbour in each direction, an approach
+    originally used because zh_core_web_sm assigned the generic 'dep' label
+    to most tokens) PLUS the same generic dependency-relation capture
+    extract_collocation_en uses (_capture_dep_relations, shared relation
+    names) — now that a properly word-segmented Chinese doc (see
+    _segment_cjk_words in workers/verbal_worker.py, and the spacy-pkuseg
+    dependency fix) produces real, usable dependency labels instead of that
+    degenerate fallback.
+
+    No stopword filtering — every alphabetic, non-punctuation token is
+    eligible as a target, same as extract_collocation_en.
     """
     raw: dict[str, dict[str, Counter]] = defaultdict(lambda: defaultdict(Counter))
 
@@ -260,7 +277,7 @@ def extract_collocations_zh(doc, stopwords: frozenset = frozenset()) -> dict[str
         return token.text.lower()
 
     def _content(token) -> bool:
-        return token.text not in stopwords and token.is_alpha and not token.is_punct
+        return token.is_alpha and not token.is_punct
 
     def _nearest(toks, origin, direction, pos_filter=None):
         """Return the first content token in *direction* whose POS is in
@@ -339,17 +356,11 @@ def extract_collocations_zh(doc, stopwords: frozenset = frozenset()) -> dict[str
                     break
                 j += 1
 
-    result: dict[str, dict[str, list]] = {}
-    for word, rels in raw.items():
-        rel_dict: dict[str, list] = {}
-        for rel, counter in rels.items():
-            pairs = [[w, c] for w, c in counter.most_common()]
-            if pairs:
-                rel_dict[rel] = pairs
-        if rel_dict:
-            result[word] = rel_dict
+    # Same generic dependency-relation capture extract_collocation_en uses,
+    # accumulated into the same raw dict alongside the positional relations above.
+    _capture_dep_relations(doc, raw, _eff, _content)
 
-    return result
+    return _serialise(raw)
 
 
 def get_word_sketch(collocations: dict, word: str) -> dict:

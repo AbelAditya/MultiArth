@@ -46,7 +46,7 @@ store = FeatureStore()
 _orch = Orchestrator(store=store)
 
 # Used only to detect/decompose contractions typed into the keyword search
-# box (see kw_search) — English-specific, same as extract_collocations.
+# box (see kw_search) — English-specific, same as extract_collocation_en.
 _nlp_en = spacy.load("en_core_web_sm")
 
 # Browse Corpus reads from Mongo. Optional at dashboard-startup time — if
@@ -732,11 +732,10 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                     dash_table.DataTable(
                         id="kw-wordlist-table",
                         columns=[
-                            {"name": "Word",       "id": "lemma"},
+                            {"name": "Word",       "id": "word"},
                             {"name": "POS",        "id": "pos"},
                             {"name": "Count",      "id": "count",         "type": "numeric"},
                             {"name": "Freq/1000",  "id": "freq_per_1000", "type": "numeric"},
-                            {"name": "Example",    "id": "example"},
                         ],
                         data=[],
                         sort_action="native",
@@ -2292,7 +2291,7 @@ def kw_thesaurus(keyword, job_id, data_source, collection):
     wl = artifacts.get("wordlist")
     freq_map: dict[str, int] = {}
     if wl and wl.get("words"):
-        freq_map = {e["lemma"]: e["count"] for e in wl["words"]}
+        freq_map = {e["word"]: e["count"] for e in wl["words"]}
 
     rows = [
         {

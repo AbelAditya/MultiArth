@@ -227,41 +227,41 @@ class VerbalWorker:
             nlp_text = text[: nlp.max_length]
             doc = nlp(nlp_text)
 
-            lemma_data: dict[str, dict] = {}
+            # Keyed by surface form, not lemma — "run"/"running"/"ran" get
+            # separate rows with their own counts, consistent with the
+            # surface-form keying used for collocations (core/corpus_analysis.py).
+            word_data: dict[str, dict] = {}
             for token in doc:
                 if token.is_stop or token.is_punct or not token.is_alpha:
                     continue
-                # zh_core_web_sm returns empty lemma_ for all tokens; fall back to surface form
-                lemma = (token.lemma_ or token.text).lower()
-                if not lemma:
+                word = token.text.lower()
+                if not word:
                     continue
-                if lemma not in lemma_data:
-                    lemma_data[lemma] = {"pos": token.pos_, "count": 0, "example": token.text}
-                lemma_data[lemma]["count"] += 1
+                if word not in word_data:
+                    word_data[word] = {"pos": token.pos_, "count": 0}
+                word_data[word]["count"] += 1
 
-            total = max(sum(v["count"] for v in lemma_data.values()), 1)
+            total = max(sum(v["count"] for v in word_data.values()), 1)
             word_entries = [
                 {
-                    "lemma":         lemma,
+                    "word":          word,
                     "pos":           d["pos"],
-                    "example":       d["example"],
                     "count":         d["count"],
                     "freq_per_1000": round(d["count"] * 1000 / total, 2),
                 }
-                for lemma, d in sorted(lemma_data.items(), key=lambda x: -x[1]["count"])[:200]
+                for word, d in sorted(word_data.items(), key=lambda x: -x[1]["count"])
             ]
         else:
             counts = Counter(w for w in raw_words if w.isalpha())
             total = max(sum(counts.values()), 1)
             word_entries = [
                 {
-                    "lemma":         w,
+                    "word":          w,
                     "pos":           "?",
-                    "example":       w,
                     "count":         c,
                     "freq_per_1000": round(c * 1000 / total, 2),
                 }
-                for w, c in counts.most_common(200)
+                for w, c in counts.most_common()
             ]
 
         wordlist = {"words": word_entries, "total_tokens": len(raw_words)}
@@ -292,11 +292,9 @@ class VerbalWorker:
         if doc is not None:
             try:
                 if lang_code in ("zh", "ja", "ko"):
-                    collocations = corpus_analysis.extract_collocations_zh(
-                        doc, stopwords=frozenset(load_stopwords(lang_code))
-                    )
+                    collocations = corpus_analysis.extract_collocations_zh(doc)
                 else:
-                    collocations = corpus_analysis.extract_collocations(doc)
+                    collocations = corpus_analysis.extract_collocation_en(doc)
             except Exception as exc:
                 logger.warning(f"[verbal] Collocations extraction failed: {exc}")
 
