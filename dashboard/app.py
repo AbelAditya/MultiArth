@@ -924,6 +924,7 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
     dcc.Store(id="keyword-occurrences", data=[]),
     dcc.Store(id="active-keyword", data=None),
     dcc.Store(id="second-keyword", data=None),
+    dcc.Store(id="search-display-keyword", data=None),
     dcc.Store(id="window-times", data=[]),
     dcc.Store(id="transcript-hl-dummy"),
     dcc.Store(id="seek-to", data=None),
@@ -2105,6 +2106,7 @@ def c_trend(data, ct, occ):
     Output("keyword-occurrences", "data"),
     Output("active-keyword", "data"),
     Output("second-keyword", "data"),
+    Output("search-display-keyword", "data"),
     Input("kw-search-btn", "n_clicks"),
     Input("kw-input", "n_submit"),
     State("kw-input", "value"),
@@ -2117,7 +2119,7 @@ def c_trend(data, ct, occ):
 )
 def kw_search(_, __, keyword, keyword2, data, job_id, data_source, collection):
     if not keyword or not keyword.strip() or not data:
-        return [], None, None
+        return [], None, None, None
     kw = keyword.strip().lower()
     kw2 = keyword2.strip().lower() if keyword2 and keyword2.strip() else None
 
@@ -2125,14 +2127,29 @@ def kw_search(_, __, keyword, keyword2, data, job_id, data_source, collection):
     # key, but its two constituent words might. If the user hasn't manually
     # filled in a second keyword for comparison, detect a contraction via
     # spaCy's own tokenizer and route to the word-sketch-diff view for its
-    # two parts instead of a single (empty) word sketch. Concordance below
-    # keeps matching the literal typed string either way.
+    # two parts instead of a single (empty) word sketch.
+    #
+    # Concordance also can't match the literal typed string anymore, now that
+    # it reads segmented_tokens: spaCy splits "don't" into "do"/"n't" there,
+    # so no single token ever equals "don't". contraction_parts captures the
+    # two RAW (un-normalised) token texts — not active_kw/second_kw's _eff()
+    # form, since segmented_tokens holds literal spaCy token text — so
+    # Concordance can search for them occurring adjacently instead. Scoped to
+    # single-word queries with no whitespace (not just "any 2-token query",
+    # which a genuine phrase search like "New York" would also produce) so a
+    # real two-word phrase search still gets today's literal-match behaviour.
     active_kw, second_kw = keyword, kw2
+    contraction_parts = None
     if not kw2:
         query_toks = [t for t in _nlp_en(keyword.strip()) if not t.is_space and not t.is_punct]
         if len(query_toks) == 2:
             active_kw = corpus_analysis._eff(query_toks[0])
             second_kw = corpus_analysis._eff(query_toks[1])
+            if " " not in keyword.strip():
+                contraction_parts = (
+                    re.sub(r"^[^\w]+|[^\w]+$", "", query_toks[0].text, flags=re.UNICODE).lower(),
+                    re.sub(r"^[^\w]+|[^\w]+$", "", query_toks[1].text, flags=re.UNICODE).lower(),
+                )
 
     occurrences = []
 
@@ -2155,6 +2172,25 @@ def kw_search(_, __, keyword, keyword2, data, job_id, data_source, collection):
     if segmented:
         # CJK words conventionally read with no space between them.
         sep = "" if _CJK_CHAR_RE.search(segmented[0]["word"]) else " "
+
+        if contraction_parts:
+            part1, part2 = contraction_parts
+            for i in range(len(segmented) - 1):
+                w1 = re.sub(r"^[^\w]+|[^\w]+$", "", segmented[i]["word"], flags=re.UNICODE).lower()
+                w2 = re.sub(r"^[^\w]+|[^\w]+$", "", segmented[i + 1]["word"], flags=re.UNICODE).lower()
+                if w1 == part1 and w2 == part2:
+                    left  = sep.join(t["word"] for t in segmented[max(0, i - 4):i])
+                    right = sep.join(t["word"] for t in segmented[i + 2:i + 6])
+                    occurrences.append({
+                        "word":          keyword,
+                        "start_s":       segmented[i]["start_s"],
+                        "end_s":         segmented[i + 1]["end_s"],
+                        "context_left":  left,
+                        "context_right": right,
+                        "window_start":  segmented[i]["start_s"],
+                    })
+            return occurrences, active_kw, second_kw, keyword
+
         for i, tok in enumerate(segmented):
             tok_clean = re.sub(r"^[^\w]+|[^\w]+$", "", tok["word"], flags=re.UNICODE).lower()
             if tok_clean == kw:
@@ -2168,7 +2204,7 @@ def kw_search(_, __, keyword, keyword2, data, job_id, data_source, collection):
                     "context_right": right,
                     "window_start":  tok["start_s"],
                 })
-        return occurrences, active_kw, second_kw
+        return occurrences, active_kw, second_kw, keyword
 
     ws, _ = _parse(data)
     for w in ws:
@@ -2188,13 +2224,13 @@ def kw_search(_, __, keyword, keyword2, data, job_id, data_source, collection):
                     "context_right": right,
                     "window_start":  w.window.start_s,
                 })
-    return occurrences, active_kw, second_kw
+    return occurrences, active_kw, second_kw, keyword
 
 
 @callback(
     Output("kw-stats", "children"),
     Input("keyword-occurrences", "data"),
-    Input("active-keyword", "data"),
+    Input("search-display-keyword", "data"),
 )
 def kw_stats(occ, keyword):
     if not occ or not keyword:

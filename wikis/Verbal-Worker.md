@@ -44,7 +44,13 @@ lexical statistics with **spaCy**.
      transcribing "male-female" as the raw tokens `"male"`/`"-female"` —
      spaCy's own tokenizer only splits a leading hyphen off *digits*, not
      letters) before the alpha check, so a word doesn't silently drop out
-     just because of an attached punctuation character.
+     just because of an attached punctuation character. The dashboard's
+     Frequency tab (`kw-wordlist-table`) displays each word's spaCy
+     Universal POS tag as a full label (`_POS_LABELS` in
+     `dashboard/app.py` — e.g. `PROPN` → "Proper noun", `CCONJ` →
+     "Coordinating conjunction") rather than the raw abbreviation; the
+     dropdown filter and colour-coded row styling still key off the raw
+     tags underneath, only the displayed value is expanded.
    - **N-grams** — bigrams/trigrams (including stop words, for natural
      phrasing) over alphabetic tokens.
    - **Collocations** — dependency-parse-based collocations
@@ -78,7 +84,14 @@ lexical statistics with **spaCy**.
      have that entire relation silently dropped, leaving it with zero
      relations and so absent from Word Sketch/Distributional Thesaurus
      entirely, even though Concordance (which has always done its own
-     equivalent cleanup) would still find it.
+     equivalent cleanup) would still find it. `_clean_word` deliberately
+     leaves leading/trailing **apostrophes** untouched (only strips other
+     punctuation like the stray hyphen above) — contraction fragments
+     (`'s`/`'re`/`'m`/`'ll`/`'ve`) legitimately start with one, and `_eff`'s
+     lemma-based expansion (below) depends on that apostrophe surviving to
+     even recognise them as contractions; stripping it would silently skip
+     that logic and key e.g. "they're" as the meaningless fragment "re"
+     instead of "are".
    - **Segmented tokens** (`_segment_words`) — every spaCy doc token mapped
      back onto the timestamp(s) of the original Whisper `WordToken`(s) it
      came from, for **every** language. The dashboard's Concordance tab
@@ -92,6 +105,17 @@ lexical statistics with **spaCy**.
      multi-character words. Split-off sub-tokens (English) share their
      source token's timing; merged multi-character words (CJK) use the
      first/last covered token's start/end timestamp.
+
+     Because spaCy splits a contraction into two separate tokens, searching
+     Concordance for the literal typed string ("don't") would otherwise
+     never match anything. `kw_search` (`dashboard/app.py`) detects this —
+     a query with no whitespace that spaCy still tokenizes into two parts
+     (deliberately narrower than "any 2-token query", so a genuine phrase
+     search like "New York" is unaffected) — and instead searches
+     `segmented_tokens` for the two raw split parts (`"do"`/`"n't"`)
+     occurring adjacently. Each matching pair becomes one occurrence: the
+     displayed word is the original typed contraction, the timestamp is the
+     **first** token's, and the span extends to the second token's end.
 
 ## Multi-language support
 
