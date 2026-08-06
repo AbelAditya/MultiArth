@@ -9,7 +9,23 @@ The heavy spaCy doc parsing is done once in verbal_worker and stored via Feature
 
 from __future__ import annotations
 
+import re
 from collections import Counter, defaultdict
+
+
+def _clean_word(text: str) -> str:
+    """
+    Strip leading/trailing non-word characters — stray punctuation Whisper
+    sometimes glues onto a token with no space (e.g. transcribing
+    "male-female" as the two raw tokens "male"/"-female", leaving the
+    hyphen stuck to the front of "female"). Same normalization the
+    dashboard's Concordance search already applies when matching tokens
+    (dashboard/app.py's kw_search); used here too so a token like "-female"
+    doesn't fail an alpha/validity check purely because of an attached
+    punctuation character — which would otherwise silently drop it, and
+    anything that depends on it, from Word List/Collocations.
+    """
+    return re.sub(r"^[^\w]+|[^\w]+$", "", text)
 
 
 # "'s"/"'re"/"'m" all lemmatise to "be", which would throw away real
@@ -42,7 +58,7 @@ def _eff(token) -> str:
     a typed contraction into its constituent words for the word-sketch-diff
     view, so both places normalise contractions identically.
     """
-    text = token.text.lower()
+    text = _clean_word(token.text.lower())
     if "'" not in text and text not in ("wo", "ca", "sha"):
         return text
     lemma = token.lemma_.lower()
@@ -249,7 +265,10 @@ def extract_collocation_en(doc) -> dict[str, dict[str, list]]:
     raw: dict[str, dict[str, Counter]] = defaultdict(lambda: defaultdict(Counter))
 
     def _is_valid(token) -> bool:
-        return not token.is_punct and token.text.replace("'", "").isalpha()
+        if token.is_punct:
+            return False
+        cleaned = _clean_word(token.text).replace("'", "")
+        return bool(cleaned) and cleaned.isalpha()
 
     _capture_dep_relations(doc, raw, _eff, _is_valid)
 
@@ -264,7 +283,7 @@ def extract_collocations_zh(doc) -> dict[str, dict[str, list]]:
     to most tokens) PLUS the same generic dependency-relation capture
     extract_collocation_en uses (_capture_dep_relations, shared relation
     names) — now that a properly word-segmented Chinese doc (see
-    _segment_cjk_words in workers/verbal_worker.py, and the spacy-pkuseg
+    _segment_words in workers/verbal_worker.py, and the spacy-pkuseg
     dependency fix) produces real, usable dependency labels instead of that
     degenerate fallback.
 
@@ -274,10 +293,13 @@ def extract_collocations_zh(doc) -> dict[str, dict[str, list]]:
     raw: dict[str, dict[str, Counter]] = defaultdict(lambda: defaultdict(Counter))
 
     def _eff(token) -> str:
-        return token.text.lower()
+        return _clean_word(token.text.lower())
 
     def _content(token) -> bool:
-        return token.is_alpha and not token.is_punct
+        if token.is_punct:
+            return False
+        cleaned = _clean_word(token.text)
+        return bool(cleaned) and cleaned.isalpha()
 
     def _nearest(toks, origin, direction, pos_filter=None):
         """Return the first content token in *direction* whose POS is in

@@ -1,5 +1,0 @@
-# Chinese stop words — single characters only
-# Sources: HIT IR Lab, standard Chinese NLP corpora
-# Format: one word per line; lines starting with # are comments
-#
-.

@@ -197,6 +197,13 @@ C = {
 
 KW_COLOUR = "#00B4D8"  # cyan-teal — distinct from all section colours and cursor amber
 
+# Concordance context (kw_search): CJK words are conventionally displayed
+# with no space between them, unlike space-separated languages — detected
+# from the words themselves rather than a stored per-job language code
+# (segmented_tokens carries no language tag), by checking for any character
+# in the common CJK Unicode blocks.
+_CJK_CHAR_RE = re.compile(r"[一-鿿぀-ヿ가-힯]")
+
 _POS_FILTER_SETS: dict[str, set[str]] = {
     "NOUN":  {"NOUN", "PROPN"},
     "VERB":  {"VERB", "AUX"},
@@ -2100,21 +2107,30 @@ def kw_search(_, __, keyword, keyword2, data, job_id, data_source, collection):
 
     occurrences = []
 
-    # CJK transcripts: raw Whisper tokens are individual characters, so a
-    # multi-character search would never match a single one. Use the
-    # properly word-segmented list built once during processing instead,
-    # when available (see VerbalWorker._segment_cjk_words) — falls back to
-    # per-window Whisper tokens for everything else, unchanged.
+    # Concordance reads the spaCy-word-segmented token list (built once
+    # during processing — see VerbalWorker._segment_words) rather than raw
+    # Whisper tokens, for every language: this keeps it from ever disagreeing
+    # with Word List/Collocations/Word Sketch/Distributional Thesaurus about
+    # what words exist in the transcript — e.g. Whisper's raw ASR tokens
+    # keep English contractions ("don't") and hyphenated compounds
+    # ("well-known") glued together as one token, and CJK's raw tokens are
+    # individual characters, so a multi-character search would never match
+    # a single one — either way, spaCy's own tokenization is what the other
+    # features already use, so Concordance now does too. Falls back to raw
+    # per-window Whisper tokens only if segmentation wasn't available for
+    # this job (e.g. no spaCy model for the detected language).
     segmented = None
     if job_id:
         segmented = _artifacts(job_id, data_source, collection).get("segmented_tokens")
 
     if segmented:
+        # CJK words conventionally read with no space between them.
+        sep = "" if _CJK_CHAR_RE.search(segmented[0]["word"]) else " "
         for i, tok in enumerate(segmented):
             tok_clean = re.sub(r"^[^\w]+|[^\w]+$", "", tok["word"], flags=re.UNICODE).lower()
             if tok_clean == kw:
-                left  = "".join(t["word"] for t in segmented[max(0, i - 4):i])
-                right = "".join(t["word"] for t in segmented[i + 1:i + 5])
+                left  = sep.join(t["word"] for t in segmented[max(0, i - 4):i])
+                right = sep.join(t["word"] for t in segmented[i + 1:i + 5])
                 occurrences.append({
                     "word":          tok["word"],
                     "start_s":       tok["start_s"],

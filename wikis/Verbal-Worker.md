@@ -18,11 +18,33 @@ lexical statistics with **spaCy**.
    each window by start time; a `VerbalFeatures` record (transcript text,
    token list, word count) is stored per window.
 3. **Corpus statistics** (`_compute_corpus_stats`), computed once for the
-   whole transcript and stored separately:
-   - **Word list** — surface-form frequency table for every content word
-     (inflected forms like "run"/"running" stay separate, not merged under
-     one lemma), using the spaCy model matched to the detected language when
-     available, otherwise raw lower-cased word counts.
+   whole transcript and stored separately. The spaCy doc it's all built from
+   is produced by `_build_doc` rather than a plain `nlp(text)` call: both
+   faster-whisper (English — see `split_tokens_on_spaces` in
+   `faster_whisper/tokenizer.py`) and pkuseg (Chinese, via `zh_core_web_sm`)
+   occasionally produce a single token that glues a number onto adjacent
+   content with no boundary (`"5apples"`, `"30岁"`), and spaCy's own
+   tokenizer doesn't reliably split these back apart either. `_build_doc`
+   tokenizes first, runs a shared digit-boundary correction pass
+   (`_split_number_glue`) over the tokens — skipping a small set of
+   conventionally-glued forms (`am`/`pm`, ordinals, multipliers) for
+   English, no exceptions for Chinese — then rebuilds the doc and runs the
+   rest of the pipeline (tagger, parser, ...) on the corrected tokens, so
+   the split-off piece (`"apples"`, `"岁"`) gets a proper POS tag and
+   dependency edge instead of inheriting the merged token's. This runs
+   before Word List/Collocations/Segmented-tokens are computed, so all
+   three see the correction uniformly, for every language.
+   - **Word list** — surface-form frequency table for every alphabetic,
+     non-punctuation word (inflected forms like "run"/"running" stay
+     separate, not merged under one lemma), using the spaCy model matched to
+     the detected language when available, otherwise raw lower-cased word
+     counts. No stopword filtering, for any language — see "Multi-language
+     support" below. Strips stray leading/trailing punctuation a token might
+     be glued to (`core/corpus_analysis._clean_word`; e.g. Whisper
+     transcribing "male-female" as the raw tokens `"male"`/`"-female"` —
+     spaCy's own tokenizer only splits a leading hyphen off *digits*, not
+     letters) before the alpha check, so a word doesn't silently drop out
+     just because of an attached punctuation character.
    - **N-grams** — bigrams/trigrams (including stop words, for natural
      phrasing) over alphabetic tokens.
    - **Collocations** — dependency-parse-based collocations
@@ -48,7 +70,28 @@ lexical statistics with **spaCy**.
      conjunctions/markers — each as a symmetric pair (e.g. `subj_of`/
      `has_subj`) so either side of a relation is searchable, plus, for
      anything without an established name, an automatic `{dep}_of`/
-     `has_{dep}` fallback using spaCy's raw dependency label.
+     `has_{dep}` fallback using spaCy's raw dependency label. Both
+     languages' validity checks and keying (`_eff`) apply the same
+     `_clean_word` stray-punctuation stripping the word list uses — without
+     it, a word whose only captured relation points to a punctuation-glued
+     neighbour (e.g. "male", whose head is the glued token "-female") would
+     have that entire relation silently dropped, leaving it with zero
+     relations and so absent from Word Sketch/Distributional Thesaurus
+     entirely, even though Concordance (which has always done its own
+     equivalent cleanup) would still find it.
+   - **Segmented tokens** (`_segment_words`) — every spaCy doc token mapped
+     back onto the timestamp(s) of the original Whisper `WordToken`(s) it
+     came from, for **every** language. The dashboard's Concordance tab
+     searches this instead of Whisper's raw, un-reprocessed word list, so it
+     can never disagree with Word List/Collocations/Word Sketch/
+     Distributional Thesaurus about what words exist in the transcript —
+     e.g. Whisper's raw ASR output keeps English contractions (`don't`) and
+     hyphenated compounds (`well-known`) glued together as one token, which
+     spaCy splits apart (`do`/`n't`, `well`/`-`/`known`); for CJK, raw
+     Whisper tokens are individual characters, which pkuseg merges into real
+     multi-character words. Split-off sub-tokens (English) share their
+     source token's timing; merged multi-character words (CJK) use the
+     first/last covered token's start/end timestamp.
 
 ## Multi-language support
 
@@ -60,11 +103,12 @@ lexical statistics with **spaCy**.
   spaces before being handed to spaCy so its tokenizer can re-segment words
   correctly, and n-grams are built from the spaCy doc's word tokens rather
   than Whisper's per-character tokens.
-- `zh_core_web_sm` ships no dedicated stop-word list and its statistical
-  `is_stop` flags mis-tag common content words (e.g. 人/好/大). To work
-  around this, the worker clears the model's built-in stop-word flags and
-  applies a curated list instead, loaded via
-  [`core/stopwords`](../core/stopwords) (`load_stopwords`).
+- No stopword filtering is applied anywhere (word list or collocations), for
+  any language — `zh_core_web_sm`'s built-in `is_stop` flags mis-tag common
+  Chinese content words (e.g. 人/好/大/是), and rather than maintain a curated
+  override list for just Chinese, `is_stop` is ignored entirely so every
+  language is treated consistently: every alphabetic, non-punctuation token
+  is a valid word.
 - If no spaCy model is configured/installed for a detected language, the
   worker falls back to raw word counts and skips collocation extraction
   rather than failing the job.

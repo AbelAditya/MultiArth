@@ -11,16 +11,17 @@ lazily and cached so multi-language sessions don't reload unnecessarily.
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from typing import Optional
 
 import spacy
 from faster_whisper import WhisperModel
 from loguru import logger
+from spacy.tokens import Doc
 
 from core import corpus_analysis
 from core.feature_store import FeatureStore
-from core.stopwords import load_stopwords
 from core.models import TimeWindow, VerbalFeatures, WordToken
 from core.preprocessing import VideoMeta
 
@@ -30,6 +31,44 @@ _SPACY_MODELS: dict[str, str] = {
     "en": "en_core_web_sm",
     "zh": "zh_core_web_sm",
 }
+
+# _split_number_glue: a digit run immediately touching non-digit content,
+# in either direction ("30岁"/"5apples" = digit-prefix, "第5" = digit-suffix).
+_DIGIT_PREFIX_GLUE_RE = re.compile(r"^(\d+)([^\d]+)$")
+_DIGIT_SUFFIX_GLUE_RE = re.compile(r"^([^\d]+)(\d+)$")
+
+# English suffixes that conventionally stay glued to a leading number as one
+# legitimate unit (ordinals, times, multipliers) — never split apart.
+# Chinese has no equivalent: every numeral+character fusion pkuseg produces
+# (e.g. "30岁", "2024年") is the exact ambiguity being corrected, so its
+# _compute_corpus_stats call passes an empty keep-set instead of this one.
+_EN_NUMBER_GLUE_KEEP = frozenset({"am", "pm", "st", "nd", "rd", "th", "x", "k", "m", "b"})
+
+
+def _split_number_glue(word: str, keep_glued: frozenset) -> Optional[tuple[str, str]]:
+    """
+    Shared by every language's _build_doc call: detect a token that glues a
+    digit run onto adjacent non-digit content with no boundary, and split it
+    into two strings at that boundary. Returns None if *word* doesn't match
+    this pattern, or if the non-digit part (case-insensitive) is in
+    *keep_glued* — a language-specific set of forms that conventionally stay
+    attached to a number as one legitimate unit.
+    """
+    m = _DIGIT_PREFIX_GLUE_RE.match(word)
+    if m:
+        digits, content = m.group(1), m.group(2)
+        if content.lower() in keep_glued:
+            return None
+        return digits, content
+
+    m = _DIGIT_SUFFIX_GLUE_RE.match(word)
+    if m:
+        content, digits = m.group(1), m.group(2)
+        if content.lower() in keep_glued:
+            return None
+        return content, digits
+
+    return None
 
 
 class VerbalWorker:
@@ -59,21 +98,6 @@ class VerbalWorker:
         try:
             nlp = spacy.load(model_name)
             logger.info(f"[verbal] Loaded spaCy model '{model_name}' for '{lang_code}'")
-
-            custom_stops = load_stopwords(lang_code)
-            if custom_stops:
-                # Clear the model's built-in stop word list and apply ours exclusively.
-                # zh_core_web_sm has no dedicated stop word list and its statistical
-                # is_stop flags incorrectly mark content words like 人/好/大.
-                for lex in nlp.vocab:
-                    lex.is_stop = False
-                for word in custom_stops:
-                    nlp.vocab[word].is_stop = True
-                logger.info(
-                    f"[verbal] Applied custom stop word list for '{lang_code}' "
-                    f"({len(custom_stops)} entries)"
-                )
-
             self._nlp_cache[lang_code] = nlp
             return nlp
         except OSError:
@@ -162,24 +186,41 @@ class VerbalWorker:
         )
 
     @staticmethod
-    def _segment_cjk_words(doc, all_tokens: list[WordToken]) -> list[dict]:
+    def _segment_words(doc, all_tokens: list[WordToken], sep_len: int) -> list[dict]:
         """
-        For CJK: raw Whisper tokens are individual characters (see the
-        n-grams comment below), but spaCy's jieba-based tokenizer re-segments
-        the concatenated (no-separator) transcript into proper multi-character
-        words. Map each spaCy word's character span back to the original
-        per-character Whisper tokens it came from, so Concordance can search
-        these properly-segmented words (with real timestamps) instead of
-        being limited to matching single Whisper characters.
+        Map every spaCy doc token back onto the original Whisper WordToken(s)
+        it derives from, so Concordance (and anything else that wants word-
+        level timestamps) can search spaCy's own tokenization instead of
+        Whisper's raw, un-reprocessed word list — keeping Concordance, Word
+        List, Collocations, Word Sketch, and Distributional Thesaurus all
+        reading from the exact same tokenization, for every language.
+
+        This matters differently depending on how the transcript was joined
+        for spaCy (see _compute_corpus_stats' join_sep):
+        - CJK (sep_len=0, no separator): a single spaCy word can span
+          *multiple* original per-character Whisper tokens, since pkuseg
+          merges individual characters into real multi-character words. Uses
+          the first/last covered token's start/end timestamp.
+        - Space-separated languages (sep_len=1): spaCy's tokenizer only ever
+          *splits* within a chunk, never merges across the space we joined
+          with — so each spaCy token falls entirely within exactly one
+          original Whisper token. Sub-tokens split off a single ASR word
+          (e.g. "don't" -> "do"/"n't", "well-known" -> "well"/"-"/"known")
+          simply share that one original token's timing, since Whisper
+          doesn't give finer-grained timestamps within one ASR word anyway.
+
+        *sep_len*: number of characters joining consecutive Whisper tokens in
+        the string handed to spaCy (0 for CJK's no-separator join, 1 for a
+        single-space join).
         """
         # (start_char, end_char) for each Whisper token, in the same
-        # concatenated-string coordinate space the spaCy doc was built from.
+        # coordinate space as the string the spaCy doc was built from.
         spans = []
         offset = 0
         for tok in all_tokens:
             n = len(tok.word)
             spans.append((offset, offset + n, tok))
-            offset += n
+            offset += n + sep_len
 
         segmented: list[dict] = []
         span_i = 0
@@ -205,13 +246,69 @@ class VerbalWorker:
 
         return segmented
 
+    @staticmethod
+    def _build_doc(nlp, text: str, keep_glued: frozenset = frozenset()):
+        """
+        Tokenize *text* with *nlp* and run the rest of its pipeline (tagger,
+        parser, ...) — same as calling nlp(text) directly — except a
+        digit-glue correction pass runs on the tokens first: faster-whisper
+        (English) and pkuseg (Chinese, via zh_core_web_sm) both occasionally
+        produce a single token that glues a number onto adjacent content
+        with no boundary ("5apples", "30岁") — see _split_number_glue. This
+        has to happen *between* tokenizing and parsing, not after nlp(text)
+        has already run end to end: the parser needs to see "apples"/"岁" as
+        their own tokens to assign them a real POS tag and dependency edge,
+        not inherit whatever the merged token got.
+
+        Rebuilds a Doc from the corrected tokens, preserving each original
+        token's own `.whitespace_` so the rebuilt doc's character offsets
+        stay identical to *text* — critical since _segment_words maps
+        timestamps back onto this doc purely by character offset. Split
+        halves get no space between them (they were glued with none); the
+        second half inherits the original token's own trailing space.
+
+        Skips the rebuild (just calls nlp(text) normally) when nothing
+        needed splitting, which is the common case.
+        """
+        tok_doc = nlp.tokenizer(text)
+        words: list[str] = []
+        spaces: list[bool] = []
+        changed = False
+        for tok in tok_doc:
+            if not tok.text:
+                continue
+            split = _split_number_glue(tok.text, keep_glued)
+            if split:
+                changed = True
+                first, second = split
+                words.append(first)
+                spaces.append(False)
+                words.append(second)
+                spaces.append(bool(tok.whitespace_))
+            else:
+                words.append(tok.text)
+                spaces.append(bool(tok.whitespace_))
+
+        if not changed:
+            return nlp(text)
+
+        doc = Doc(nlp.vocab, words=words, spaces=spaces)
+        for _, proc in nlp.pipeline:
+            doc = proc(doc)
+        return doc
+
     def _compute_corpus_stats(
         self, all_tokens: list[WordToken], lang_code: str
     ) -> tuple[dict, dict, dict, list]:
         """
-        Build word list, n-grams, collocations, and (for CJK) a properly
-        word-segmented token list from the full transcript. Uses the spaCy
-        model for *lang_code* if available.
+        Build word list, n-grams, collocations, and a spaCy-word-segmented
+        token list (with timestamps mapped back from the original Whisper
+        tokens — see _segment_words) from the full transcript. Uses the
+        spaCy model for *lang_code* if available, tokenized via _build_doc
+        (rather than calling nlp(text) directly) so a number glued onto
+        adjacent content with no boundary ("5apples", "30年") — which
+        neither faster-whisper nor spaCy's own tokenizer reliably splits on
+        its own — gets corrected before tagging/parsing, for every language.
         Returns (wordlist, ngrams, collocations, segmented_tokens).
         """
         nlp = self._get_nlp(lang_code)
@@ -225,17 +322,28 @@ class VerbalWorker:
         doc = None
         if nlp and text.strip():
             nlp_text = text[: nlp.max_length]
-            doc = nlp(nlp_text)
+            keep_glued = frozenset() if lang_code in ("zh", "ja", "ko") else _EN_NUMBER_GLUE_KEEP
+            doc = self._build_doc(nlp, nlp_text, keep_glued)
 
             # Keyed by surface form, not lemma — "run"/"running"/"ran" get
             # separate rows with their own counts, consistent with the
             # surface-form keying used for collocations (core/corpus_analysis.py).
+            # No stopword filtering at all — spaCy's is_stop is unreliable for
+            # zh_core_web_sm (mis-tags real content words like 大/是), and for
+            # consistency N-grams/Collocations never filtered stop words
+            # either, so the word list doesn't filter them for any language.
             word_data: dict[str, dict] = {}
             for token in doc:
-                if token.is_stop or token.is_punct or not token.is_alpha:
+                if token.is_punct:
                     continue
-                word = token.text.lower()
-                if not word:
+                # Strip stray leading/trailing punctuation Whisper sometimes
+                # glues onto a token (e.g. "-female" from "male-female")
+                # before the alpha check — same normalization Collocations
+                # uses (core/corpus_analysis._clean_word) — so a word doesn't
+                # silently drop out of the list just because of an attached
+                # punctuation character.
+                word = corpus_analysis._clean_word(token.text.lower())
+                if not word or not word.isalpha():
                     continue
                 if word not in word_data:
                     word_data[word] = {"pos": token.pos_, "count": 0}
@@ -298,14 +406,18 @@ class VerbalWorker:
             except Exception as exc:
                 logger.warning(f"[verbal] Collocations extraction failed: {exc}")
 
-        # ── Word-segmented tokens for Concordance (CJK only — Whisper's own
-        #    per-character tokens are already word-granular for other
-        #    languages, so Concordance keeps using those there) ───────────
+        # ── Word-segmented tokens for Concordance (all languages) ────────
+        # Built from the same doc as Word List/Collocations/Word Sketch/
+        # Distributional Thesaurus, rather than Whisper's raw, un-reprocessed
+        # word list, so Concordance can never disagree with them about what
+        # words exist in the transcript (e.g. English contractions/hyphenated
+        # compounds that spaCy splits differently than Whisper's own word
+        # boundaries, or CJK words pkuseg merges from multiple characters).
         segmented_tokens: list[dict] = []
-        if doc is not None and lang_code in ("zh", "ja", "ko"):
+        if doc is not None:
             try:
-                segmented_tokens = self._segment_cjk_words(doc, all_tokens)
+                segmented_tokens = self._segment_words(doc, all_tokens, len(join_sep))
             except Exception as exc:
-                logger.warning(f"[verbal] CJK word segmentation failed: {exc}")
+                logger.warning(f"[verbal] Word segmentation failed: {exc}")
 
         return wordlist, ngrams, collocations, segmented_tokens
