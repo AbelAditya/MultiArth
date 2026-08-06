@@ -218,6 +218,32 @@ POS_COLOUR = {
     "ADJ":  C["cursor"],  "ADV":   C["camera"],
 }
 
+# Full display labels for spaCy's Universal POS tags (kw-wordlist-table's
+# "pos" column) — stopwords are no longer filtered out of the word list, so
+# entries can carry any of these, not just the six content-word tags above.
+# "?" is the fallback tag used when no spaCy model exists for a language.
+_POS_LABELS: dict[str, str] = {
+    "ADJ":   "Adjective",
+    "ADP":   "Adposition (preposition/postposition)",
+    "ADV":   "Adverb",
+    "AUX":   "Auxiliary verb",
+    "CCONJ": "Coordinating conjunction",
+    "DET":   "Determiner",
+    "INTJ":  "Interjection",
+    "NOUN":  "Noun",
+    "NUM":   "Numeral",
+    "PART":  "Particle",
+    "PRON":  "Pronoun",
+    "PROPN": "Proper noun",
+    "PUNCT": "Punctuation",
+    "SCONJ": "Subordinating conjunction",
+    "SYM":   "Symbol",
+    "VERB":  "Verb",
+    "X":     "Other (unknown/foreign)",
+    "SPACE": "Space",
+    "?":     "Unknown",
+}
+
 PLOT_LAYOUT = dict(
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(0,0,0,0)",
@@ -767,7 +793,10 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                             "fontFamily": "DM Mono, monospace", "fontSize": "10px",
                         },
                         style_data_conditional=[
-                            {"if": {"filter_query": f'{{pos}} = "{pos}"'}, "borderLeft": f"3px solid {colour}"}
+                            {
+                                "if": {"filter_query": f'{{pos}} = "{_POS_LABELS.get(pos, pos)}"'},
+                                "borderLeft": f"3px solid {colour}",
+                            }
                             for pos, colour in POS_COLOUR.items()
                         ],
                     ),
@@ -2500,7 +2529,10 @@ def kw_wordlist_table(data, pos_filter, job_id, data_source, collection):
         allowed = _POS_FILTER_SETS.get(pos_filter, set())
         entries = [e for e in all_entries if e["pos"] in allowed]
 
-    return entries
+    # Filtering above uses spaCy's raw tag abbreviations (matching
+    # _POS_FILTER_SETS/_KNOWN_POS); only the displayed value is expanded to
+    # a full label, here at the end, so filtering logic is unaffected.
+    return [{**e, "pos": _POS_LABELS.get(e["pos"], e["pos"])} for e in entries]
 
 
 @callback(

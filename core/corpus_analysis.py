@@ -24,8 +24,15 @@ def _clean_word(text: str) -> str:
     doesn't fail an alpha/validity check purely because of an attached
     punctuation character — which would otherwise silently drop it, and
     anything that depends on it, from Word List/Collocations.
+
+    Apostrophes are deliberately exempt from stripping, unlike other
+    punctuation: contraction fragments ("'s", "'re", "'m", "'ll", "'ve")
+    legitimately start with one, and _eff() (below) depends on that leading
+    apostrophe surviving to recognise them and expand them correctly —
+    stripping it here would silently skip that logic and leave e.g.
+    "they're" keyed as the meaningless fragment "re" instead of "are".
     """
-    return re.sub(r"^[^\w]+|[^\w]+$", "", text)
+    return re.sub(r"^[^\w']+|[^\w']+$", "", text)
 
 
 # "'s"/"'re"/"'m" all lemmatise to "be", which would throw away real
