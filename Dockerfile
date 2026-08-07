@@ -8,8 +8,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
-COPY pyproject.toml ./
-RUN uv sync --no-dev --no-install-project
+COPY pyproject.toml uv.lock ./
+# --frozen: install exactly what's pinned in uv.lock rather than re-resolving
+# from pyproject.toml alone. Without a lockfile in the build context, `uv
+# sync` resolves fresh inside the container — which isn't guaranteed to match
+# the (tested, working) local resolution, and has in practice landed on a
+# broken one: llvmlite==0.36.0 (a 2021 release with a hard guard against
+# Python >=3.10, pulled in transitively via funasr -> umap-learn ->
+# pynndescent), instead of the modern 0.48.0 the local lockfile pins.
+RUN uv sync --frozen --no-dev --no-install-project
 
 # scenedetect and mediapipe pull in opencv-python and opencv-contrib-python
 # respectively — both packages, both hard dependencies of something we need,
