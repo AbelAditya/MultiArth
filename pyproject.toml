@@ -13,6 +13,15 @@ dependencies = [
     "soundfile>=0.12.1",
     # ASR / NLP
     "faster-whisper>=1.0.1",
+    # SenseVoice (via funasr) handles Chinese transcription specifically —
+    # meaningfully more accurate on Mandarin than Whisper in side-by-side
+    # testing (fewer homophone-confusion errors) and ~5x faster on CPU.
+    # English (and any other non-Chinese language) still goes through
+    # faster-whisper above; see VerbalWorker._transcribe's routing.
+    "funasr>=1.4.1",
+    "torch>=2.0",
+    "torchaudio>=2.0",
+    "modelscope>=1.9",
     "spacy>=3.7.4",
     # zh_core_web_sm's proper multi-character word segmenter — without this,
     # spaCy's Chinese tokenizer silently falls back to splitting every single
@@ -54,6 +63,23 @@ dev-dependencies = [
     "ipykernel>=6.29.4",
     "mongomock>=4.3.0",
 ]
+
+[tool.uv.sources]
+# CPU-only wheels — the default PyPI torch build on Linux unconditionally
+# pulls in the full CUDA toolkit (nvcc compiler, dev headers, triton — not
+# just the runtime libraries GPU inference actually needs) regardless of
+# whether a GPU is present, several GB heavier than this deployment needs.
+# GPU support is left for later — it needs real Docker/deployment work
+# (CUDA base image, nvidia-container-toolkit, a properly-scoped CUDA-version
+# index instead of this one) that hasn't been done yet; revisit this pin
+# together with that when it's actually being set up.
+torch = [{ index = "pytorch-cpu" }]
+torchaudio = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [project.scripts]
 analyze = "cli:main"

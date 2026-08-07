@@ -50,6 +50,20 @@ from faster_whisper import WhisperModel
 WhisperModel("small", device="cpu", compute_type="int8")
 EOF
 
+# Pre-download SenseVoice (Chinese ASR — see VerbalWorker._transcribe_alt)
+# and its VAD model, same reasoning as Whisper above.
+RUN python - <<'EOF'
+from funasr import AutoModel
+AutoModel(
+    model="iic/SenseVoiceSmall",
+    trust_remote_code=True,
+    vad_model="fsmn-vad",
+    vad_kwargs={"max_single_segment_time": 30000},
+    device="cpu",
+    disable_update=True,
+)
+EOF
+
 # Copy application code
 COPY . .
 

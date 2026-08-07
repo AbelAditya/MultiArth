@@ -6,7 +6,8 @@ Feature model: [`VerbalFeatures`](../core/models.py) (in `core/models.py`)
 
 ## What it does
 
-`VerbalWorker` transcribes the full audio **once** with **faster-whisper**,
+`VerbalWorker` transcribes the full audio **once** — with **faster-whisper**
+for most languages, **SenseVoice** (via `funasr`) for Chinese specifically —
 then distributes word tokens into time windows and builds corpus-wide
 lexical statistics with **spaCy**.
 
@@ -14,6 +15,37 @@ lexical statistics with **spaCy**.
    `word_timestamps=True` and `vad_filter=True` (voice-activity filtering),
    auto-detecting the spoken language and returning a flat list of
    `WordToken`s (word, start/end time, confidence).
+
+   Whisper *always* runs first, purely to detect the language — that part is
+   cheap (an encoder pass over the first ~30s + the language-ID head, ~1-2s),
+   well under the cost of the actual autoregressive decoding. If the
+   detected language is in `_ALT_ASR_LANGS` (currently just `zh`),
+   transcription is handed off to `_transcribe_alt` (SenseVoice) instead —
+   Whisper's own `segments` generator is simply left unconsumed, so its
+   decoding cost is never paid. If SenseVoice fails for any reason, it falls
+   back to consuming Whisper's already-in-flight segments rather than
+   failing the job outright.
+
+   SenseVoice was adopted after a direct side-by-side accuracy comparison on
+   a real Chinese sample: Whisper produced five homophone-confusion errors in
+   a 46-second clip (e.g. "潜**意**默化" — not a real phrase — where SenseVoice
+   correctly produced the actual idiom "潜**移**默化"), and ran ~5x slower on
+   CPU. SenseVoice's Chinese `words` output is still per-character, same
+   granularity as Whisper's, so pkuseg (via spaCy, in `_build_doc`/
+   `_compute_corpus_stats`) still does the real word segmentation on top,
+   unchanged by which engine produced the raw transcript. SenseVoice doesn't
+   report a per-word confidence the way Whisper does, so its `WordToken`s
+   get a flat `1.0` (unused downstream beyond display).
+
+   Both engines are placed on the same device (`VerbalWorker`'s `device`
+   param — already threaded from the CLI's `--device cpu|cuda` flag via
+   `Orchestrator`; `funasr` falls back to CPU automatically if `cuda` is
+   requested but unavailable). The dashboard's `Orchestrator(store=store)`
+   call doesn't currently pass this through, so dashboard-driven jobs always
+   run on CPU regardless of what's available — only the CLI exposes GPU
+   selection today. SenseVoice is loaded lazily and cached (`_get_sensevoice`,
+   mirroring `_get_nlp`'s per-language spaCy caching) — English-only sessions
+   never load it at all.
 2. **Per-window features** (`_process_window`) — tokens are bucketed into
    each window by start time; a `VerbalFeatures` record (transcript text,
    token list, word count) is stored per window.
@@ -123,6 +155,11 @@ lexical statistics with **spaCy**.
   looked up in `_SPACY_MODELS` (currently `en → en_core_web_sm`,
   `zh → zh_core_web_sm`) and loaded lazily, then cached per-language so
   repeated jobs don't reload the model.
+- The **ASR engine itself** is also chosen by detected language —
+  `_ALT_ASR_LANGS` (currently `{"zh"}`) routes to SenseVoice instead of
+  Whisper; see `_transcribe`/`_transcribe_alt`. Add a code there (and a
+  branch in `_transcribe_alt`) to route another language to a different
+  engine the same way.
 - For logographic scripts (`zh`/`ja`/`ko`), tokens are joined **without**
   spaces before being handed to spaCy so its tokenizer can re-segment words
   correctly, and n-grams are built from the spaCy doc's word tokens rather
@@ -141,7 +178,9 @@ lexical statistics with **spaCy**.
 
 | Package | Role | Docs |
 |---|---|---|
-| faster-whisper | Speech-to-text transcription with word-level timestamps | https://github.com/SYSTRAN/faster-whisper#readme |
+| faster-whisper | Speech-to-text transcription with word-level timestamps (all languages except `_ALT_ASR_LANGS`) | https://github.com/SYSTRAN/faster-whisper#readme |
+| funasr | Runs SenseVoice, the Chinese-specific ASR engine | https://github.com/modelscope/FunASR#readme |
+| torch / torchaudio | funasr/SenseVoice's inference backend (CPU or CUDA) | https://pytorch.org/docs/stable/index.html |
 | spaCy | Tokenization, lemmatization, POS tagging, dependency parsing | https://spacy.io/api |
 | loguru | Transcription/job logging | https://loguru.readthedocs.io/en/stable/ |
 | Pydantic | `VerbalFeatures` / `WordToken` models | https://docs.pydantic.dev/latest/ |
