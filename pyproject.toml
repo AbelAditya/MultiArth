@@ -8,6 +8,15 @@ dependencies = [
     # Video / vision
     "mediapipe==0.10.9",
     "scenedetect>=0.6.3",
+    # YOLO-Pose (Ultralytics) — multi-person pose estimation for
+    # GestureWorker, replacing MediaPipe's single-person Holistic model.
+    # NOTE: Ultralytics is AGPL-3.0-licensed (copyleft, with a network-use
+    # clause) — a materially different license from the rest of this
+    # project's permissive (Apache/MIT/BSD) dependencies. Adopted
+    # deliberately, with that tradeoff understood, not by default.
+    "ultralytics>=8.4.0",
+    "torch>=2.0",
+    "torchvision>=0.15",
     # Audio / prosody
     "praat-parselmouth>=0.4.3",
     "soundfile>=0.12.1",
@@ -54,6 +63,20 @@ dev-dependencies = [
     "ipykernel>=6.29.4",
     "mongomock>=4.3.0",
 ]
+
+[tool.uv.sources]
+# CPU-only wheels — the default PyPI Linux build pulls in the full CUDA
+# toolkit unconditionally, several GB heavier than this deployment needs.
+# GPU support is deliberately deferred until real Docker/deployment
+# orchestration for it is done (CUDA base image, nvidia-container-toolkit,
+# a properly-scoped CUDA-version index instead of this one).
+torch = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [project.scripts]
 analyze = "cli:main"

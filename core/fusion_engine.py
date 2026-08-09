@@ -21,27 +21,32 @@ from core.models import (
 
 def _classify_shot_from_pose(keyframes: list[PoseKeyframe]) -> ShotType:
     """
-    Determine shot type from which MediaPipe body landmarks are consistently
-    visible across keyframes.
+    Determine shot type from which body landmarks are consistently visible
+    across keyframes. Indices are COCO-17 (Ultralytics YOLO-Pose topology —
+    see workers/gesture_worker.py), not MediaPipe's old 33-point topology.
 
     Landmark y-coords in PoseKeyframe are stored pre-flipped as (1 - raw_y),
     so pose_y=1.0 is the top of the frame and pose_y=0.0 is the bottom.
 
     Classification ladder (most inclusive wins):
-      feet (31,32) visible + tall person  → LONG
-      feet visible + small person         → VERY_LONG
-      ankles (27,28) visible              → MEDIUM_LONG
-      knees (25,26) visible               → MEDIUM
-      hips  (23,24) visible               → MEDIUM_CLOSE
-      shoulders (11,12) visible           → CLOSE_UP
-      nose  (0) only                      → EXTREME_CLOSE_UP
-      nothing detected                    → UNKNOWN
+      ankles (15,16) visible + tall person → LONG
+      ankles visible + small person        → VERY_LONG
+      knees  (13,14) visible                → MEDIUM
+      hips   (11,12) visible                → MEDIUM_CLOSE
+      shoulders (5,6) visible                → CLOSE_UP
+      nose   (0) only                        → EXTREME_CLOSE_UP
+      nothing detected                       → UNKNOWN
+
+    COCO-17 has no foot/toe landmark distinct from ankle (MediaPipe had
+    both, at 27/28 and 31/32), so the old feet-vs-ankle split — LONG/
+    VERY_LONG vs. a separate MEDIUM_LONG tier — collapses into one ankle-
+    based tier here. MEDIUM_LONG is no longer emitted by this function.
     """
     n = len(keyframes)
     if n == 0:
         return ShotType.UNKNOWN
 
-    VIS_MIN    = 0.5   # MediaPipe visibility threshold
+    VIS_MIN    = 0.5   # keypoint-confidence threshold
     IN_FRAME_Y = 0.05  # landmark must be >5% above bottom edge (pose_y > 0)
     THRESH     = 0.4   # fraction of frames the landmark must be visible
 
@@ -57,32 +62,30 @@ def _classify_shot_from_pose(keyframes: list[PoseKeyframe]) -> ShotType:
                 count += 1
         return count / n
 
-    feet_r     = ratio([31, 32])
-    ankle_r    = ratio([27, 28])
-    knee_r     = ratio([25, 26])
-    hip_r      = ratio([23, 24])
-    shoulder_r = ratio([11, 12])
+    ankle_r    = ratio([15, 16])
+    knee_r     = ratio([13, 14])
+    hip_r      = ratio([11, 12])
+    shoulder_r = ratio([5, 6])
     nose_r     = ratio([0])
 
     if shoulder_r < THRESH and nose_r < THRESH:
         return ShotType.UNKNOWN
 
-    if feet_r >= THRESH:
+    if ankle_r >= THRESH:
         heights = []
         for kf in keyframes:
             if kf.pose_vis[0] > VIS_MIN:
-                foot_ys = [
-                    kf.pose_y[i] for i in [31, 32]
+                ankle_ys = [
+                    kf.pose_y[i] for i in [15, 16]
                     if i < len(kf.pose_vis) and kf.pose_vis[i] > VIS_MIN
                 ]
-                if foot_ys:
-                    heights.append(kf.pose_y[0] - min(foot_ys))
+                if ankle_ys:
+                    heights.append(kf.pose_y[0] - min(ankle_ys))
         mean_height = float(np.mean(heights)) if heights else 0.5
         return ShotType.LONG if mean_height >= 0.4 else ShotType.VERY_LONG
 
-    if ankle_r   >= THRESH: return ShotType.MEDIUM_LONG
-    if knee_r    >= THRESH: return ShotType.MEDIUM
-    if hip_r     >= THRESH: return ShotType.MEDIUM_CLOSE
+    if knee_r     >= THRESH: return ShotType.MEDIUM
+    if hip_r      >= THRESH: return ShotType.MEDIUM_CLOSE
     if shoulder_r >= THRESH: return ShotType.CLOSE_UP
     return ShotType.EXTREME_CLOSE_UP
 
@@ -97,6 +100,16 @@ def _compute_angles_from_pose(
       0° = subject faces camera directly, ±90° = pure profile.
     Face pitch — elevation of nose relative to mid-ear anchor:
       positive = subject looking up (HIGH angle), negative = looking down (LOW).
+
+    Needs metric 3D world-space landmarks (kf.world_x/world_y/world_z), which
+    MediaPipe provided but YOLO-Pose (workers/gesture_worker.py, since the
+    switch away from MediaPipe) does not — it's a 2D-only pose model. Every
+    keyframe's world_x is now always None, so this always returns
+    (None, None), via the same `kf.world_x is None` guard below that already
+    handled "world landmarks weren't available this frame" gracefully before
+    the switch. Left otherwise intact (including the now-unreachable MediaPipe
+    33-point indices below) as a ready-made reference if 3D pose estimation
+    ever gets reintroduced via a different model.
 
     MediaPipe world_y is downward-positive, so the pitch sign is negated to
     give an intuitive result.

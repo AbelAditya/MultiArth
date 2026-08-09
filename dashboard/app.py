@@ -1629,24 +1629,31 @@ clientside_callback(
         if (window._poseRafRunning) return window.dash_clientside.no_update;
         window._poseRafRunning = true;
 
+        // COCO-17 keypoint topology (Ultralytics YOLO-Pose — see
+        // workers/gesture_worker.py), not MediaPipe's old 33-point one:
+        // 0 nose, 1/2 eyes, 3/4 ears, 5/6 shoulders, 7/8 elbows, 9/10
+        // wrists, 11/12 hips, 13/14 knees, 15/16 ankles. No separate
+        // finger/hand-tip or foot/toe landmarks exist in this topology, so
+        // "hands" below is just the wrist points (arms already covers
+        // them too) and "head"/"gaze" lost their finer MediaPipe face-mesh
+        // detail (only nose/eyes/ears are available now).
         var SEG_LMS = {
-            head:  [0,1,2,3,4,5,6,7,8,9,10],
-            arms:  [11,12,13,14,15,16,17,18,19,20,21,22],
-            hands: [15,16,17,18,19,20,21,22],
-            torso: [11,12,23,24],
-            gaze:  [1,2,3,4,5,6]
+            head:  [0,1,2,3,4],
+            arms:  [5,6,7,8,9,10],
+            hands: [9,10],
+            torso: [5,6,11,12],
+            gaze:  [1,2]
         };
         var SEG_COLORS = {
             head:  '#4A90D9', arms:  '#F0A500',
             hands: '#C84B31', torso: '#28a745', gaze: '#D63384'
         };
         var CONNECTIONS = [
-            [0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],[9,10],
-            [11,12],[11,23],[12,24],[23,24],
-            [11,13],[13,15],[15,17],[15,19],[15,21],[17,19],
-            [12,14],[14,16],[16,18],[16,20],[16,22],[18,20],
-            [23,25],[25,27],[27,29],[27,31],[29,31],
-            [24,26],[26,28],[28,30],[28,32],[30,32]
+            [0,1],[0,2],[1,3],[2,4],
+            [5,6],
+            [5,7],[7,9],[6,8],[8,10],
+            [5,11],[6,12],[11,12],
+            [11,13],[13,15],[12,14],[14,16]
         ];
 
         function drawLoop() {
@@ -1697,11 +1704,11 @@ clientside_callback(
             }
             if (lo > 0 && Math.abs(frames[lo-1].ts - t) < Math.abs(frames[lo].ts - t)) lo--;
             var f = frames[lo];
-            var px = f.px, py = f.py, pv = f.pv, n33 = px.length;
-            if (n33 < 33) return;
+            var px = f.px, py = f.py, pv = f.pv, nKp = px.length;
+            if (nKp < 17) return;  // COCO-17 keypoint count (was 33 under MediaPipe)
 
-            var cx_arr = new Float32Array(n33), cy_arr = new Float32Array(n33);
-            for (var m = 0; m < n33; m++) {
+            var cx_arr = new Float32Array(nKp), cy_arr = new Float32Array(nKp);
+            for (var m = 0; m < nKp; m++) {
                 cx_arr[m] = px[m] * frame_w;
                 cy_arr[m] = (1 - py[m]) * frame_h;
             }
@@ -1716,7 +1723,7 @@ clientside_callback(
 
             for (var e = 0; e < CONNECTIONS.length; e++) {
                 var i = CONNECTIONS[e][0], j = CONNECTIONS[e][1];
-                if (i >= n33 || j >= n33 || pv[i] < 0.15 || pv[j] < 0.15) continue;
+                if (i >= nKp || j >= nKp || pv[i] < 0.15 || pv[j] < 0.15) continue;
                 var ci = segColor[i], cj = segColor[j];
                 var lit = ci !== undefined && cj !== undefined;
                 ctx.beginPath();
@@ -1727,7 +1734,7 @@ clientside_callback(
                 ctx.stroke();
             }
 
-            for (var k = 0; k < n33; k++) {
+            for (var k = 0; k < nKp; k++) {
                 if (pv[k] < 0.15) continue;
                 var kc = segColor[k];
                 var litJ = kc !== undefined;

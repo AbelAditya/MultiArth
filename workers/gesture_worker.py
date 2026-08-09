@@ -1,48 +1,95 @@
 """
 workers/gesture_worker.py
 --------------------------
-MediaPipe Holistic worker.
+YOLO-Pose (Ultralytics) worker — multi-person detection with speaker
+selection.
 
 For each time window it:
   1. Reads frames from the video
-  2. Runs MediaPipe Holistic to extract pose + hand landmarks
-  3. Computes kinematic features (velocity, amplitude, symmetry, etc.)
-  4. Stores a GestureFeatures record in the FeatureStore
+  2. Runs YOLO-Pose (multi-person, COCO-17 keypoints) on every frame
+  3. Selects which detected person is "the subject": most-central-to-frame
+     (by bounding-box center) at the first frame of the window (voted
+     once), then nearest-to-last-known-position for the rest of the
+     window — no re-vote until the next window starts. Deliberately no
+     "is this still plausibly the same person" ambiguity guard yet (e.g. a
+     max-distance cutoff) — that's held off until there's enough real
+     multi-person test data to decide whether it's actually needed.
+  4. Computes kinematic features (velocity, amplitude, symmetry, etc.) from
+     only the selected person's landmarks — everyone else detected in a
+     frame is discarded before a GestureFrame is ever built, so nothing
+     downstream (FusionEngine, the dashboard) needs to know multiple people
+     were ever in frame.
+
+Switched from MediaPipe (Holistic, then Tasks API PoseLandmarker) to
+YOLO-Pose after a direct accuracy comparison showed MediaPipe's multi-person
+predictions were worse than expected. Two real tradeoffs from this switch,
+both worth knowing about:
+
+  - License: Ultralytics is AGPL-3.0 (copyleft, with a network-use clause),
+    a materially different license from the rest of this project's
+    permissive dependencies. Adopted deliberately, tradeoff understood.
+  - Topology: YOLO-Pose uses COCO's 17-keypoint topology, not MediaPipe's
+    33-point BlazePose topology — fewer face points, no separate hand/finger
+    or foot/toe landmarks, and critically, no 3D world-space coordinates at
+    all (2D image-plane keypoints only). Every kinematic feature actually
+    computed here only ever needed wrist position (a keypoint COCO-17 still
+    has), so that's unaffected — but FusionEngine's camera yaw/pitch angle
+    computation depended entirely on MediaPipe's 3D world landmarks, and has
+    nothing to compute from now; see core/fusion_engine.py for how that
+    degrades (cleanly, to None, not an error) and its shot-classification
+    landmark remap (COCO-17 also has no foot/toe landmark distinct from
+    ankle, so the LONG/VERY_LONG-vs-MEDIUM_LONG distinction lost a tier).
 """
 
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Optional
 
-import cv2
-import mediapipe as mp
 import numpy as np
 from loguru import logger
+from ultralytics import YOLO
 
 from core.feature_store import FeatureStore
 from core.models import GestureFeatures, GestureFrame, Landmark, PoseKeyframe, TimeWindow
 from core.preprocessing import VideoMeta, frames_for_window
 
-# MediaPipe landmark indices
-_LEFT_WRIST = 15
-_RIGHT_WRIST = 16
+# COCO-17 keypoint indices (Ultralytics YOLO-Pose topology) — different from
+# MediaPipe's 33-point BlazePose topology this file used before switching.
+# Standard COCO order: 0 nose, 1/2 eyes, 3/4 ears, 5/6 shoulders, 7/8 elbows,
+# 9/10 wrists, 11/12 hips, 13/14 knees, 15/16 ankles.
+_LEFT_WRIST = 9
+_RIGHT_WRIST = 10
+_LEFT_HIP = 11
+_RIGHT_HIP = 12
+_NUM_LANDMARKS = 17
+
+# Absolute path (not a bare filename) so the model is found regardless of the
+# process's working directory — Ultralytics otherwise downloads/looks for it
+# relative to CWD, which isn't reliable across how this worker gets started
+# (CLI vs. dashboard vs. tests). Pre-downloaded here in the Dockerfile too.
+_MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "yolo11m-pose.pt"
+_FRAME_CENTER = (0.5, 0.5)
+
+
+def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
 
 
 class GestureWorker:
-    def __init__(self, store: FeatureStore):
+    def __init__(self, store: FeatureStore, conf_threshold: float = 0.5):
         self.store = store
-        self._holistic = mp.solutions.holistic.Holistic(
-            static_image_mode=False,
-            model_complexity=1,
-            smooth_landmarks=True,
-            enable_segmentation=False,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
+        self._conf_threshold = conf_threshold
+        # Unlike MediaPipe's Tasks-API VIDEO mode (which required a fresh
+        # landmarker per video — see git history), plain YOLO .predict()
+        # calls are stateless: no timestamp bookkeeping, no memory carried
+        # between frames. Safe to load once here and reuse across every
+        # video this worker instance ever processes.
+        self._model = YOLO(str(_MODEL_PATH))
 
     def close(self) -> None:
-        self._holistic.close()
+        pass  # no persistent per-video resource to release
 
     def process_job(
         self,
@@ -69,51 +116,68 @@ class GestureWorker:
     ) -> GestureFeatures:
         raw_frames = frames_for_window(meta.path, start_s, end_s, meta.fps)
         gesture_frames: list[GestureFrame] = []
+        # None until the first frame with any detection in this window —
+        # that frame runs the centrality vote; every frame after just tracks
+        # whoever was picked. Reset every window (never carried across
+        # windows), same design as the MediaPipe version before it.
+        ref_pos: Optional[tuple[float, float]] = None
 
         for frame_idx, (ts, bgr) in enumerate(raw_frames):
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            result = self._holistic.process(rgb)
-            gf = self._parse_result(frame_idx, ts, result, meta.width, meta.height)
+            # YOLO's numpy-array input path assumes BGR (OpenCV's native
+            # format) already — confirmed directly (near-identical keypoint
+            # confidence whether fed BGR or a manually-converted RGB copy of
+            # the same frame), so no cv2.cvtColor needed here, unlike the
+            # MediaPipe version.
+            result = self._model(bgr, verbose=False, conf=self._conf_threshold)[0]
+            people = result.keypoints
+            boxes = result.boxes
+
+            if people is None or len(people) == 0:
+                gesture_frames.append(self._empty_frame(frame_idx, ts))
+                continue
+
+            # Bounding-box center (normalised) as the "where is this person"
+            # point — simpler and more robust than averaging hip landmarks,
+            # since it's available even when specific keypoints are occluded.
+            centers = [(float(b[0]), float(b[1])) for b in boxes.xywhn]
+            if ref_pos is None:
+                chosen = min(range(len(centers)), key=lambda i: _dist(centers[i], _FRAME_CENTER))
+            else:
+                chosen = min(range(len(centers)), key=lambda i: _dist(centers[i], ref_pos))
+            ref_pos = centers[chosen]
+
+            xy = people.xy[chosen]
+            conf = people.conf[chosen] if people.conf is not None else None
+            gf = self._build_frame(frame_idx, ts, xy, conf)
             gesture_frames.append(gf)
 
         return self._aggregate(start_s, end_s, gesture_frames, meta.width, meta.height)
 
-    def _parse_result(
-        self,
-        frame_idx: int,
-        ts: float,
-        result,
-        width: int,
-        height: int,
-    ) -> GestureFrame:
-        def to_landmarks(lm_list) -> list[Landmark]:
-            if lm_list is None:
-                return []
-            return [
-                Landmark(
-                    x=lm.x * width,
-                    y=lm.y * height,
-                    z=lm.z,
-                    visibility=getattr(lm, "visibility", 1.0),
-                )
-                for lm in lm_list.landmark
-            ]
-
-        def to_world_landmarks(lm_list) -> list[Landmark]:
-            if lm_list is None:
-                return []
-            return [
-                Landmark(x=lm.x, y=lm.y, z=lm.z, visibility=getattr(lm, "visibility", 1.0))
-                for lm in lm_list.landmark
-            ]
-
+    @staticmethod
+    def _build_frame(frame_idx: int, ts: float, xy, conf) -> GestureFrame:
+        pose = [
+            Landmark(
+                x=float(xy[i][0]),
+                y=float(xy[i][1]),
+                z=0.0,  # no depth/world coordinate from a 2D pose model
+                visibility=float(conf[i]) if conf is not None else 1.0,
+            )
+            for i in range(len(xy))
+        ]
         return GestureFrame(
             frame_idx=frame_idx,
             timestamp_s=ts,
-            pose=to_landmarks(result.pose_landmarks),
-            left_hand=to_landmarks(result.left_hand_landmarks),
-            right_hand=to_landmarks(result.right_hand_landmarks),
-            pose_world=to_world_landmarks(result.pose_world_landmarks),
+            pose=pose,
+            left_hand=[],
+            right_hand=[],
+            pose_world=[],  # YOLO-Pose has no 3D world-space output at all
+        )
+
+    @staticmethod
+    def _empty_frame(frame_idx: int, ts: float) -> GestureFrame:
+        return GestureFrame(
+            frame_idx=frame_idx, timestamp_s=ts,
+            pose=[], left_hand=[], right_hand=[], pose_world=[],
         )
 
     def _aggregate(
@@ -126,9 +190,9 @@ class GestureWorker:
     ) -> GestureFeatures:
         window = TimeWindow(start_s=start_s, end_s=end_s)
 
-        # Require at least 33 landmarks (full MediaPipe pose) so all
-        # landmark index accesses are safe
-        pose_present = [f for f in frames if len(f.pose) >= 33]
+        # Require the full COCO-17 keypoint set so all landmark index
+        # accesses below are safe.
+        pose_present = [f for f in frames if len(f.pose) >= _NUM_LANDMARKS]
         pose_present_ratio = len(pose_present) / max(len(frames), 1)
 
         if not pose_present:
@@ -198,9 +262,9 @@ class GestureWorker:
         keyframes = []
         for i in range(0, len(frames), step):
             f = frames[i]
-            if len(f.pose) < 33:
+            if len(f.pose) < _NUM_LANDMARKS:
                 continue
-            has_world = len(f.pose_world) == 33
+            has_world = len(f.pose_world) == _NUM_LANDMARKS
             keyframes.append(PoseKeyframe(
                 ts=f.timestamp_s,
                 pose_x=[lm.x / width for lm in f.pose],
@@ -263,5 +327,3 @@ class GestureWorker:
         xs = [p[0] for p in valid]
         ys = [p[1] for p in valid]
         return math.sqrt((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2)
-
-

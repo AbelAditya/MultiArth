@@ -3,3 +3,7 @@ __pycache__
 .env
 labels.py
 dep_labels.txt
+
+# Downloaded model weights (pre-fetched in the Dockerfile instead — see
+# workers/gesture_worker.py's _MODEL_PATH) — large binaries, not source.
+models/

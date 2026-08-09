@@ -50,6 +50,12 @@ from faster_whisper import WhisperModel
 WhisperModel("small", device="cpu", compute_type="int8")
 EOF
 
+# Pre-download YOLO-Pose model (see workers/gesture_worker.py's _MODEL_PATH)
+RUN mkdir -p /app/models && python - <<'EOF'
+from ultralytics import YOLO
+YOLO("/app/models/yolo11m-pose.pt")
+EOF
+
 # Copy application code
 COPY . .
 
