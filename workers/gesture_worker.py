@@ -1,48 +1,151 @@
 """
 workers/gesture_worker.py
 --------------------------
-MediaPipe Holistic worker.
+MeTRAbs worker — metric-scale absolute 3D multi-person pose estimation with
+speaker selection.
 
 For each time window it:
-  1. Reads frames from the video
-  2. Runs MediaPipe Holistic to extract pose + hand landmarks
-  3. Computes kinematic features (velocity, amplitude, symmetry, etc.)
-  4. Stores a GestureFeatures record in the FeatureStore
+  1. Reads frames from the video for that window
+  2. Runs MeTRAbs (multi-person, 19-keypoint "coco_19" skeleton, absolute
+     3D world-space coordinates in mm) on every frame
+  3. Selects which detected person is "the subject": most-central-to-frame
+     (by detection-box center) at the first frame of the window (voted
+     once), then nearest-to-last-known-position for the rest of the window
+     — no re-vote until the next window starts. Deliberately no "is this
+     still plausibly the same person" ambiguity guard yet (e.g. a
+     max-distance cutoff) — that's held off until there's enough real
+     multi-person test data to decide whether it's actually needed. Same
+     design as the RTMPose version before it, just tracking the detector's
+     own box center instead of a keypoint-derived centroid (MeTRAbs already
+     hands back a box per person, so there's no need to compute one).
+  4. Computes kinematic features (velocity, amplitude, symmetry, etc.) from
+     only the selected person's landmarks — everyone else detected in a
+     frame is discarded before a GestureFrame is ever built, so nothing
+     downstream (FusionEngine, the dashboard) needs to know multiple people
+     were ever in frame.
+
+Switched from RTMPose (via rtmlib) after RTMPose turned out to be strictly
+2D — FusionEngine's camera yaw/pitch computation had nothing to work with
+and permanently returned None. Chosen after researching alternatives:
+  - MediaPipe's own multi-person Tasks API does give 3D world landmarks, but
+    re-uses the same underlying model whose accuracy was the original
+    reason for moving off MediaPipe in the first place.
+  - NLF (NeurIPS'24, a newer relative of MeTRAbs, reportedly even more
+    accurate) has MIT-licensed code but noncommercial-research-only
+    pretrained weights — ruled out the same way YOLO-Pose's AGPL-3.0 was.
+  - MeTRAbs: MIT license (code and weights both), natively multi-person
+    with absolute metric-scale 3D output, and — per an independent 2025
+    study benchmarking 16 pose frameworks head-to-head (MediaPipe, rtmlib,
+    YOLOv8, MMPose, ViTPose, etc.) — the single highest-accuracy performer
+    overall, with MediaPipe notably absent from the top tier.
+
+**Runs isolated in its own subprocess, not in the dashboard's main
+process** — see `workers/gesture_subprocess.py` and
+`core/orchestrator.py`. TensorFlow's memory allocator doesn't reliably
+release memory back to the OS even after the Python model object is
+deleted and `gc.collect()` is run (a well-documented TF behavior, not
+specific to this project) — so simply avoiding eager construction in
+`Orchestrator.__init__` wouldn't be enough on its own to keep MeTRAbs from
+staying resident indefinitely across jobs. Running it as a subprocess that
+fully exits after each job is what actually guarantees the OS reclaims its
+memory, at the cost of paying the ~15-22s model-load time on every job
+instead of once. `Orchestrator` also deliberately runs gesture's subprocess
+*after*, not concurrently with, the other three workers — isolation alone
+only guarantees memory gets released *afterward*; it says nothing about
+whether it was the only heavy thing running *at the time*, which is what
+actually caused the crashes (MeTRAbs's own footprint compounding with
+Whisper/prosody/camera all active via the same `ThreadPoolExecutor` batch).
+
+Loaded as a standalone TensorFlow SavedModel (not the training codebase,
+not tensorflow-hub) — see `_MODEL_DIR` below and the Dockerfile for how the
+model file gets there. Plain `tensorflow` on PyPI is CPU-only by default
+and, unlike plain `torch`, doesn't pull in a CUDA toolkit.
+
+Two real tradeoffs from the RTMPose->MeTRAbs switch, both worth knowing
+about:
+
+  - No per-joint confidence: unlike RTMPose/MediaPipe, MeTRAbs's
+    `detect_poses` returns only a per-*person* detection-box confidence —
+    no per-keypoint score, occlusion flag, or uncertainty at all (confirmed
+    against the model directly, not just docs). It always estimates a
+    plausible position for all 19 joints per detected person, including
+    ones that are occluded or entirely outside the frame (e.g. cropped-off
+    legs), extrapolated from its learned body-shape prior. In place of a
+    real confidence value, every landmark here gets a pseudo-visibility of
+    1.0 if its 2D projection lands inside the actual frame bounds, else
+    0.0 — good enough for the existing visibility-threshold logic
+    downstream (shot classification, wrist-motion filtering), but it's an
+    in-frame check, not a real confidence estimate.
+  - Speed/footprint: uses `metrabs_mob3s_y4t` — MobileNetV3-Small backbone
+    *and* YOLOv4-tiny as the person detector, not full YOLOv4. The detector
+    dominates total model size far more than the pose backbone does
+    (confirmed: `mob3s_y4` vs `mob3l_y4`, a backbone jump, changes the
+    download by <5%; swapping to the `t`-suffixed detector shrinks it 8x,
+    248MB -> 31MB). Real tradeoff, per MeTRAbs's own published numbers:
+    worse multi-person detection accuracy (MuPoTS PCK 81.0 vs 86.6) than
+    full YOLOv4 — acceptable here since this pipeline only needs the
+    detector to reliably find *the* subject, not exhaustively catalog
+    everyone in frame.
 """
 
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Optional
 
 import cv2
-import mediapipe as mp
 import numpy as np
+import tensorflow as tf
 from loguru import logger
 
 from core.feature_store import FeatureStore
 from core.models import GestureFeatures, GestureFrame, Landmark, PoseKeyframe, TimeWindow
 from core.preprocessing import VideoMeta, frames_for_window
 
-# MediaPipe landmark indices
-_LEFT_WRIST = 15
-_RIGHT_WRIST = 16
+# MeTRAbs "coco_19" skeleton joint order — verified directly against the
+# model's own `per_skeleton_joint_names['coco_19']` output (there's no
+# authoritative public spec for this ordering other than the model itself):
+#   0 neck, 1 nose, 2 pelvis, 3 l_shoulder, 4 l_elbow, 5 l_wrist, 6 l_hip,
+#   7 l_knee, 8 l_ankle, 9 r_shoulder, 10 r_elbow, 11 r_wrist, 12 r_hip,
+#   13 r_knee, 14 r_ankle, 15 l_eye, 16 l_ear, 17 r_eye, 18 r_ear
+# This has real structure MediaPipe/COCO-17 didn't give us in one topology:
+# both a neck AND a pelvis point, useful as stable torso anchors.
+_SKELETON = "coco_19"
+_NUM_LANDMARKS = 19
+_LEFT_WRIST = 5
+_RIGHT_WRIST = 11
+_LEFT_HIP = 6
+_RIGHT_HIP = 12
+
+_MODEL_DIR = Path(__file__).resolve().parent.parent / "models" / "metrabs_mob3s_y4t"
+_MODEL_URL = "https://omnomnom.vision.rwth-aachen.de/data/metrabs/metrabs_mob3s_y4t.zip"
+
+_FRAME_CENTER = (0.5, 0.5)
+_DEFAULT_FOV_DEGREES = 55.0  # MeTRAbs's own default; used when no camera
+# intrinsics are known, which is always true here (arbitrary source videos).
+
+
+def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
 
 
 class GestureWorker:
     def __init__(self, store: FeatureStore):
         self.store = store
-        self._holistic = mp.solutions.holistic.Holistic(
-            static_image_mode=False,
-            model_complexity=1,
-            smooth_landmarks=True,
-            enable_segmentation=False,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
+        if not _MODEL_DIR.exists():
+            raise FileNotFoundError(
+                f"MeTRAbs model not found at {_MODEL_DIR}. Download it with:\n"
+                f"  curl -L -o /tmp/metrabs.zip {_MODEL_URL}\n"
+                f"  unzip /tmp/metrabs.zip -d {_MODEL_DIR.parent}\n"
+                "(the Dockerfile does this automatically at build time)"
+            )
+        self._model = tf.saved_model.load(str(_MODEL_DIR))
 
     def close(self) -> None:
-        self._holistic.close()
+        pass  # no persistent per-video resource to release; the subprocess
+        # this worker runs in (see module docstring) is what actually
+        # reclaims TensorFlow's memory, by exiting entirely after the job.
 
     def process_job(
         self,
@@ -69,51 +172,82 @@ class GestureWorker:
     ) -> GestureFeatures:
         raw_frames = frames_for_window(meta.path, start_s, end_s, meta.fps)
         gesture_frames: list[GestureFrame] = []
+        # None until the first frame with any detection in this window —
+        # that frame runs the centrality vote; every frame after just tracks
+        # whoever was picked. Reset every window (never carried across
+        # windows), same design as the RTMPose/MediaPipe-multi-person
+        # versions before it.
+        ref_pos: Optional[tuple[float, float]] = None
 
         for frame_idx, (ts, bgr) in enumerate(raw_frames):
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            result = self._holistic.process(rgb)
-            gf = self._parse_result(frame_idx, ts, result, meta.width, meta.height)
+            image = tf.constant(rgb, dtype=tf.uint8)
+            pred = self._model.detect_poses(
+                image, skeleton=_SKELETON, default_fov_degrees=_DEFAULT_FOV_DEGREES
+            )
+            boxes = pred["boxes"].numpy()
+
+            if len(boxes) == 0:
+                gesture_frames.append(self._empty_frame(frame_idx, ts))
+                continue
+
+            poses2d = pred["poses2d"].numpy()
+            poses3d = pred["poses3d"].numpy()
+
+            centers = [self._box_center(b, meta.width, meta.height) for b in boxes]
+            if ref_pos is None:
+                chosen = min(range(len(centers)), key=lambda i: _dist(centers[i], _FRAME_CENTER))
+            else:
+                chosen = min(range(len(centers)), key=lambda i: _dist(centers[i], ref_pos))
+            ref_pos = centers[chosen]
+
+            gf = self._build_frame(
+                frame_idx, ts, poses2d[chosen], poses3d[chosen], meta.width, meta.height
+            )
             gesture_frames.append(gf)
 
         return self._aggregate(start_s, end_s, gesture_frames, meta.width, meta.height)
 
-    def _parse_result(
-        self,
+    @staticmethod
+    def _box_center(box: np.ndarray, width: int, height: int) -> tuple[float, float]:
+        """Detection box is [x, y, w, h, confidence] in pixel coords."""
+        x, y, w, h = box[0], box[1], box[2], box[3]
+        return ((x + w / 2.0) / width, (y + h / 2.0) / height)
+
+    @staticmethod
+    def _build_frame(
         frame_idx: int,
         ts: float,
-        result,
+        xy2d: np.ndarray,
+        xyz3d: np.ndarray,
         width: int,
         height: int,
     ) -> GestureFrame:
-        def to_landmarks(lm_list) -> list[Landmark]:
-            if lm_list is None:
-                return []
-            return [
-                Landmark(
-                    x=lm.x * width,
-                    y=lm.y * height,
-                    z=lm.z,
-                    visibility=getattr(lm, "visibility", 1.0),
-                )
-                for lm in lm_list.landmark
-            ]
-
-        def to_world_landmarks(lm_list) -> list[Landmark]:
-            if lm_list is None:
-                return []
-            return [
-                Landmark(x=lm.x, y=lm.y, z=lm.z, visibility=getattr(lm, "visibility", 1.0))
-                for lm in lm_list.landmark
-            ]
-
+        # No native per-joint confidence (see module docstring) — a joint
+        # counts as "visible" here if its 2D projection actually lands
+        # inside the frame, not extrapolated off-screen from occlusion.
+        pose = []
+        pose_world = []
+        for i in range(_NUM_LANDMARKS):
+            x2, y2 = float(xy2d[i][0]), float(xy2d[i][1])
+            vis = 1.0 if (0.0 <= x2 < width and 0.0 <= y2 < height) else 0.0
+            pose.append(Landmark(x=x2, y=y2, z=0.0, visibility=vis))
+            x3, y3, z3 = float(xyz3d[i][0]), float(xyz3d[i][1]), float(xyz3d[i][2])
+            pose_world.append(Landmark(x=x3, y=y3, z=z3, visibility=vis))
         return GestureFrame(
             frame_idx=frame_idx,
             timestamp_s=ts,
-            pose=to_landmarks(result.pose_landmarks),
-            left_hand=to_landmarks(result.left_hand_landmarks),
-            right_hand=to_landmarks(result.right_hand_landmarks),
-            pose_world=to_world_landmarks(result.pose_world_landmarks),
+            pose=pose,
+            left_hand=[],
+            right_hand=[],
+            pose_world=pose_world,
+        )
+
+    @staticmethod
+    def _empty_frame(frame_idx: int, ts: float) -> GestureFrame:
+        return GestureFrame(
+            frame_idx=frame_idx, timestamp_s=ts,
+            pose=[], left_hand=[], right_hand=[], pose_world=[],
         )
 
     def _aggregate(
@@ -126,9 +260,11 @@ class GestureWorker:
     ) -> GestureFeatures:
         window = TimeWindow(start_s=start_s, end_s=end_s)
 
-        # Require at least 33 landmarks (full MediaPipe pose) so all
-        # landmark index accesses are safe
-        pose_present = [f for f in frames if len(f.pose) >= 33]
+        # Require the full 19-keypoint set so all landmark index accesses
+        # below are safe. MeTRAbs always returns all 19 for a detected
+        # person (see module docstring), so in practice this is equivalent
+        # to "was anyone detected at all this frame".
+        pose_present = [f for f in frames if len(f.pose) >= _NUM_LANDMARKS]
         pose_present_ratio = len(pose_present) / max(len(frames), 1)
 
         if not pose_present:
@@ -198,9 +334,9 @@ class GestureWorker:
         keyframes = []
         for i in range(0, len(frames), step):
             f = frames[i]
-            if len(f.pose) < 33:
+            if len(f.pose) < _NUM_LANDMARKS:
                 continue
-            has_world = len(f.pose_world) == 33
+            has_world = len(f.pose_world) == _NUM_LANDMARKS
             keyframes.append(PoseKeyframe(
                 ts=f.timestamp_s,
                 pose_x=[lm.x / width for lm in f.pose],
@@ -263,5 +399,3 @@ class GestureWorker:
         xs = [p[0] for p in valid]
         ys = [p[1] for p in valid]
         return math.sqrt((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2)
-
-

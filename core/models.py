@@ -31,7 +31,7 @@ class TimeWindow(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Gesture features  (MediaPipe)
+# Gesture features  (MeTRAbs — coco_19 skeleton; see workers/gesture_worker.py)
 # ---------------------------------------------------------------------------
 
 class Landmark(BaseModel):
@@ -42,24 +42,24 @@ class Landmark(BaseModel):
 
 
 class GestureFrame(BaseModel):
-    """Pose + hand keypoints for a single frame."""
+    """Pose keypoints for a single frame."""
     frame_idx: int
     timestamp_s: float
-    pose: list[Landmark]          # 33 MediaPipe pose landmarks (image-space pixels)
-    left_hand: list[Landmark]     # 21 landmarks, empty list if not detected
-    right_hand: list[Landmark]    # 21 landmarks, empty list if not detected
-    pose_world: list[Landmark] = Field(default_factory=list)  # 33 metric world-space coords
+    pose: list[Landmark]          # 19 MeTRAbs coco_19 landmarks (image-space pixels)
+    left_hand: list[Landmark]     # unused (no hand-keypoint model in the current pipeline)
+    right_hand: list[Landmark]    # unused (no hand-keypoint model in the current pipeline)
+    pose_world: list[Landmark] = Field(default_factory=list)  # 19 metric world-space coords (mm)
 
 
 class PoseKeyframe(BaseModel):
     """Lightweight normalised pose snapshot for the timeline animation viewer."""
     ts: float                  # timestamp in seconds
-    pose_x: list[float]        # 33 normalised x-coords [0, 1]
-    pose_y: list[float]        # 33 normalised y-coords, already flipped (1 − raw_y) so up = high
-    pose_vis: list[float]      # 33 visibility scores
-    world_x: Optional[list[float]] = None  # 33 metric world x-coords (right positive)
-    world_y: Optional[list[float]] = None  # 33 metric world y-coords (down positive)
-    world_z: Optional[list[float]] = None  # 33 metric world z-coords (toward camera positive)
+    pose_x: list[float]        # 19 normalised x-coords [0, 1]
+    pose_y: list[float]        # 19 normalised y-coords, already flipped (1 − raw_y) so up = high
+    pose_vis: list[float]      # 19 pseudo-visibility flags (0.0/1.0 — see gesture_worker.py)
+    world_x: Optional[list[float]] = None  # 19 metric world x-coords, mm (right positive)
+    world_y: Optional[list[float]] = None  # 19 metric world y-coords, mm (down positive)
+    world_z: Optional[list[float]] = None  # 19 metric world z-coords, mm (away from camera positive)
 
 
 class GestureFeatures(BaseModel):

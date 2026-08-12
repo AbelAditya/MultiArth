@@ -125,10 +125,12 @@ class BulkOrchestrator:
         summary = {"succeeded": [], "skipped": [], "failed": []}
         total = len(entries)
 
-        # One Orchestrator (and its workers — MediaPipe Holistic, the Whisper
+        # One Orchestrator (and its in-process workers' models — the Whisper
         # model, the Haar cascade, spaCy's per-language cache) for the whole
         # manifest, reused across every video, instead of reloading these
-        # models from scratch for each one.
+        # from scratch for each one. Gesture (MeTRAbs) is the exception —
+        # Orchestrator.analyze() runs it in a fresh subprocess per video
+        # regardless (see core/orchestrator.py), so it gets no such reuse.
         orchestrator = Orchestrator(store=self.store, **self.orchestrator_kwargs)
         try:
             for index, entry in enumerate(entries, start=1):
