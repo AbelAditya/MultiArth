@@ -6,8 +6,41 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     # Video / vision
-    "mediapipe==0.10.9",
+    # MeTRAbs — metric-scale absolute 3D multi-person pose estimation for
+    # GestureWorker (loaded as a standalone TensorFlow SavedModel, not via
+    # the training codebase). Replaced RTMPose (via rtmlib) because RTMPose
+    # is 2D-only, leaving FusionEngine's camera yaw/pitch angle computation
+    # permanently starved of input; MeTRAbs natively outputs per-person 3D
+    # world-space coordinates (mm), and an independent 16-framework
+    # benchmark study found it the single highest-accuracy performer
+    # overall. MIT licensed — both code and pretrained weights — unlike
+    # YOLO-Pose (AGPL-3.0) and NLF (noncommercial-research-only weights).
+    # Plain `tensorflow` on PyPI is CPU-only by default and pulls no CUDA
+    # packages (unlike plain `torch`) — confirmed via a clean install.
+    #
+    # MeTRAbs's TensorFlow runtime is too heavy to run inside the main
+    # dashboard process alongside everything else — crashed a 15GB-RAM dev
+    # laptop twice before this was understood. It now runs in an isolated
+    # subprocess, per-job, that fully exits when done (see
+    # workers/gesture_subprocess.py, core/orchestrator.py) — TensorFlow's
+    # allocator doesn't reliably release memory back to the OS otherwise,
+    # even after deleting the model object. The main dashboard process
+    # never imports tensorflow at all.
+    #
+    # The actual pretrained model file is downloaded separately (see
+    # Dockerfile / workers/gesture_worker.py) and loaded directly with
+    # `tf.saved_model.load()` — no `tensorflow-hub` dependency needed.
+    "tensorflow>=2.16",
     "scenedetect>=0.6.3",
+    # opencv-contrib-python (not plain opencv-python) — camera_worker.py
+    # needs its Haar cascade data (cv2.data.haarcascades), which plain
+    # opencv-python doesn't ship. Used to arrive transitively via rtmlib;
+    # now that MeTRAbs (TensorFlow-based) replaced it, nothing else in the
+    # dependency tree pulls this in, so it needs to be explicit. The
+    # Dockerfile additionally force-reinstalls this exact version after
+    # `uv sync` to deterministically win the site-packages/cv2/ file merge
+    # against scenedetect's opencv-python — see the comment there.
+    "opencv-contrib-python==4.13.0.92",
     # Audio / prosody
     "praat-parselmouth>=0.4.3",
     "soundfile>=0.12.1",

@@ -3,3 +3,6 @@ __pycache__
 .env
 labels.py
 dep_labels.txt
+# Downloaded MeTRAbs SavedModel (see workers/gesture_worker.py / Dockerfile)
+models/
+*.rdb
