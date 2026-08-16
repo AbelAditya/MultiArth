@@ -80,9 +80,12 @@ A YAML or JSON list of entries. Every entry needs `collection`, and **either**
 
 ## What happens behind the scenes
 
-- Videos are processed **one at a time**, reusing one set of loaded models
-  (MediaPipe, Whisper, spaCy) across the whole manifest rather than reloading
-  them per video.
+- Videos are processed **one at a time**, reusing loaded models across the
+  whole manifest rather than reloading them per video — Whisper and spaCy
+  stay loaded in-process, and MeTRAbs (gesture/pose) is kept warm in a
+  separate persistent server process for the whole batch instead of
+  reloading per video — see [Gesture-Worker.md](Gesture-Worker.md)'s "Bulk
+  runs" section.
 - A video downloaded automatically from `drive_url` is **always** deleted
   locally afterward, whether that video succeeded or failed — the durable
   copy is Drive, so there's no reason to keep a local copy around either way.

@@ -24,20 +24,38 @@ writes its output to a shared Redis [`FeatureStore`](../core/feature_store.py).
 > main [README](../README.md) for the full history of the **MultiArth**
 > rebrand.
 
+## Remote workers (optional)
+
+Two workers can offload their heaviest model to a free Colab GPU instead of
+running it on the machine hosting this project — see each worker's own wiki
+page ("Remote MeTRAbs, local fallback" / the SenseVoice remote section) for
+the full design:
+
+| Notebook | Hosts | Env vars |
+|---|---|---|
+| [`colab/gesture_server.ipynb`](../colab/gesture_server.ipynb) | MeTRAbs (pose) | `GESTURE_REMOTE_URL`, `GESTURE_API_KEY` |
+| [`colab/sensevoice_server.ipynb`](../colab/sensevoice_server.ipynb) | SenseVoice (Chinese ASR) | `SENSEVOICE_REMOTE_URL`, `SENSEVOICE_API_KEY` |
+
 ## Full dependency list
 
 All package versions are pinned in [`pyproject.toml`](../pyproject.toml).
 
 | Package | Used by | Docs |
 |---|---|---|
-| [mediapipe](https://pypi.org/project/mediapipe/) | Gesture | https://ai.google.dev/edge/mediapipe/solutions/vision/holistic_landmarker |
-| [opencv-python](https://pypi.org/project/opencv-python/) | Gesture, Camera | https://docs.opencv.org/4.x/ |
+| [tensorflow](https://pypi.org/project/tensorflow/) | Gesture (MeTRAbs) | https://www.tensorflow.org/api_docs |
+| [fastapi](https://pypi.org/project/fastapi/) / [uvicorn](https://pypi.org/project/uvicorn/) | Gesture (`gesture_server.py`, bulk runs) | https://fastapi.tiangolo.com/ · https://www.uvicorn.org/ |
+| [opencv-contrib-python](https://pypi.org/project/opencv-contrib-python/) | Gesture, Camera | https://docs.opencv.org/4.x/ |
 | [praat-parselmouth](https://pypi.org/project/praat-parselmouth/) | Acoustic/Prosody | https://parselmouth.readthedocs.io/en/stable/ |
 | [soundfile](https://pypi.org/project/soundfile/) | Acoustic/Prosody, preprocessing | https://python-soundfile.readthedocs.io/en/latest/ |
 | [faster-whisper](https://pypi.org/project/faster-whisper/) | Verbal | https://github.com/SYSTRAN/faster-whisper#readme |
+| [funasr](https://pypi.org/project/funasr/) | Verbal (SenseVoice, Chinese) | https://github.com/modelscope/FunASR#readme |
+| [torch](https://pypi.org/project/torch/) / [torchaudio](https://pypi.org/project/torchaudio/) | Verbal (funasr/SenseVoice backend) | https://pytorch.org/docs/stable/index.html |
+| [modelscope](https://pypi.org/project/modelscope/) | Verbal (SenseVoice model hub) | https://www.modelscope.cn/docs |
+| [requests](https://pypi.org/project/requests/) | Gesture + Verbal remote HTTP clients | https://requests.readthedocs.io/en/latest/ |
 | [spacy](https://pypi.org/project/spacy/) | Verbal | https://spacy.io/api |
 | [scenedetect](https://pypi.org/project/scenedetect/) | Camera | https://www.scenedetect.com/docs/latest/api.html |
 | [redis](https://pypi.org/project/redis/) | Feature store (all workers) | https://redis-py.readthedocs.io/en/stable/ |
+| [pymongo](https://pypi.org/project/pymongo/) | Durable results store (Browse Corpus, bulk runs) | https://pymongo.readthedocs.io/en/stable/ |
 | [numpy](https://pypi.org/project/numpy/) | Gesture, Acoustic/Prosody, Camera | https://numpy.org/doc/stable/ |
 | [pandas](https://pypi.org/project/pandas/) | Fusion / dashboard | https://pandas.pydata.org/docs/ |
 | [scipy](https://pypi.org/project/scipy/) | Fusion / signal helpers | https://docs.scipy.org/doc/scipy/ |

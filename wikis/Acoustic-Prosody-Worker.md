@@ -45,6 +45,42 @@ All three outputs are written to the [`FeatureStore`](../core/feature_store.py)
   failure in one doesn't prevent the other (or per-window features) from
   being stored.
 
+## Benchmark accuracy (published)
+
+Praat's pitch tracker (an autocorrelation method) doesn't have a single
+universally-cited "accuracy" figure the way a benchmark-trained model
+does — F0-extraction accuracy studies vary in which error metric they
+report (gross pitch error, frame F0 error, cents accuracy, voicing-decision
+F1) and which algorithms they compare against, and results shift with
+recording conditions. The general, consistent picture across the
+literature checked:
+
+- A recent (2025) comparative study under **clean** recording conditions
+  found Praat's autocorrelation method achieved the **highest F1 score
+  (93.63%)** among the algorithms tested for voicing decisions, competitive
+  with newer methods on raw accuracy — but noted it "makes more octave
+  errors" (mistaking a pitch for double/half its true value) than some
+  alternatives; a newer algorithm in the same study (SwiftF0) reported
+  slightly higher cents-accuracy (94.98%) and gross-error accuracy (97.04%).
+- Older comparative work found Praat's autocorrelation method performing
+  **slightly worse than YIN and RAPT** (two other established pitch-
+  tracking algorithms) in some evaluations, while a separate, more recent
+  evaluation found it among the better performers in its test set (~5.05%
+  average Frame F0 Error across 20 speakers).
+
+Net picture: Praat's F0 tracker is a well-established, competitive (not
+clearly best-in-class) choice under clean speech conditions — reasonable
+for this project's use case (windowed pitch/intensity statistics over
+whole video clips, not fine-grained per-sample F0 curves used for anything
+downstream-sensitive to occasional octave errors).
+
+Sources: ["SwiftF0: Fast and Accurate Monophonic Pitch
+Detection"](https://arxiv.org/pdf/2508.18440) (2025 comparative benchmark);
+["Today's Most Frequently Used F0 Estimation Methods, and Their Accuracy in
+Estimating Male and Female Pitch in Clean
+Speech"](https://www.researchgate.net/publication/307888988) (YIN/RAPT
+comparison).
+
 ## Package documentation
 
 | Package | Role | Docs |

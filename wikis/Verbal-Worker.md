@@ -197,6 +197,39 @@ lexical statistics with **spaCy**.
   worker falls back to raw word counts and skips collocation extraction
   rather than failing the job.
 
+## Benchmark accuracy (published)
+
+The two ASR engines this worker actually routes between — Whisper **small**
+(the `model_size` default; both the `WhisperModel` used everywhere and the
+`faster-whisper` reimplementation of it, which doesn't change accuracy)
+and **SenseVoice-Small** — have a direct, published head-to-head comparison
+from SenseVoice's own paper (Table 6, FunAudioLLM). This is the same
+comparison that motivated adopting SenseVoice for Chinese specifically (see
+"What it does" above), now with the actual published numbers behind the
+qualitative side-by-side test that originally motivated it:
+
+| Benchmark | Metric | SenseVoice-Small | Whisper-small |
+|---|---|---|---|
+| AISHELL-1 test | CER | **2.96%** | 10.04% |
+| AISHELL-2 test_ios | CER | **3.80%** | 8.78% |
+| WenetSpeech test_meeting | CER | **7.44%** | 25.62% |
+| WenetSpeech test_net | CER | **7.84%** | 16.66% |
+| Common Voice zh-CN | CER | **10.78%** | 19.60% |
+| Common Voice en | WER | 14.71% | **14.85%** (~tied) |
+| LibriSpeech test-clean | WER | 3.15% | **3.13%** (~tied) |
+
+The pattern matches this worker's own routing logic exactly: SenseVoice
+wins by a wide, consistent margin on every **Chinese** benchmark (roughly
+2-3.5x lower error rate), while the two are essentially tied on the
+**English** benchmarks (Common Voice `en`, LibriSpeech) — which is exactly
+why `_ALT_ASR_LANGS` only routes `zh` to SenseVoice and leaves English (and
+every other language) on Whisper: there's no published accuracy case for
+switching English away from Whisper, only for Chinese.
+
+Source: [FunAudioLLM: Voice Understanding and Generation Foundation Models
+for Natural Interaction Between Humans and
+LLMs](https://arxiv.org/html/2407.04051v1), Table 6.
+
 ## Package documentation
 
 | Package | Role | Docs |

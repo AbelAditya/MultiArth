@@ -29,7 +29,7 @@ framing/zoom over time.
    - `dominant_shot_type` is left as `ShotType.UNKNOWN` here — actual shot
      classification (extreme close-up → very long) as well as
      `horizontal_angle`/`vertical_angle` (shoulder yaw / face pitch) are
-     computed later in the `FusionEngine` using MediaPipe pose keypoints
+     computed later in the `FusionEngine` using MeTRAbs pose keypoints
      from the Gesture worker, which give finer-grained framing information
      than face detection alone.
 
@@ -37,9 +37,44 @@ framing/zoom over time.
 
 - The Haar cascade is a fast, GPU-free, but low-accuracy face detector; the
   module docstring notes it as a stand-in and recommends a deep-learning
-  detector (e.g. RetinaFace via `insightface`) for production accuracy.
+  detector (e.g. RetinaFace via `insightface`) for production accuracy —
+  see "Benchmark accuracy" below for how much of a gap that actually is.
 - Only the **largest** detected face per frame is used for the area/trend
   calculations, to avoid background faces skewing the zoom proxy.
+
+## Benchmark accuracy (published)
+
+`haarcascade_frontalface_default.xml` is the classic Viola-Jones detector
+(2001) — hand-crafted features, not a trained deep-learning model, and its
+accuracy on standard face-detection benchmarks reflects that age gap
+clearly:
+
+| Detector | Benchmark | Reported accuracy |
+|---|---|---|
+| Haar cascade (Viola-Jones), OpenCV implementation | FDDB | ~67% precision / 0.67 positive-detection rate in one direct evaluation; other studies report anywhere from ~34% to ~94% depending on how "accuracy" is defined and how challenging the test images are (lighting, angle, occlusion) |
+| RetinaFace (the module docstring's suggested replacement) | FDDB / WIDER FACE | Consistently reported as substantially ahead of Haar cascade and other classical/lightweight detectors across every comparative study checked — one head-to-head put Haar cascade at 34% vs. RetinaFace at 65% on the same evaluation set |
+
+The wide spread in Haar cascade's own numbers across studies isn't
+inconsistency in the citation — it's a real property of the algorithm:
+unlike a benchmark-trained deep model, its accuracy swings hard with
+lighting/pose/occlusion conditions in the specific test images used, which
+is exactly why `_process_window` here only ever uses it as a coarse zoom
+proxy (largest detected face's bounding-box area) rather than for anything
+requiring reliable detection of *every* face in frame.
+
+Sources: ["Evaluation of Human and Machine Face Detection using a Novel
+Distinctive Human Appearance
+Dataset"](https://arxiv.org/pdf/2111.00660) (FDDB precision figure);
+["Comparative Analysis of Multi-Face Detection Methods in Classroom
+Environments"](https://ieeexplore.ieee.org/document/10823781/) (Haar vs.
+RetinaFace head-to-head); [RetinaFace paper](https://arxiv.org/abs/1905.00641).
+
+**PySceneDetect's `ContentDetector`** (the other detector this worker uses,
+for scene cuts) doesn't have a comparable published benchmark table — it's
+a threshold-based heuristic over HSV colour-space frame-to-frame
+difference, not a trained model evaluated against a labelled dataset, so
+"accuracy on public benchmarks" isn't a meaningful framing for it the way
+it is for the face detector.
 
 ## Package documentation
 

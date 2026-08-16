@@ -131,10 +131,11 @@ Two real, current tradeoffs worth knowing about:
   RSS for a full window down to ~2.7GB and roughly halved per-window
   processing time, with detection output looking equivalent on the
   (single-subject) test videos tried so far. Real tradeoff, per MeTRAbs's
-  own published numbers: worse multi-person detection accuracy (MuPoTS PCK
-  81.0 vs 86.6) — acceptable here since this pipeline only needs the
-  detector to reliably find *the* subject, not exhaustively catalog
-  everyone in frame, but worth revisiting if that stops being true.
+  own published numbers: worse multi-person detection accuracy (MuPoTS
+  PCK@150mm 76.8 vs 81.8 — see "Benchmark accuracy" below) — acceptable
+  here since this pipeline only needs the detector to reliably find *the*
+  subject, not exhaustively catalog everyone in frame, but worth
+  revisiting if that stops being true.
   Larger backbones (EfficientNetV2-based, up to `eff2l`) exist for more
   accuracy at more cost, but backbone was never really the lever that
   mattered here — see `docs/MODELS_6_DATASETS.md` in the MeTRAbs repo.
@@ -219,6 +220,25 @@ fresh spawn-per-job subprocess pays MeTRAbs's ~15-22s model-load time on
 for single-video jobs. See the next section for how bulk runs avoid paying
 that cost per video while keeping the same reclaim-on-exit guarantee.
 
+**Logs stream live, not in one dump at the end.** `Orchestrator._run_gesture_isolated`
+uses `Popen` with a piped stdout/stderr, reading and re-logging each line
+as the subprocess produces it (`for line in process.stdout: logger.info(...)`),
+rather than `subprocess.run(..., capture_output=True)` — that call is fully
+blocking and only hands back output once the whole subprocess has already
+exited, so nothing would be visible while a job is running, only a dump
+afterward. Matters in practice for actually seeing, live, whether a given
+job ran locally or hit remote MeTRAbs successfully (see "Remote MeTRAbs"
+below) — `subprocess.run`'s capture used to silently swallow that on the
+(common) success path entirely, only printing it on failure. Getting real
+streaming also needed the child's own invocation to include `-u`
+(`python -u -m workers.gesture_subprocess ...`) — Python block-buffers
+stdout by default when it isn't an interactive terminal (a pipe never is),
+so without it the child would sit on its own output internally regardless
+of how promptly the parent reads its end of the pipe. Verified directly:
+timestamped log lines arrive progressively across a job's real runtime
+(model load at t≈2.5s, window completions spread across the full ~100s a
+job took), not all at once at the end.
+
 ## Bulk runs: a persistent gesture server instead
 
 Single-video jobs (the dashboard's main Analyze tab, CLI's `analyze run`)
@@ -262,24 +282,85 @@ by default: a local GPU was already ruled out earlier (CUDA-version
 mismatch against the system install, and only 4GB VRAM on the dev
 laptop) — Colab sidesteps both.
 
-**Per window, not per frame or per video.** A per-frame calling pattern
-was considered and rejected outright: a window can have up to 150 frames
-(`frames_for_window`'s cap), and network latency across that many
-individual round-trips would likely dwarf actual inference time — this is
-exactly why gesture wasn't the first worker remoted (SenseVoice was,
-specifically because it needs only one call per *video*). Whole-video-at-
-once was also considered — fewer round-trips still, and video codecs
-compress better than a pile of independent JPEG frames — but per-window
-was chosen instead because it keeps a natural, low-effort path to real
-per-window progress reporting later (each window's result already arrives
-as its own discrete response) without needing an HTTP-streaming redesign,
-for a modest cost: dozens of round-trips per video instead of one.
-MeTRAbs's own batched-inference call (`detect_poses_batched` — confirmed
-directly against the model, not just docs: takes a stacked
-`[N, H, W, 3]` array, returns `boxes`/`poses2d`/`poses3d` as
-`RaggedTensor`s, one ragged row per frame, each frame indexable exactly
-like the single-frame `detect_poses` call's own output) means the remote
-side batches its own model call per window too, not a frame-by-frame loop.
+**HTTP requests are per window, not per frame or per video — but the
+*model* is called per frame within that.** These are two independent
+decisions, worth separating clearly:
+
+- *Network batching (per window)*: a per-frame HTTP calling pattern was
+  considered and rejected outright — a window can have up to 150 frames
+  (`frames_for_window`'s cap), and network latency across that many
+  individual round-trips would likely dwarf actual inference time; this is
+  exactly why gesture wasn't the first worker remoted (SenseVoice was,
+  specifically because it needs only one call per *video*). Whole-video-
+  at-once was also considered — fewer round-trips still, and video codecs
+  compress better than a pile of independent JPEG frames — but per-window
+  was chosen instead because it keeps a natural, low-effort path to real
+  per-window progress reporting later (each window's result already
+  arrives as its own discrete response), for a modest cost: dozens of
+  round-trips per video instead of one.
+- *Model batching (per frame, not per window)*: the notebook originally
+  used MeTRAbs's own batched-inference call (`detect_poses_batched` —
+  confirmed directly against the model: takes a stacked `[N, H, W, 3]`
+  array, returns `boxes`/`poses2d`/`poses3d` as `RaggedTensor`s, one
+  ragged row per frame) to process a whole window's frames in one model
+  call. This caused a real, measured problem — see "A memory-growth dead
+  end, and what actually fixed it" below — and was replaced with a loop
+  calling the single-image `detect_poses` once per frame, still within
+  the one per-window HTTP request.
+
+## A memory-growth dead end, and what actually fixed it
+
+Colab's system RAM (not GPU RAM — checked explicitly) climbed until the
+notebook crashed partway through real use. Root cause, confirmed by direct
+measurement, not guessed: `detect_poses_batched` is a `tf.function`
+internally, and TensorFlow permanently caches a freshly-compiled graph for
+every *new* input shape it sees — it never gets freed. A window's frame
+count varies almost every request (the last window of a video is shorter,
+`frames_for_window`'s fps-dependent subsampling varies, etc.), so nearly
+every request hit a batch size TensorFlow hadn't seen before:
+
+```
+RSS after model load: 1870 MB
+call  1 (batch=129): RSS = 6587 MB   <- first-ever trace, huge one-time jump
+call  2 (batch=133): RSS = 7161 MB
+...
+call 12 (batch=144): RSS = 7860 MB   <- still climbing, no sign of levelling off
+```
+
+First fix tried: pad every window's frames to a **fixed** batch size
+(`_MAX_BATCH = 150`) with dummy frames, so there's only ever one shape to
+trace. This measurably worked *for the retracing problem specifically* —
+growth dropped from a continuous climb to a plateau by around the 10th
+call — but real Colab usage still ran out of RAM. The batched call itself,
+even at a constant shape, still requires TensorFlow to allocate buffers
+sized for a 150-image batch on every single call — a large, unavoidable
+per-call cost that padding didn't address, since it only fixed *which*
+shapes got traced, not how much memory one call needs regardless of shape.
+
+The fix that actually worked: stop batching the model call at all. Loop
+over the window's frames and call plain `detect_poses` once per frame —
+the same design `_process_window_local` already used locally, which never
+showed this problem, for a simple reason: a single video's frames are
+always the same resolution, so a per-frame call's input shape is constant
+within a video, meaning at most one trace per resolution, not one per
+window. Measured directly, same test scenario as above (varying "real"
+frame counts, now processed one at a time instead of batched-with-
+padding):
+
+```
+RSS after model load: 1871 MB
+window 1 (30 frames): RSS = 2456 MB
+window 2 (30 frames): RSS = 2474 MB
+window 3 (30 frames): RSS = 2479 MB
+window 4 (30 frames): RSS = 2487 MB   <- plateaued, and at a much lower level
+```
+
+Real tradeoff: `detect_poses_batched` was almost certainly faster per
+window than 150 sequential single-frame calls (better GPU utilisation from
+batching) — worth it given the alternative was fast until it crashed. The
+**local** paths (`gesture_subprocess.py`/`gesture_server.py`) were never
+affected by any of this — they always called `detect_poses` per frame, not
+batched, so this whole investigation only changed the notebook.
 
 **Selection logic runs on the remote side.** The vote-once/track-
 thereafter subject-selection logic (see "What it does" above) is
@@ -317,6 +398,47 @@ startup) was judged an acceptable, much smaller cost than the alternative
 of restructuring `Orchestrator`/the subprocess entrypoints to skip
 spawning entirely on a remote success, which would have meant a bigger
 refactor for a comparatively small win.
+
+## Benchmark accuracy (published)
+
+MeTRAbs's own published numbers (`docs/MODELS_6_DATASETS.md` in the
+[MeTRAbs repo](https://github.com/isarandi/metrabs)), verified directly
+against the table, for the exact checkpoint family this project uses
+(MobileNetV3-Small backbone) — 3DPW is single-person body-shape accuracy,
+MuPoTS is multi-person detection accuracy:
+
+| Checkpoint | Detector | 3DPW PCK@50mm | 3DPW MPJPE | MuPoTS PCK@150mm |
+|---|---|---|---|---|
+| `metrabs_mob3s_y4t` (**used by this project**) | YOLOv4-**tiny** | 36.3% | 87.3 mm | 76.8 |
+| `metrabs_mob3s_y4` | YOLOv4 (full) | 36.5% | 86.4 mm | 81.8 |
+
+Reading this: switching to the tiny detector (done specifically to fix the
+out-of-memory crashes described above) cost almost nothing on single-
+person body-shape accuracy (36.3% vs 36.5% PCK, 87.3mm vs 86.4mm MPJPE —
+both come from the *same* pose backbone, only the detector changed) but a
+real, measurable ~5-point drop in multi-person detection accuracy (76.8
+vs 81.8 MuPoTS PCK). Consistent with why this tradeoff was accepted: this
+pipeline only needs the detector to reliably find *the* subject in frame,
+not to exhaustively catalogue every person present, so the accuracy this
+project actually depends on barely moved.
+
+For context, larger backbones on the *same* full detector (`y4`) trade
+more compute for more single-person accuracy — backbone was never the
+lever that mattered for this project's memory problems, only detector
+choice was:
+
+| Backbone | 3DPW PCK@50mm | 3DPW MPJPE |
+|---|---|---|
+| MobileNetV3-Small (`mob3s_y4`) | 36.5% | 86.4 mm |
+| MobileNetV3-Large (`mob3l_y4`) | 44.6% | 73.1 mm |
+| EfficientNetV2-Large (`eff2l_y4`) | 53.3% | 61.9 mm |
+
+An independent 2025 study benchmarking 16 pose frameworks head-to-head
+(MediaPipe, `rtmlib`, YOLOv8, MMPose, ViTPose, MeTRAbs, and others) — the
+study already cited in "Why MeTRAbs" above, motivating the switch away
+from MediaPipe in the first place — found MeTRAbs the single
+highest-accuracy performer overall across that comparison, with MediaPipe
+notably absent from the top tier.
 
 ## Implementation notes
 
@@ -361,7 +483,9 @@ refactor for a comparatively small win.
 
 | Package | Role | Docs |
 |---|---|---|
-| tensorflow | Runs the MeTRAbs SavedModel (multi-person 3D pose) | https://www.tensorflow.org/api_docs |
+| tensorflow | Runs the MeTRAbs SavedModel (multi-person 3D pose), local path only | https://www.tensorflow.org/api_docs |
+| fastapi / uvicorn | `gesture_server.py`'s persistent-bulk HTTP server, and `colab/gesture_server.ipynb`'s remote server | https://fastapi.tiangolo.com/ · https://www.uvicorn.org/ |
+| requests | `_process_window_remote`'s HTTP client (calls `colab/gesture_server.ipynb`) | https://requests.readthedocs.io/en/latest/ |
 | OpenCV (`opencv-contrib-python`) | Frame I/O, BGR→RGB conversion (pulled in by scenedetect/camera_worker) | https://docs.opencv.org/4.x/ |
 | NumPy | Velocity/displacement math (`np.mean`, `np.sqrt`) | https://numpy.org/doc/stable/ |
 | Pydantic | `GestureFeatures` / `GestureFrame` / `PoseKeyframe` models | https://docs.pydantic.dev/latest/ |
