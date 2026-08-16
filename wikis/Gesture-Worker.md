@@ -2,8 +2,11 @@
 
 Source: [`workers/gesture_worker.py`](../workers/gesture_worker.py),
 run via [`workers/gesture_subprocess.py`](../workers/gesture_subprocess.py)
-and dispatched by [`core/orchestrator.py`](../core/orchestrator.py) — see
-"Running in isolation" below.
+/ [`workers/gesture_server.py`](../workers/gesture_server.py) and
+dispatched by [`core/orchestrator.py`](../core/orchestrator.py) — see
+"Running in isolation" / "Bulk runs" below. Optionally offloaded to
+[`colab/gesture_server.ipynb`](../colab/gesture_server.ipynb) — see
+"Remote MeTRAbs, local fallback" below.
 Dashboard section: **Pose Estimation**
 Feature model: [`GestureFeatures`](../core/models.py) (in `core/models.py`)
 
@@ -193,18 +196,127 @@ guarantees the OS reclaims everything. This was confirmed directly: a real
 end-to-end run's memory was sampled every 5s, and usage dropped by
 ~550MB the moment the gesture subprocess exited.
 
-`Orchestrator.analyze()` also runs the gesture subprocess **strictly
-after**, never alongside, the other three workers (prosody/verbal/camera,
-still dispatched together via the existing `ThreadPoolExecutor` — none of
-them load anything close to MeTRAbs's weight, so that concurrency was
-never the problem). Isolation by itself only guarantees memory gets
-released *afterward* — it says nothing about whether MeTRAbs was the only
-heavy thing running *at the time*, which is what actually caused the
-crashes. Both parts together are what make this safe.
+`Orchestrator.analyze()` originally ran the gesture subprocess **strictly
+after**, never alongside, the other three workers — isolation by itself
+only guarantees memory gets released *afterward*, it says nothing about
+whether MeTRAbs was the only heavy thing running *at the time*, which is
+what actually caused the crashes, so both parts (isolation + not
+overlapping) were needed together. That "run strictly after" half has
+since been deliberately reverted: gesture's subprocess is now dispatched
+*alongside* prosody/verbal/camera (a 4th task in `_run_parallel`'s
+`ThreadPoolExecutor`), a known, explicitly chosen tradeoff — accepting the
+real risk of the crash pattern recurring in exchange for shorter total
+wall-clock time per job, on the reasoning that isolation still guarantees
+the memory gets reclaimed once the job ends, even though it no longer
+guarantees gesture was the only heavy thing running while it was active.
+Worth reverting back to strictly-after if that tradeoff stops being
+acceptable, e.g. on a machine without much RAM headroom and no swap
+configured.
 
-The real cost of this design: MeTRAbs's ~15-22s model-load time is paid on
-**every job**, not once at server startup — a deliberate trade of latency
-for memory safety.
+The real cost of the *isolation* itself (independent of the above): a
+fresh spawn-per-job subprocess pays MeTRAbs's ~15-22s model-load time on
+**every job**, not once — a deliberate trade of latency for memory safety,
+for single-video jobs. See the next section for how bulk runs avoid paying
+that cost per video while keeping the same reclaim-on-exit guarantee.
+
+## Bulk runs: a persistent gesture server instead
+
+Single-video jobs (the dashboard's main Analyze tab, CLI's `analyze run`)
+use the spawn-per-job subprocess above — reasonable for occasional,
+casual use, where you don't want MeTRAbs resident in memory in between.
+Bulk runs (CLI `analyze bulk`, the dashboard's Bulk Upload tab) are
+different: potentially dozens of videos processed back to back, where
+paying that ~15-22s load cost *per video* adds up to real, wasted time
+across a whole manifest.
+
+For these, `Orchestrator(persistent_gesture=True)` — set automatically by
+both bulk entrypoints — routes gesture dispatch to
+[`workers/gesture_server.py`](../workers/gesture_server.py) instead of
+`workers/gesture_subprocess.py`: a long-lived, localhost-only HTTP server
+(`Orchestrator._ensure_gesture_server` starts it on first use, picking a
+free port) that loads MeTRAbs once, on its first `/process_job` request,
+and stays warm for every subsequent video in the batch — verified directly
+(two jobs sent to the same running server reused the same OS process, and
+the second job showed no reload cost). `Orchestrator.close()` — already
+called by both `BulkOrchestrator.run()` and the CLI's `run`/`bulk` commands
+in a `finally` block — terminates that server process when the whole batch
+finishes, so the OS reclaims its memory at that point (confirmed directly:
+system memory dropped back to its pre-batch baseline immediately after
+`close()`), same reclaim guarantee as the per-job subprocess, just on a
+batch-scoped cycle instead of a job-scoped one rather than lingering
+indefinitely the way an in-process `GestureWorker` reused across a batch
+would have (TensorFlow's allocator not reliably releasing memory applies
+here exactly as it does everywhere else in this file — a process actually
+exiting is what makes reclaim reliable, so `gesture_server.py` being a
+separate process, not a plain object living inside the long-running
+dashboard process, is what makes this safe for the dashboard's Bulk Upload
+tab specifically, not just the CLI's naturally-short-lived process).
+
+## Remote MeTRAbs, local fallback
+
+`GESTURE_REMOTE_URL` (+ `GESTURE_API_KEY`), if set, points at a
+[`colab/gesture_server.ipynb`](../colab/gesture_server.ipynb) instance —
+the same MeTRAbs checkpoint, running on Colab's GPU (typically a T4)
+instead of this project's CPU-only local setup. Chosen deliberately, not
+by default: a local GPU was already ruled out earlier (CUDA-version
+mismatch against the system install, and only 4GB VRAM on the dev
+laptop) — Colab sidesteps both.
+
+**Per window, not per frame or per video.** A per-frame calling pattern
+was considered and rejected outright: a window can have up to 150 frames
+(`frames_for_window`'s cap), and network latency across that many
+individual round-trips would likely dwarf actual inference time — this is
+exactly why gesture wasn't the first worker remoted (SenseVoice was,
+specifically because it needs only one call per *video*). Whole-video-at-
+once was also considered — fewer round-trips still, and video codecs
+compress better than a pile of independent JPEG frames — but per-window
+was chosen instead because it keeps a natural, low-effort path to real
+per-window progress reporting later (each window's result already arrives
+as its own discrete response) without needing an HTTP-streaming redesign,
+for a modest cost: dozens of round-trips per video instead of one.
+MeTRAbs's own batched-inference call (`detect_poses_batched` — confirmed
+directly against the model, not just docs: takes a stacked
+`[N, H, W, 3]` array, returns `boxes`/`poses2d`/`poses3d` as
+`RaggedTensor`s, one ragged row per frame, each frame indexable exactly
+like the single-frame `detect_poses` call's own output) means the remote
+side batches its own model call per window too, not a frame-by-frame loop.
+
+**Selection logic runs on the remote side.** The vote-once/track-
+thereafter subject-selection logic (see "What it does" above) is
+duplicated into the notebook rather than only living in this file — same
+trade already accepted for `colab/sensevoice_server.ipynb` duplicating
+`_transcribe_alt`'s call; **keep the two in sync** if this logic ever
+changes. This keeps response payloads down (only the *selected* person's
+landmarks per frame, not everyone detected) and is safe to do statelessly
+per window, since the vote always resets fresh at a window's start —
+never carried across windows, by design — so no tracking state needs to
+cross the network boundary at all; each window's request is fully
+self-contained.
+
+**Local fallback, not a hard requirement once remote is configured.** Any
+failure calling remote (network, timeout, bad response) falls back to
+running MeTRAbs locally for that window — and every subsequent window in
+the same job, via a per-job flag (`_remote_failed_this_job`), so a dead
+tunnel doesn't retry-and-fail on every single window of a video, just
+once. The flag resets at the start of the next job, so a later video gets
+a fresh chance in case the failure was transient. Local MeTRAbs, when it
+does run, still runs inside the same isolated-subprocess/persistent-server
+setup described above ("Running in isolation" / "Bulk runs") — unchanged;
+neither `Orchestrator` nor `gesture_subprocess.py`/`gesture_server.py`
+have any idea whether a given call ended up hitting Colab or running
+locally, that decision is entirely internal to `GestureWorker`.
+
+**TensorFlow's own `import` is deferred**, not just the model load — moved
+from module top-level into `_get_model()`, mirroring
+`VerbalWorker._get_sensevoice`'s lazy `from funasr import AutoModel`
+exactly. This means a successful remote call costs nothing TF-related in
+whichever process runs it, even though that process (the per-job
+subprocess, or the persistent bulk server) still technically exists and
+still gets spawned — the process-spawn overhead itself (~1-2s of Python
+startup) was judged an acceptable, much smaller cost than the alternative
+of restructuring `Orchestrator`/the subprocess entrypoints to skip
+spawning entirely on a remote success, which would have meant a bigger
+refactor for a comparatively small win.
 
 ## Implementation notes
 
@@ -225,22 +337,25 @@ for memory safety.
   `FusionEngine`'s shoulder-yaw formula was hand-checked against real
   output and needed its subtraction order flipped (left-minus-right, not
   right-minus-left) to correctly land frontal poses near 0°.
-- The MeTRAbs `tf.saved_model` is loaded once per `GestureWorker` instance
-  and reused across every window *within that instance's job* — inference
-  itself is stateless per frame (unlike MediaPipe's Tasks API
-  `PoseLandmarker` in `VIDEO` mode), so there's no cross-window timestamp
-  bookkeeping to worry about, and `close()` is a no-op. But a
-  `GestureWorker` instance's whole lifetime is now scoped to a single
+- The local MeTRAbs `tf.saved_model` is loaded lazily (`_get_model`, not
+  `__init__`) on first actual local-inference need, then reused across
+  every window *within that instance's job* — inference itself is
+  stateless per frame (unlike MediaPipe's Tasks API `PoseLandmarker` in
+  `VIDEO` mode), so there's no cross-window timestamp bookkeeping to worry
+  about, and `close()` is a no-op. If a job's every window is served by
+  remote MeTRAbs successfully, the local model is never touched at all. A
+  `GestureWorker` instance's whole lifetime is scoped to a single
   subprocess handling a single job (see "Running in isolation" above) —
-  unlike `rtmlib` before it, there's no reuse *across* jobs; the model gets
-  reloaded from scratch every time, by design.
+  unlike `rtmlib` before it, there's no reuse *across* jobs; the local
+  model, if it loads at all, gets reloaded from scratch every time.
 - The model file itself (`metrabs_mob3s_y4t`, ~50MB unzipped) is **not**
   distributed via pip — it's downloaded once from
   `https://omnomnom.vision.rwth-aachen.de/data/metrabs/metrabs_mob3s_y4t.zip`
   and unzipped into `models/metrabs_mob3s_y4t/` (gitignored). The Dockerfile
-  does this automatically at build time; for local development, download
-  and unzip it manually first (`GestureWorker.__init__` raises a clear
-  `FileNotFoundError` with the exact commands if it's missing).
+  does this automatically at build time; for local development without
+  `GESTURE_REMOTE_URL` set, download and unzip it manually first
+  (`GestureWorker._get_model` raises a clear `FileNotFoundError` with the
+  exact commands the first time local inference is actually attempted).
 
 ## Package documentation
 

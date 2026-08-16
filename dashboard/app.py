@@ -1112,7 +1112,12 @@ def _run_bulk_manifest(entries: list[dict], force: bool) -> None:
             _BULK_STATE["last_event"] = evt
 
     try:
-        bulk_orch = BulkOrchestrator(feature_store=store, repo=repo, orchestrator_kwargs={})
+        bulk_orch = BulkOrchestrator(
+            feature_store=store, repo=repo,
+            # Keep MeTRAbs loaded across the whole manifest instead of
+            # reloading it per video — see core/orchestrator.py.
+            orchestrator_kwargs={"persistent_gesture": True},
+        )
         summary = bulk_orch.run(entries, force=force, progress_cb=_progress_cb)
     except Exception as exc:
         logger.error(f"[dashboard] Bulk run failed: {exc}")

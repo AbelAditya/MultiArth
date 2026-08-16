@@ -163,6 +163,9 @@ def bulk(ctx, manifest_path, force, mongo_uri, mongo_db, window, whisper_model, 
             "window_size_s": window,
             "whisper_model": whisper_model,
             "whisper_device": device,
+            # Keep MeTRAbs loaded across the whole manifest instead of
+            # reloading it per video — see core/orchestrator.py.
+            "persistent_gesture": True,
         },
     )
     on_progress, close_progress = _make_bulk_progress_reporter()

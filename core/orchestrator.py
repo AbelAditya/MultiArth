@@ -5,30 +5,53 @@ Coordinates the full analysis pipeline for a single video.
 
 Architecture (Option B — event-driven modular):
   1. Ingest: extract audio, probe video, compute windows
-  2. Dispatch: run prosody/verbal/camera (optionally in parallel via
-     threading), THEN gesture — in its own isolated subprocess, never
-     concurrently with the other three
+  2. Dispatch: run all four workers together — prosody/verbal/camera as
+     threads, gesture as an isolated subprocess — optionally in parallel
   3. Fuse: merge all modality outputs per window
   4. Report: store final results in FeatureStore
 
 Prosody/verbal/camera run as threads so they can be parallelised without
 the GIL bottleneck (each worker is I/O or C-extension bound, not pure
-Python). Gesture (MeTRAbs) is deliberately excluded from that pool and run
-afterward instead, in a separate OS process — see `_run_gesture_isolated`
-below and `workers/gesture_subprocess.py` for why: MeTRAbs's TensorFlow
-runtime is heavy enough (~1.8-2.7GB) that running it concurrently with
-Whisper (loaded once at startup in VerbalWorker) and the other workers is
-what caused real out-of-memory crashes in practice, and TensorFlow doesn't
-reliably release memory back to the OS even when the model object is
-explicitly deleted — only a subprocess that fully exits guarantees that.
-Running gesture strictly after, not alongside, the others ensures its
-memory footprint never overlaps with anything else's peak, which isolation
-alone does not guarantee (isolation only fixes what happens *afterward*).
+Python). Gesture (MeTRAbs) still runs in a separate OS process rather than
+in-process — see `_run_gesture` below and `workers/gesture_subprocess.py` —
+because TensorFlow's allocator doesn't reliably release memory back to the
+OS even after the model object is explicitly deleted; only a process
+actually exiting guarantees that.
+
+Gesture's subprocess is dispatched *alongside* the other three
+(`parallel=True`, the default) rather than strictly after them. This is a
+deliberate, known tradeoff, not an oversight: running MeTRAbs concurrently
+with Whisper and the other workers is exactly what caused real
+out-of-memory crashes earlier in this project's history — subprocess
+isolation guarantees MeTRAbs's memory gets released *after* its job
+finishes, but says nothing about peak memory *while* everything is running
+together, which is what actually matters for avoiding a crash.
+
+Two further things worth knowing about, both explicit tradeoffs:
+
+- **Lazy workers.** `_prosody_worker`/`_verbal_worker`/`_camera_worker`
+  are properties, not attributes set in `__init__` — each one's actual
+  worker (and whatever model it loads — Whisper, in VerbalWorker's case)
+  is only constructed the first time it's actually used, not eagerly when
+  `Orchestrator` itself is constructed. This matters most for the
+  dashboard's module-level `_orch = Orchestrator(store=store)`: without
+  this, Whisper would load the moment the dashboard process starts and
+  stay resident for its entire lifetime, whether or not a job is ever run.
+- **`persistent_gesture`.** Single-video jobs (the default, `False`) use
+  `workers/gesture_subprocess.py` — spawn fresh, load MeTRAbs, run one job,
+  exit — so MeTRAbs's memory doesn't linger afterward for what's likely
+  casual, interspersed-with-other-laptop-use usage. Bulk runs (CLI
+  `analyze bulk`, the dashboard's Bulk Upload tab) pass `True`: a single
+  `workers/gesture_server.py` subprocess is started once, kept warm across
+  every video in the batch (so MeTRAbs's ~15-22s load time is paid once,
+  not once per video), and explicitly terminated in `close()` when the
+  whole batch finishes — see `_ensure_gesture_server`.
 """
 
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -36,6 +59,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import requests
 from loguru import logger
 
 from core.feature_store import FeatureStore
@@ -45,6 +69,9 @@ from core.preprocessing import compute_windows, extract_audio, probe_video
 from workers.camera_worker import CameraWorker
 from workers.prosody_worker import ProsodyWorker
 from workers.verbal_worker import VerbalWorker
+
+_GESTURE_SERVER_TIMEOUT_S = 300  # generous: first call pays MeTRAbs's ~15-22s load too
+_GESTURE_SERVER_HEALTH_TIMEOUT_S = 30  # server process boot, not model load — should be quick
 
 
 class Orchestrator:
@@ -56,20 +83,56 @@ class Orchestrator:
         whisper_model: str = "small",
         whisper_device: str = "cpu",
         parallel: bool = True,
+        persistent_gesture: bool = False,
     ):
         self.store = store
         self.work_dir = Path(work_dir or os.environ.get("WORK_DIR", "/tmp/mannerism"))
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.window_size_s = window_size_s
         self.parallel = parallel
+        self.persistent_gesture = persistent_gesture
+        self._whisper_model = whisper_model
+        self._whisper_device = whisper_device
 
-        # Gesture (MeTRAbs) is deliberately NOT constructed here — it runs
-        # in its own subprocess per job, see _run_gesture_isolated. This
-        # process never imports tensorflow at all.
-        self._prosody_worker = ProsodyWorker(store)
-        self._verbal_worker = VerbalWorker(store, model_size=whisper_model, device=whisper_device)
-        self._camera_worker = CameraWorker(store)
+        # Gesture (MeTRAbs) is never constructed in-process here — it
+        # always runs in a subprocess, see _run_gesture. The other three
+        # are lazy (see _prosody_worker/_verbal_worker/_camera_worker
+        # properties below) — none of them, including this process itself,
+        # load anything until the first job actually needs it.
+        self._prosody_worker_inst: ProsodyWorker | None = None
+        self._verbal_worker_inst: VerbalWorker | None = None
+        self._camera_worker_inst: CameraWorker | None = None
         self._fusion = FusionEngine(store)
+
+        # Only used when persistent_gesture=True — see _ensure_gesture_server.
+        self._gesture_proc: subprocess.Popen | None = None
+        self._gesture_port: int | None = None
+
+    # ------------------------------------------------------------------
+    # Lazy worker construction — see module docstring's "Lazy workers"
+    # ------------------------------------------------------------------
+
+    @property
+    def _prosody_worker(self) -> ProsodyWorker:
+        if self._prosody_worker_inst is None:
+            self._prosody_worker_inst = ProsodyWorker(self.store)
+        return self._prosody_worker_inst
+
+    @property
+    def _verbal_worker(self) -> VerbalWorker:
+        if self._verbal_worker_inst is None:
+            self._verbal_worker_inst = VerbalWorker(
+                self.store, model_size=self._whisper_model, device=self._whisper_device
+            )
+        return self._verbal_worker_inst
+
+    @property
+    def _camera_worker(self) -> CameraWorker:
+        if self._camera_worker_inst is None:
+            self._camera_worker_inst = CameraWorker(self.store)
+        return self._camera_worker_inst
+
+    # ------------------------------------------------------------------
 
     def analyze(self, video_path: str, job_id: str | None = None) -> str:
         """
@@ -102,15 +165,14 @@ class Orchestrator:
                 f"{meta.fps:.1f}fps, {len(windows)} windows"
             )
 
-            # 2a. Dispatch the three lightweight workers
+            # 2. Dispatch all four workers together — see module docstring
+            # for why gesture (a subprocess, not an in-process call like the
+            # other three) being included here instead of run afterward is
+            # a deliberate memory/throughput tradeoff.
             if self.parallel:
-                self._run_parallel(job_id, meta, windows)
+                self._run_parallel(job_id, meta, windows, video_path)
             else:
-                self._run_sequential(job_id, meta, windows)
-
-            # 2b. THEN gesture, alone, in its own subprocess — never
-            # overlapping with the above (see module docstring).
-            self._run_gesture_isolated(job_id, video_path)
+                self._run_sequential(job_id, meta, windows, video_path)
 
             # 3. Fuse
             fused = self._fusion.fuse_job(job_id, len(windows))
@@ -127,11 +189,12 @@ class Orchestrator:
 
     # ------------------------------------------------------------------
 
-    def _run_parallel(self, job_id, meta, windows) -> None:
+    def _run_parallel(self, job_id, meta, windows, video_path) -> None:
         tasks = {
             "prosody": lambda: self._prosody_worker.process_job(job_id, meta, windows),
             "verbal":  lambda: self._verbal_worker.process_job(job_id, meta, windows),
             "camera":  lambda: self._camera_worker.process_job(job_id, meta, windows),
+            "gesture": lambda: self._run_gesture(job_id, video_path),
         }
         with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
             futures = {pool.submit(fn): name for name, fn in tasks.items()}
@@ -143,38 +206,135 @@ class Orchestrator:
                 else:
                     logger.info(f"[orchestrator] Worker '{name}' finished")
 
-    def _run_sequential(self, job_id, meta, windows) -> None:
+    def _run_sequential(self, job_id, meta, windows, video_path) -> None:
         self._prosody_worker.process_job(job_id, meta, windows)
         self._verbal_worker.process_job(job_id, meta, windows)
         self._camera_worker.process_job(job_id, meta, windows)
+        self._run_gesture(job_id, video_path)
+
+    # ------------------------------------------------------------------
+    # Gesture dispatch — spawn-per-job (default) or persistent-server
+    # (persistent_gesture=True) — see module docstring.
+    # ------------------------------------------------------------------
+
+    def _run_gesture(self, job_id: str, video_path: str) -> None:
+        if self.persistent_gesture:
+            self._run_gesture_persistent(job_id, video_path)
+        else:
+            self._run_gesture_isolated(job_id, video_path)
 
     def _run_gesture_isolated(self, job_id: str, video_path: str) -> None:
         """
         Runs gesture analysis (MeTRAbs) in a fresh `python -m
         workers.gesture_subprocess` process and waits for it to finish —
         see workers/gesture_subprocess.py and this module's docstring for
-        why. The child inherits this process's environment (REDIS_HOST/
-        REDIS_PORT etc.), so it connects to the same FeatureStore and
-        writes gesture results there directly; nothing is passed back
-        through this call except the exit code.
+        why it's a subprocess at all. The child inherits this process's
+        environment (REDIS_HOST/REDIS_PORT etc.), so it connects to the
+        same FeatureStore and writes gesture results there directly;
+        nothing is passed back through this call except the exit code.
+
+        Streams the subprocess's output line-by-line as it's produced
+        (`Popen` + iterating its pipe), rather than `subprocess.run(...,
+        capture_output=True)`, which is fully blocking — it hands back
+        everything only once the whole subprocess has already exited, so
+        nothing is visible while a job is still running, only in one dump
+        at the end. `-u` on the child's own invocation matters here too:
+        Python block-buffers stdout by default when it isn't an
+        interactive terminal (which a pipe never is), so without it the
+        *child* would sit on its own output internally regardless of how
+        promptly we read our end of the pipe.
         """
         logger.info(f"[orchestrator] Starting isolated gesture subprocess for job {job_id}")
-        result = subprocess.run(
+        process = subprocess.Popen(
             [
-                sys.executable, "-m", "workers.gesture_subprocess",
+                sys.executable, "-u", "-m", "workers.gesture_subprocess",
                 job_id, video_path, str(self.window_size_s),
             ],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # merged: loguru defaults to stderr,
+            # and one merged stream avoids needing two reader threads (or
+            # select()-based multiplexing) just to preserve line ordering.
             text=True,
+            bufsize=1,  # line-buffered on our read side
         )
-        if result.returncode != 0:
-            logger.error(
-                f"[orchestrator] Gesture subprocess for job {job_id} exited "
-                f"{result.returncode}:\n{result.stderr}"
-            )
+        for line in process.stdout:
+            logger.info(f"[gesture-subprocess] {line.rstrip()}")
+        process.wait()
+
+        if process.returncode != 0:
+            logger.error(f"[orchestrator] Gesture subprocess for job {job_id} exited {process.returncode}")
         else:
             logger.info(f"[orchestrator] Gesture subprocess for job {job_id} finished")
 
+    def _run_gesture_persistent(self, job_id: str, video_path: str) -> None:
+        """
+        Sends this job to the long-lived workers/gesture_server.py instance
+        (starting it first if this is the first job of the batch) instead
+        of spawning a fresh subprocess — see module docstring's
+        `persistent_gesture` explanation.
+        """
+        self._ensure_gesture_server()
+        logger.info(f"[orchestrator] Sending job {job_id} to persistent gesture server")
+        try:
+            response = requests.post(
+                f"http://127.0.0.1:{self._gesture_port}/process_job",
+                json={"job_id": job_id, "video_path": video_path, "window_size_s": self.window_size_s},
+                timeout=_GESTURE_SERVER_TIMEOUT_S,
+            )
+            response.raise_for_status()
+            logger.info(f"[orchestrator] Persistent gesture server finished job {job_id}")
+        except Exception:
+            logger.exception(f"[orchestrator] Persistent gesture server failed on job {job_id}")
+
+    def _ensure_gesture_server(self) -> None:
+        """Starts workers/gesture_server.py if it isn't already running for this Orchestrator."""
+        if self._gesture_proc is not None and self._gesture_proc.poll() is None:
+            return  # already running
+
+        self._gesture_port = self._pick_free_port()
+        logger.info(f"[orchestrator] Starting persistent gesture server on port {self._gesture_port}")
+        self._gesture_proc = subprocess.Popen(
+            [sys.executable, "-m", "workers.gesture_server", str(self._gesture_port)],
+        )
+
+        health_url = f"http://127.0.0.1:{self._gesture_port}/health"
+        deadline = time.time() + _GESTURE_SERVER_HEALTH_TIMEOUT_S
+        while time.time() < deadline:
+            if self._gesture_proc.poll() is not None:
+                raise RuntimeError(
+                    f"gesture server exited early (code {self._gesture_proc.returncode}) before becoming healthy"
+                )
+            try:
+                requests.get(health_url, timeout=1).raise_for_status()
+                logger.info("[orchestrator] Persistent gesture server is up")
+                return
+            except requests.exceptions.RequestException:
+                time.sleep(0.5)
+        raise TimeoutError(f"gesture server did not become healthy within {_GESTURE_SERVER_HEALTH_TIMEOUT_S}s")
+
+    @staticmethod
+    def _pick_free_port() -> int:
+        # Standard "ask the OS for an unused port" idiom: bind to port 0,
+        # read back whatever it assigned, then release it. There's a small,
+        # unavoidable race between closing this socket and the gesture
+        # server binding the same port — accepted as low-risk here since
+        # only one gesture server is ever started per Orchestrator instance.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
     def close(self) -> None:
-        pass  # nothing held open — gesture's subprocess exits on its own
-        # after every job; prosody/verbal/camera hold no closeable resources.
+        # Only the persistent gesture server holds a resource that needs
+        # explicit cleanup — terminating it is what reclaims MeTRAbs's
+        # memory for a persistent_gesture batch (see module docstring).
+        # Everything else (prosody/verbal/camera, and the plain per-job
+        # gesture subprocess) has nothing left open once process_job returns.
+        if self._gesture_proc is not None and self._gesture_proc.poll() is None:
+            logger.info("[orchestrator] Terminating persistent gesture server")
+            self._gesture_proc.terminate()
+            try:
+                self._gesture_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                logger.warning("[orchestrator] Persistent gesture server didn't exit in time, killing it")
+                self._gesture_proc.kill()
+                self._gesture_proc.wait()

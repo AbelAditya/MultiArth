@@ -14,89 +14,120 @@ For each time window it:
      — no re-vote until the next window starts. Deliberately no "is this
      still plausibly the same person" ambiguity guard yet (e.g. a
      max-distance cutoff) — that's held off until there's enough real
-     multi-person test data to decide whether it's actually needed. Same
-     design as the RTMPose version before it, just tracking the detector's
-     own box center instead of a keypoint-derived centroid (MeTRAbs already
-     hands back a box per person, so there's no need to compute one).
+     multi-person test data to decide whether it's actually needed.
   4. Computes kinematic features (velocity, amplitude, symmetry, etc.) from
      only the selected person's landmarks — everyone else detected in a
      frame is discarded before a GestureFrame is ever built, so nothing
      downstream (FusionEngine, the dashboard) needs to know multiple people
      were ever in frame.
 
-Switched from RTMPose (via rtmlib) after RTMPose turned out to be strictly
-2D — FusionEngine's camera yaw/pitch computation had nothing to work with
-and permanently returned None. Chosen after researching alternatives:
-  - MediaPipe's own multi-person Tasks API does give 3D world landmarks, but
-    re-uses the same underlying model whose accuracy was the original
-    reason for moving off MediaPipe in the first place.
-  - NLF (NeurIPS'24, a newer relative of MeTRAbs, reportedly even more
-    accurate) has MIT-licensed code but noncommercial-research-only
-    pretrained weights — ruled out the same way YOLO-Pose's AGPL-3.0 was.
-  - MeTRAbs: MIT license (code and weights both), natively multi-person
-    with absolute metric-scale 3D output, and — per an independent 2025
-    study benchmarking 16 pose frameworks head-to-head (MediaPipe, rtmlib,
-    YOLOv8, MMPose, ViTPose, etc.) — the single highest-accuracy performer
-    overall, with MediaPipe notably absent from the top tier.
+Runs remotely first, local as a fallback — see "Remote MeTRAbs" below for
+the full design. Whichever path actually runs, this class's aggregation
+logic (_aggregate, _extract_keyframes, kinematic helpers) is identical —
+only "how do we get this window's per-frame selected-person landmarks"
+differs between _process_window_remote and _process_window_local.
 
-**Runs isolated in its own subprocess, not in the dashboard's main
-process** — see `workers/gesture_subprocess.py` and
-`core/orchestrator.py`. TensorFlow's memory allocator doesn't reliably
-release memory back to the OS even after the Python model object is
-deleted and `gc.collect()` is run (a well-documented TF behavior, not
-specific to this project) — so simply avoiding eager construction in
-`Orchestrator.__init__` wouldn't be enough on its own to keep MeTRAbs from
-staying resident indefinitely across jobs. Running it as a subprocess that
-fully exits after each job is what actually guarantees the OS reclaims its
-memory, at the cost of paying the ~15-22s model-load time on every job
-instead of once. `Orchestrator` also deliberately runs gesture's subprocess
-*after*, not concurrently with, the other three workers — isolation alone
-only guarantees memory gets released *afterward*; it says nothing about
-whether it was the only heavy thing running *at the time*, which is what
-actually caused the crashes (MeTRAbs's own footprint compounding with
-Whisper/prosody/camera all active via the same `ThreadPoolExecutor` batch).
+Chosen (over RTMPose, MediaPipe, NLF, OpenPose, AlphaPose) after research
+covered in wikis/Gesture-Worker.md — in short: MIT licensed (unlike
+YOLO-Pose/NLF), natively multi-person with absolute 3D output (unlike
+RTMPose, which is 2D-only), and the single highest-accuracy performer in
+an independent 2025 16-framework benchmark study.
 
-Loaded as a standalone TensorFlow SavedModel (not the training codebase,
-not tensorflow-hub) — see `_MODEL_DIR` below and the Dockerfile for how the
-model file gets there. Plain `tensorflow` on PyPI is CPU-only by default
-and, unlike plain `torch`, doesn't pull in a CUDA toolkit.
+## Remote MeTRAbs, local fallback
 
-Two real tradeoffs from the RTMPose->MeTRAbs switch, both worth knowing
-about:
+`GESTURE_REMOTE_URL` (+ `GESTURE_API_KEY`), if set, points at a
+colab/gesture_server.ipynb instance — MeTRAbs running on a free Colab GPU
+(a T4, typically — meaningfully faster than this project's CPU-only local
+setup, and sidesteps the CUDA-version mismatch and 4GB VRAM that ruled out
+using a local GPU at all). Each *window* (not each frame — see below for
+why) is sent as one batched HTTP request; on any failure (network, timeout,
+bad response), that and every subsequent window in the same job falls back
+to local MeTRAbs instead (`_remote_failed_this_job` — a per-job circuit
+breaker, so a dead tunnel doesn't retry-and-fail on every single window of
+a video, just once).
+
+Per-window, not per-frame or per-video: a per-frame calling pattern was
+considered and rejected outright — a window can have up to 150 frames
+(`core/preprocessing.py`'s `frames_for_window`), and network latency alone
+across that many individual round-trips would likely dwarf actual
+inference time. Whole-video-at-once was also considered — fewer
+round-trips still, and video codecs compress better than a pile of
+independent JPEG frames — but committing to per-window keeps a natural
+path to real per-window progress reporting later (each window's result
+already arrives as its own discrete response) without needing an
+HTTP-streaming redesign, at only a modest cost: dozens of round-trips per
+video instead of one. MeTRAbs's own batched-inference call
+(`detect_poses_batched`, confirmed directly — takes a stacked
+`[N, H, W, 3]` array, returns `boxes`/`poses2d`/`poses3d` as
+`RaggedTensor`s, one raggeed row per frame, each indexable exactly like the
+single-frame `detect_poses` call's per-frame output) means the remote side
+batches its own model call per window too, not a frame-by-frame loop.
+
+The vote-once/track-thereafter subject-selection logic runs **on the
+remote side** for the remote path (duplicated from this file into the
+notebook, same trade already accepted for
+`colab/sensevoice_server.ipynb` duplicating `_transcribe_alt` — keep them
+in sync if this logic ever changes) — sending back only the *selected*
+person's landmarks per frame, not everyone detected, keeps response
+payloads down. This is safe statelessly per window: the vote always resets
+fresh at the start of a window (never carried across windows, by design —
+see point 3 above), so no tracking state needs to cross the network
+boundary; each window's request is fully self-contained.
+
+TensorFlow's `import` itself is deferred (inside `_get_model`, not at
+module top-level) specifically so that a successful remote call never
+costs anything TF-related in this process — mirrors
+`VerbalWorker._get_sensevoice`'s lazy `from funasr import AutoModel`
+exactly. Local MeTRAbs (whether because remote isn't configured, or a
+video's remote calls failed) still runs inside an isolated subprocess —
+see `workers/gesture_subprocess.py` / `workers/gesture_server.py` /
+`core/orchestrator.py` — that part is unchanged; this file has no idea
+which one is invoking it.
+
+Two real tradeoffs, both worth knowing about, that apply whichever engine
+actually runs the inference (remote or local — same model, same output
+shape):
 
   - No per-joint confidence: unlike RTMPose/MediaPipe, MeTRAbs's
-    `detect_poses` returns only a per-*person* detection-box confidence —
-    no per-keypoint score, occlusion flag, or uncertainty at all (confirmed
-    against the model directly, not just docs). It always estimates a
-    plausible position for all 19 joints per detected person, including
-    ones that are occluded or entirely outside the frame (e.g. cropped-off
-    legs), extrapolated from its learned body-shape prior. In place of a
-    real confidence value, every landmark here gets a pseudo-visibility of
-    1.0 if its 2D projection lands inside the actual frame bounds, else
-    0.0 — good enough for the existing visibility-threshold logic
-    downstream (shot classification, wrist-motion filtering), but it's an
-    in-frame check, not a real confidence estimate.
-  - Speed/footprint: uses `metrabs_mob3s_y4t` — MobileNetV3-Small backbone
-    *and* YOLOv4-tiny as the person detector, not full YOLOv4. The detector
-    dominates total model size far more than the pose backbone does
-    (confirmed: `mob3s_y4` vs `mob3l_y4`, a backbone jump, changes the
-    download by <5%; swapping to the `t`-suffixed detector shrinks it 8x,
-    248MB -> 31MB). Real tradeoff, per MeTRAbs's own published numbers:
-    worse multi-person detection accuracy (MuPoTS PCK 81.0 vs 86.6) than
-    full YOLOv4 — acceptable here since this pipeline only needs the
-    detector to reliably find *the* subject, not exhaustively catalog
-    everyone in frame.
+    `detect_poses`(`_batched`) returns only a per-*person* detection-box
+    confidence — no per-keypoint score, occlusion flag, or uncertainty at
+    all (confirmed against the model directly, not just docs). It always
+    estimates a plausible position for all 19 joints per detected person,
+    including ones that are occluded or entirely outside the frame (e.g.
+    cropped-off legs), extrapolated from its learned body-shape prior. In
+    place of a real confidence value, every landmark here gets a
+    pseudo-visibility of 1.0 if its 2D projection lands inside the actual
+    frame bounds, else 0.0 — good enough for the existing
+    visibility-threshold logic downstream (shot classification,
+    wrist-motion filtering), but it's an in-frame check, not a real
+    confidence estimate.
+  - Speed/footprint (local path only): uses `metrabs_mob3s_y4t` —
+    MobileNetV3-Small backbone *and* YOLOv4-tiny as the person detector,
+    not full YOLOv4. The detector dominates total model size far more than
+    the pose backbone does (confirmed: `mob3s_y4` vs `mob3l_y4`, a
+    backbone jump, changes the download by <5%; swapping to the
+    `t`-suffixed detector shrinks it 8x, 248MB -> 31MB). Real tradeoff,
+    per MeTRAbs's own published numbers: worse multi-person detection
+    accuracy (MuPoTS PCK 81.0 vs 86.6) than full YOLOv4 — acceptable here
+    since this pipeline only needs the detector to reliably find *the*
+    subject, not exhaustively catalog everyone in frame. The remote
+    Colab notebook uses this exact same checkpoint, for consistent output
+    between the two paths — a bigger checkpoint would be a legitimate
+    separate upgrade to consider later, given the remote path has real
+    GPU headroom the local path never did.
 """
 
 from __future__ import annotations
 
+import base64
 import math
+import os
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
-import tensorflow as tf
+import requests
 from loguru import logger
 
 from core.feature_store import FeatureStore
@@ -125,6 +156,12 @@ _FRAME_CENTER = (0.5, 0.5)
 _DEFAULT_FOV_DEGREES = 55.0  # MeTRAbs's own default; used when no camera
 # intrinsics are known, which is always true here (arbitrary source videos).
 
+# See module docstring's "Remote MeTRAbs, local fallback" section.
+_REMOTE_URL_ENV = "GESTURE_REMOTE_URL"
+_REMOTE_API_KEY_ENV = "GESTURE_API_KEY"
+_REMOTE_TIMEOUT_S = 120  # one window's worth of frames (up to 150), batched
+_JPEG_QUALITY = 85
+
 
 def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
@@ -133,6 +170,27 @@ def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
 class GestureWorker:
     def __init__(self, store: FeatureStore):
         self.store = store
+        self._model = None  # lazy — see _get_model; never touched at all if remote succeeds
+        self._remote_url = os.environ.get(_REMOTE_URL_ENV) or None
+        self._remote_api_key = os.environ.get(_REMOTE_API_KEY_ENV) or None
+        self._remote_failed_this_job = False
+        if self._remote_url:
+            logger.info(f"[gesture] Will try remote MeTRAbs first, at {self._remote_url}")
+
+    def close(self) -> None:
+        pass  # no persistent per-video resource to release; the subprocess
+        # this worker runs in (see module docstring) is what actually
+        # reclaims TensorFlow's memory, by exiting entirely after the job —
+        # only relevant when the local fallback actually ran at all.
+
+    def _get_model(self):
+        """Lazily loads the local MeTRAbs SavedModel — see module docstring
+        for why both the model load AND the `tensorflow` import itself are
+        deferred to here rather than module/instance-construction time."""
+        if self._model is not None:
+            return self._model
+        import tensorflow as tf  # deferred — see module docstring
+
         if not _MODEL_DIR.exists():
             raise FileNotFoundError(
                 f"MeTRAbs model not found at {_MODEL_DIR}. Download it with:\n"
@@ -140,12 +198,9 @@ class GestureWorker:
                 f"  unzip /tmp/metrabs.zip -d {_MODEL_DIR.parent}\n"
                 "(the Dockerfile does this automatically at build time)"
             )
+        logger.info("[gesture] Loading local MeTRAbs model...")
         self._model = tf.saved_model.load(str(_MODEL_DIR))
-
-    def close(self) -> None:
-        pass  # no persistent per-video resource to release; the subprocess
-        # this worker runs in (see module docstring) is what actually
-        # reclaims TensorFlow's memory, by exiting entirely after the job.
+        return self._model
 
     def process_job(
         self,
@@ -153,6 +208,11 @@ class GestureWorker:
         meta: VideoMeta,
         windows: list[tuple[float, float]],
     ) -> None:
+        # Fresh chance to try remote for every video, even if a previous
+        # job's remote calls failed (the failure might have been transient,
+        # or the notebook might have been restarted since).
+        self._remote_failed_this_job = False
+
         logger.info(f"[gesture] Starting job {job_id} — {len(windows)} windows")
         for idx, (start, end) in enumerate(windows):
             try:
@@ -171,18 +231,43 @@ class GestureWorker:
         self, meta: VideoMeta, start_s: float, end_s: float
     ) -> GestureFeatures:
         raw_frames = frames_for_window(meta.path, start_s, end_s, meta.fps)
+
+        gesture_frames: Optional[list[GestureFrame]] = None
+        if self._remote_url and not self._remote_failed_this_job:
+            try:
+                gesture_frames = self._process_window_remote(raw_frames, meta)
+                logger.info("RUNNING POSE ESTIMATION REMOTELY")
+            except Exception as exc:
+                logger.warning(
+                    f"[gesture] Remote MeTRAbs call failed ({exc}) — falling back to "
+                    "local MeTRAbs for the rest of this job"
+                )
+                self._remote_failed_this_job = True
+
+        if gesture_frames is None:
+            gesture_frames = self._process_window_local(raw_frames, meta)
+
+        return self._aggregate(start_s, end_s, gesture_frames, meta.width, meta.height)
+
+    def _process_window_local(
+        self, raw_frames: list[tuple[float, np.ndarray]], meta: VideoMeta
+    ) -> list[GestureFrame]:
+        import tensorflow as tf  # deferred — see module docstring; cheap
+        # after the first call (module import is cached), whether that was
+        # via _get_model or a previous call to this method.
+
+        model = self._get_model()
         gesture_frames: list[GestureFrame] = []
         # None until the first frame with any detection in this window —
         # that frame runs the centrality vote; every frame after just tracks
         # whoever was picked. Reset every window (never carried across
-        # windows), same design as the RTMPose/MediaPipe-multi-person
-        # versions before it.
+        # windows), same design as the remote path's selection logic.
         ref_pos: Optional[tuple[float, float]] = None
 
         for frame_idx, (ts, bgr) in enumerate(raw_frames):
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             image = tf.constant(rgb, dtype=tf.uint8)
-            pred = self._model.detect_poses(
+            pred = model.detect_poses(
                 image, skeleton=_SKELETON, default_fov_degrees=_DEFAULT_FOV_DEGREES
             )
             boxes = pred["boxes"].numpy()
@@ -206,7 +291,60 @@ class GestureWorker:
             )
             gesture_frames.append(gf)
 
-        return self._aggregate(start_s, end_s, gesture_frames, meta.width, meta.height)
+        return gesture_frames
+
+    def _process_window_remote(
+        self, raw_frames: list[tuple[float, np.ndarray]], meta: VideoMeta
+    ) -> list[GestureFrame]:
+        """
+        Sends this window's frames to colab/gesture_server.ipynb as one
+        batched request and returns the same list[GestureFrame] shape
+        `_process_window_local` produces — see module docstring's "Remote
+        MeTRAbs, local fallback" for the full design and why per-window
+        (not per-frame or per-video).
+        """
+        frames_payload = []
+        for frame_idx, (ts, bgr) in enumerate(raw_frames):
+            ok, jpeg = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY])
+            if not ok:
+                continue
+            frames_payload.append({
+                "frame_idx": frame_idx,
+                "ts": ts,
+                "jpeg_b64": base64.b64encode(jpeg.tobytes()).decode("ascii"),
+            })
+
+        response = requests.post(
+            self._remote_url,
+            json={"width": meta.width, "height": meta.height, "frames": frames_payload},
+            headers={"X-API-Key": self._remote_api_key or ""},
+            timeout=_REMOTE_TIMEOUT_S,
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        gesture_frames: list[GestureFrame] = []
+        for entry in payload["frames"]:
+            if entry["pose_2d"] is None:
+                gesture_frames.append(self._empty_frame(entry["frame_idx"], entry["ts"]))
+                continue
+            pose = [
+                Landmark(x=xy[0], y=xy[1], z=0.0, visibility=vis)
+                for xy, vis in zip(entry["pose_2d"], entry["visibility"])
+            ]
+            pose_world = [
+                Landmark(x=xyz[0], y=xyz[1], z=xyz[2], visibility=vis)
+                for xyz, vis in zip(entry["pose_3d"], entry["visibility"])
+            ]
+            gesture_frames.append(GestureFrame(
+                frame_idx=entry["frame_idx"],
+                timestamp_s=entry["ts"],
+                pose=pose,
+                left_hand=[],
+                right_hand=[],
+                pose_world=pose_world,
+            ))
+        return gesture_frames
 
     @staticmethod
     def _box_center(box: np.ndarray, width: int, height: int) -> tuple[float, float]:
@@ -329,7 +467,8 @@ class GestureWorker:
     ) -> list[PoseKeyframe]:
         """
         Return every `step`-th frame as a PoseKeyframe with normalised coords.
-        y is pre-flipped (stored as 1 − raw_y) so the JS viewer needs no flip.
+        y is pre-flipped (stored as 1 − raw_y) so the JS viewer doesn't need
+        to re-flip it.
         """
         keyframes = []
         for i in range(0, len(frames), step):

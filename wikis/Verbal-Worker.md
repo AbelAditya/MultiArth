@@ -46,6 +46,29 @@ lexical statistics with **spaCy**.
    selection today. SenseVoice is loaded lazily and cached (`_get_sensevoice`,
    mirroring `_get_nlp`'s per-language spaCy caching) — English-only sessions
    never load it at all.
+
+   **Optional: SenseVoice can run remotely instead of locally.**
+   `funasr`+`torch` is a genuinely heavy dependency to load into this
+   process — set `SENSEVOICE_REMOTE_URL` (and `SENSEVOICE_API_KEY`) and
+   `_transcribe_alt` calls that URL over HTTP instead
+   (`_transcribe_alt_remote`), and this process never imports `funasr` at
+   all. [`colab/sensevoice_server.ipynb`](../colab/sensevoice_server.ipynb)
+   hosts the same model behind a small FastAPI endpoint, tunnelled out via
+   ngrok, meant to be run in a free Colab session while you're actively
+   analysing videos — see the notebook itself for setup (a free ngrok
+   account, and a shared `API_KEY`). Session lifetime is Colab's own free-tier
+   limits (disconnects after idling, ~12h hard cap) — this is "spin it up
+   for a batch, then it's fine to lose it" infrastructure, not a permanent
+   service; re-running the notebook gives a new URL each time, so
+   `SENSEVOICE_REMOTE_URL` needs updating to match.
+
+   A failed remote call (network down, tunnel expired, wrong API key) isn't
+   a new failure mode — it's an exception out of `_transcribe_alt_remote`,
+   which propagates through `_transcribe_alt` exactly like a local SenseVoice
+   failure always has, hitting the same try/except in `_transcribe` that
+   already falls back to Whisper's output for that job. Leaving
+   `SENSEVOICE_REMOTE_URL` unset (the default) keeps everything local,
+   unchanged from before this option existed.
 2. **Per-window features** (`_process_window`) — tokens are bucketed into
    each window by start time; a `VerbalFeatures` record (transcript text,
    token list, word count) is stored per window.
@@ -181,6 +204,7 @@ lexical statistics with **spaCy**.
 | faster-whisper | Speech-to-text transcription with word-level timestamps (all languages except `_ALT_ASR_LANGS`) | https://github.com/SYSTRAN/faster-whisper#readme |
 | funasr | Runs SenseVoice, the Chinese-specific ASR engine | https://github.com/modelscope/FunASR#readme |
 | torch / torchaudio | funasr/SenseVoice's inference backend (CPU or CUDA) | https://pytorch.org/docs/stable/index.html |
+| requests | HTTP client for `_transcribe_alt_remote` (optional remote SenseVoice) | https://requests.readthedocs.io/en/latest/ |
 | spaCy | Tokenization, lemmatization, POS tagging, dependency parsing | https://spacy.io/api |
 | loguru | Transcription/job logging | https://loguru.readthedocs.io/en/stable/ |
 | Pydantic | `VerbalFeatures` / `WordToken` models | https://docs.pydantic.dev/latest/ |

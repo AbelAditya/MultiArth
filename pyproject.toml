@@ -31,6 +31,15 @@ dependencies = [
     # Dockerfile / workers/gesture_worker.py) and loaded directly with
     # `tf.saved_model.load()` — no `tensorflow-hub` dependency needed.
     "tensorflow>=2.16",
+    # For bulk runs only (CLI `analyze bulk` and the dashboard's Bulk
+    # Upload tab): a persistent, local-only HTTP server
+    # (workers/gesture_server.py) that keeps MeTRAbs loaded for a whole
+    # batch instead of paying its ~15-22s load time per video. Single-video
+    # jobs still use the plain spawn-per-job subprocess
+    # (workers/gesture_subprocess.py) — see core/orchestrator.py's
+    # `persistent_gesture` flag.
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
     "scenedetect>=0.6.3",
     # opencv-contrib-python (not plain opencv-python) — camera_worker.py
     # needs its Haar cascade data (cv2.data.haarcascades), which plain
@@ -55,6 +64,12 @@ dependencies = [
     "torch>=2.0",
     "torchaudio>=2.0",
     "modelscope>=1.9",
+    # HTTP client for VerbalWorker._transcribe_alt_remote — talks to
+    # colab/sensevoice_server.ipynb when SENSEVOICE_REMOTE_URL is set, so
+    # funasr+torch above never need to load in this process at all. Already
+    # present transitively (funasr/huggingface_hub pull it in) but declared
+    # explicitly now that this code imports and uses it directly.
+    "requests>=2.31",
     "spacy>=3.7.4",
     # zh_core_web_sm's proper multi-character word segmenter — without this,
     # spaCy's Chinese tokenizer silently falls back to splitting every single

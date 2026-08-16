@@ -7,14 +7,23 @@ Transcribes the full audio once (word-level timestamps), then
 for each time window assigns tokens and computes linguistic features.
 Language is auto-detected by Whisper; the matching spaCy model is loaded
 lazily and cached so multi-language sessions don't reload unnecessarily.
+
+SenseVoice (see _ALT_ASR_LANGS/_transcribe_alt below) can optionally run
+remotely instead of loading funasr+torch locally — see
+`colab/sensevoice_server.ipynb` and the SENSEVOICE_REMOTE_URL /
+SENSEVOICE_API_KEY env vars below. Whichever mode is active, the rest of
+this file (windowing, corpus stats, everything downstream of _transcribe)
+is unaffected — it only ever sees a list[WordToken], same as from Whisper.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from collections import Counter
 from typing import Optional
 
+import requests
 import spacy
 from faster_whisper import WhisperModel
 from loguru import logger
@@ -39,6 +48,14 @@ _SPACY_MODELS: dict[str, str] = {
 # elsewhere for languages in this set. Add a code here (and a branch in
 # _transcribe_alt) to route another language the same way.
 _ALT_ASR_LANGS = frozenset({"zh"})
+
+# If set, _transcribe_alt calls this URL instead of loading SenseVoice
+# (funasr + torch) into this process at all — see colab/sensevoice_server.ipynb.
+# SENSEVOICE_API_KEY must match whatever API_KEY that notebook was given.
+# Empty/unset means "load and run SenseVoice locally", the original behaviour.
+_REMOTE_URL_ENV = "SENSEVOICE_REMOTE_URL"
+_REMOTE_API_KEY_ENV = "SENSEVOICE_API_KEY"
+_REMOTE_TIMEOUT_S = 300  # generous: Colab cold-start + a multi-minute upload + inference
 _SENSEVOICE_MODEL = "iic/SenseVoiceSmall"
 
 # _split_number_glue: a digit run immediately touching non-digit content,
@@ -96,6 +113,13 @@ class VerbalWorker:
         # never touch it, and its torch-backed load is much heavier than
         # Whisper's, so it shouldn't be paid for English-only jobs.
         self._sensevoice = None
+        # If set, SenseVoice never gets loaded in this process at all —
+        # _transcribe_alt calls a remote instance instead (see
+        # colab/sensevoice_server.ipynb, and _REMOTE_URL_ENV's docstring above).
+        self._remote_url = os.environ.get(_REMOTE_URL_ENV) or None
+        self._remote_api_key = os.environ.get(_REMOTE_API_KEY_ENV) or None
+        if self._remote_url:
+            logger.info(f"[verbal] SenseVoice will run remotely at {self._remote_url}")
 
     def _get_nlp(self, lang_code: str):
         """Return a cached spaCy model for *lang_code*, loading it on first use."""
@@ -246,7 +270,15 @@ class VerbalWorker:
         spaCy, in _build_doc/_compute_corpus_stats) still does the real word
         segmentation on top, unchanged by which ASR engine produced the raw
         transcript.
+
+        Runs locally (loading funasr+torch into this process) unless
+        _remote_url is set, in which case _transcribe_alt_remote handles it
+        instead and this process never imports funasr at all — see
+        colab/sensevoice_server.ipynb.
         """
+        if self._remote_url:
+            return self._transcribe_alt_remote(audio_path, lang_code)
+
         model = self._get_sensevoice()
         results = model.generate(
             input=audio_path,
@@ -268,6 +300,32 @@ class VerbalWorker:
                     confidence=1.0,
                 ))
         return tokens
+
+    def _transcribe_alt_remote(self, audio_path: str, lang_code: str) -> list[WordToken]:
+        """
+        Same contract as the local branch of _transcribe_alt above, but via
+        HTTP against a colab/sensevoice_server.ipynb instance instead of a
+        local funasr call — see _REMOTE_URL_ENV's module-level docstring.
+
+        Any failure here (network, timeout, bad response) is deliberately
+        let to propagate — _transcribe's own try/except around the
+        _transcribe_alt call already falls back to Whisper's output for this
+        job on any exception, so a dead/unreachable remote server degrades
+        the same way a local SenseVoice failure always has, not a new
+        failure mode.
+        """
+        
+        with open(audio_path, "rb") as f:
+            response = requests.post(
+                self._remote_url,
+                files={"file": (os.path.basename(audio_path), f, "audio/wav")},
+                data={"lang_code": lang_code},
+                headers={"X-API-Key": self._remote_api_key or ""},
+                timeout=_REMOTE_TIMEOUT_S,
+            )
+        response.raise_for_status()
+        payload = response.json()
+        return [WordToken(**tok) for tok in payload["tokens"]]
 
     def _process_window(
         self,
