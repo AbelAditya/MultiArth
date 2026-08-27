@@ -108,13 +108,70 @@ shape):
     backbone jump, changes the download by <5%; swapping to the
     `t`-suffixed detector shrinks it 8x, 248MB -> 31MB). Real tradeoff,
     per MeTRAbs's own published numbers: worse multi-person detection
-    accuracy (MuPoTS PCK 81.0 vs 86.6) than full YOLOv4 — acceptable here
+    accuracy (MuPoTS PCK 76.8 vs 81.8) than full YOLOv4 — acceptable here
     since this pipeline only needs the detector to reliably find *the*
     subject, not exhaustively catalog everyone in frame. The remote
     Colab notebook uses this exact same checkpoint, for consistent output
     between the two paths — a bigger checkpoint would be a legitimate
     separate upgrade to consider later, given the remote path has real
     GPU headroom the local path never did.
+
+## Frame resolution
+
+Frames are downscaled (`_resize_scale`, aspect-preserving, longer edge
+capped at `_MAX_DIM` = 960px) before they're held or sent anywhere, in both
+`_process_window_local` and `_process_window_remote`. This isn't a lossy
+shortcut traded for memory — MeTRAbs's own architecture makes the source
+frame's full resolution mostly unusable in the first place:
+
+  - The pose network itself is a **crop model**: it never sees the full
+    frame at all. It only ever runs on a small, fixed-size square crop
+    around each detected person's bounding box — 256px for the
+    MobileNetV3-Small checkpoint this project uses, regardless of the
+    source frame's resolution (confirmed against MeTRAbs's own
+    `docs/MODELS_6_DATASETS.md`). A 4K frame and a 960px frame produce the
+    *same* crop once a person's box is found — the extra source pixels get
+    downsampled away at crop time either way.
+  - The person detector (YOLOv4-tiny) is, like the whole YOLO family
+    generically, expected to run at a small fixed internal input size —
+    not confirmed against MeTRAbs's own docs specifically (they don't
+    document the bundled detector's internals), but standard for the
+    architecture.
+
+Real memory numbers this fixes: `core/preprocessing.py`'s
+`frames_for_window` holds up to 150 full-resolution frames per window in
+one list — at 1080p that's ~930MB, at 4K ~3.7GB, held raw before any
+inference even starts. This was confirmed as the direct cause of a real
+crash: the kernel's OOM killer killed the persistent `gesture_server`
+process at 7.7GB RSS mid-bulk-run (`journalctl` traced it to
+`workers.gesture_server`'s own pid, matching a growth curve that stepped up
+per video and never came back down — see `wikis/Gesture-Worker.md`'s "A
+memory-growth dead end" section for the fuller history of memory issues
+here). Downscaling cuts that per-window peak by roughly (960 / longer
+source edge)² — for 1080p, about 3x; for 4K, about 8x.
+
+Every 2D pixel coordinate MeTRAbs returns (`boxes`, `poses2d`/`pose_2d`) is
+in the *resized* image's pixel space, so both paths immediately rescale it
+back to the source video's original dimensions (dividing by `scale`)
+before it reaches any of the aggregation code below (`_box_center`,
+`_build_frame`, `_aggregate`, the velocity/displacement math) — none of
+that code changed or needs to know downscaling happens at all. `poses3d`
+(metric world-space mm) is *not* rescaled — MeTRAbs derives it from the
+assumed FOV and the image's own dimensions at inference time, so it's
+resolution-independent by construction, unlike the 2D image-space output.
+
+The remote path sends the *resized* dimensions as `width`/`height` in the
+request, not the original video's — `colab/gesture_server.ipynb`'s own
+normalisation (`_box_center`, in-frame visibility bounds) only ever uses
+whatever `width`/`height` the client sends, so this required no notebook
+change at all.
+
+Each raw frame is also released (`raw_frames[i] = None`) the moment it's
+been consumed (resized + fed to the model, or resized + JPEG-encoded),
+instead of the whole window's raw frames staying referenced until the
+whole window finishes — on the remote path in particular, this avoids
+holding a complete raw copy *and* a complete encoded copy of the same
+window simultaneously, which the original implementation did.
 """
 
 from __future__ import annotations
@@ -162,9 +219,21 @@ _REMOTE_API_KEY_ENV = "GESTURE_API_KEY"
 _REMOTE_TIMEOUT_S = 120  # one window's worth of frames (up to 150), batched
 _JPEG_QUALITY = 85
 
+# Frames are downscaled (aspect-preserving) to at most this on the longer
+# edge before they're ever held or sent — see module docstring's "Frame
+# resolution" section for why this loses ~nothing MeTRAbs can actually use.
+_MAX_DIM = 960
+
 
 def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+
+
+def _resize_scale(width: int, height: int, max_dim: int = _MAX_DIM) -> float:
+    """<=1.0 factor to shrink (width, height) so its longer edge is at most
+    max_dim; 1.0 (no-op) if it's already smaller."""
+    longest = max(width, height)
+    return min(1.0, max_dim / longest) if longest > max_dim else 1.0
 
 
 class GestureWorker:
@@ -264,8 +333,30 @@ class GestureWorker:
         # windows), same design as the remote path's selection logic.
         ref_pos: Optional[tuple[float, float]] = None
 
-        for frame_idx, (ts, bgr) in enumerate(raw_frames):
+        # See module docstring's "Frame resolution" section — MeTRAbs's
+        # detector and pose network only ever produce useful signal at a
+        # small, fixed internal resolution, so feeding it the source frame
+        # at full size costs memory/compute for nothing. Detection is run
+        # on the shrunk frame; every 2D pixel coordinate that comes back
+        # from it (boxes, poses2d — but *not* poses3d, which is metric
+        # world-space and resolution-independent) is scaled back up to
+        # meta.width/meta.height immediately below, so every caller past
+        # this point still sees the same original-frame pixel space it
+        # always has — _box_center, _build_frame, _aggregate, the velocity/
+        # displacement math, all unchanged.
+        scale = _resize_scale(meta.width, meta.height)
+        resized_wh = (round(meta.width * scale), round(meta.height * scale))
+
+        for frame_idx in range(len(raw_frames)):
+            ts, bgr = raw_frames[frame_idx]
+            raw_frames[frame_idx] = None  # release this frame's raw buffer as
+            # we go, rather than keeping the whole window's raw frames alive
+            # for the entire loop — see module docstring's "Frame resolution"
+            # section for why this and downscaling matter together.
+
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            if scale < 1.0:
+                rgb = cv2.resize(rgb, resized_wh, interpolation=cv2.INTER_AREA)
             image = tf.constant(rgb, dtype=tf.uint8)
             pred = model.detect_poses(
                 image, skeleton=_SKELETON, default_fov_degrees=_DEFAULT_FOV_DEGREES
@@ -278,6 +369,14 @@ class GestureWorker:
 
             poses2d = pred["poses2d"].numpy()
             poses3d = pred["poses3d"].numpy()
+            if scale < 1.0:
+                # .astype (not an in-place /=) since boxes/poses2d's actual
+                # dtype from the model isn't guaranteed float — dividing an
+                # int-dtype array in place would raise.
+                boxes = boxes.astype(np.float64)
+                boxes[:, :4] /= scale
+                poses2d = poses2d.astype(np.float64)
+                poses2d[..., :2] /= scale
 
             centers = [self._box_center(b, meta.width, meta.height) for b in boxes]
             if ref_pos is None:
@@ -302,9 +401,31 @@ class GestureWorker:
         `_process_window_local` produces — see module docstring's "Remote
         MeTRAbs, local fallback" for the full design and why per-window
         (not per-frame or per-video).
+
+        Frames are downscaled before encoding (see module docstring's
+        "Frame resolution" section) — the *resized* dimensions are what get
+        sent as `width`/`height`, since the server normalises entirely in
+        terms of whatever image it actually received and never needs to
+        know the original video's resolution. `pose_2d` comes back in that
+        same resized pixel space, so it's the one thing rescaled back to
+        meta.width/meta.height below; `pose_3d` is metric world-space and
+        resolution-independent, so it's used as-is.
+
+        Each raw frame's buffer is released (`raw_frames[i] = None`) the
+        moment it's been encoded into the payload, so the window's raw
+        frames and their encoded copies are never both fully alive at once
+        — before this, the whole raw_frames list stayed alive for the
+        entire request, on top of the payload being built alongside it.
         """
+        scale = _resize_scale(meta.width, meta.height)
+        resized_wh = (round(meta.width * scale), round(meta.height * scale))
+
         frames_payload = []
-        for frame_idx, (ts, bgr) in enumerate(raw_frames):
+        for frame_idx in range(len(raw_frames)):
+            ts, bgr = raw_frames[frame_idx]
+            raw_frames[frame_idx] = None
+            if scale < 1.0:
+                bgr = cv2.resize(bgr, resized_wh, interpolation=cv2.INTER_AREA)
             ok, jpeg = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY])
             if not ok:
                 continue
@@ -316,7 +437,7 @@ class GestureWorker:
 
         response = requests.post(
             self._remote_url,
-            json={"width": meta.width, "height": meta.height, "frames": frames_payload},
+            json={"width": resized_wh[0], "height": resized_wh[1], "frames": frames_payload},
             headers={"X-API-Key": self._remote_api_key or ""},
             timeout=_REMOTE_TIMEOUT_S,
         )
@@ -329,7 +450,7 @@ class GestureWorker:
                 gesture_frames.append(self._empty_frame(entry["frame_idx"], entry["ts"]))
                 continue
             pose = [
-                Landmark(x=xy[0], y=xy[1], z=0.0, visibility=vis)
+                Landmark(x=xy[0] / scale, y=xy[1] / scale, z=0.0, visibility=vis)
                 for xy, vis in zip(entry["pose_2d"], entry["visibility"])
             ]
             pose_world = [

@@ -34,6 +34,22 @@ two full-clip visual aids:
 All three outputs are written to the [`FeatureStore`](../core/feature_store.py)
 (`put_prosody`, `put_spectrogram`, `put_waveform`).
 
+## Values shown on the dashboard
+
+The **Acoustic Properties** section has one KPI card and four charts:
+
+| Where | What it shows |
+|---|---|
+| KPI card: **Mean F0** | Average pitch across the whole video, in Hz. |
+| **Spectrogram** chart | A visual "fingerprint" of the audio's frequency content over time — brighter means more energy at that frequency at that moment — with the pitch (F0) contour drawn on top. |
+| **Waveform** chart | The raw amplitude of the audio over time — the up-and-down shape most people picture when they think "audio waveform." |
+| **F0** (pitch) chart | Average pitch per time window, with a shaded band showing how much it varies within that window — a rough proxy for vocal expressiveness (a flat, narrow band reads as monotone; a wide, moving band reads as more animated). |
+| **Intensity** chart | Loudness (in dB) per time window. |
+
+`f0_range` (max − min pitch per window) and `speech_rate_syl_per_s` (filled
+in later by `FusionEngine` once transcript timing is available) are
+computed but aren't currently charted anywhere in the dashboard UI.
+
 ## Implementation notes
 
 - Segment extraction uses `parselmouth.WindowShape.RECTANGULAR` with

@@ -51,6 +51,21 @@ For every time window, `GestureWorker`:
 4. Stores the resulting `GestureFeatures` record in the Redis
    [`FeatureStore`](../core/feature_store.py) under `job:{id}:gesture:{w}`.
 
+## Values shown on the dashboard
+
+The **Pose Estimation** section has one KPI card and two charts, plus the
+video-overlaid skeleton:
+
+| Where | What it shows |
+|---|---|
+| KPI card: **Wrist Vel.** | Average wrist speed across the whole video. |
+| Pose overlay (on the video itself) | The tracked skeleton drawn over the video at the current playback moment, toggleable by body segment (Head/Face, Arms, Hands, Torso, Gaze) so you can isolate the part you care about. |
+| **Wrist Velocity** chart | How fast the hands are moving, per time window — a higher value means more energetic/animated gesturing in that window. |
+| **Handedness** chart | Which hand is doing more of the moving in each window, from −1 (fully left-dominant) through 0 (both hands equally) to +1 (fully right-dominant). |
+
+`max_wrist_displacement` and `pose_present_ratio` are computed per window but
+aren't currently surfaced anywhere in the dashboard UI.
+
 ## Why MeTRAbs, and what changed getting there
 
 This worker has been through several pose-estimation engines, each swapped

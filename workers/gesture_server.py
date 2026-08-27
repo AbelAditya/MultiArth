@@ -88,6 +88,16 @@ def main() -> None:
         sys.exit(2)
     port = int(sys.argv[1])
 
+    # This process is launched via a bare subprocess.Popen with no
+    # stdout/stderr redirection (core/orchestrator.py's
+    # _ensure_gesture_server) — unlike the isolated gesture_subprocess.py
+    # path, nothing re-logs its output through a parent process's own
+    # logger, so without this it's invisible the moment its console goes
+    # away (see wikis/Gesture-Worker.md's memory-growth history — this is
+    # exactly the gap that made diagnosing a real crash here a dead end).
+    from core.logging_setup import setup_file_logging
+    setup_file_logging("gesture_server")
+
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
 

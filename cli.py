@@ -30,6 +30,10 @@ from tqdm import tqdm
 
 load_dotenv()
 
+from core.logging_setup import setup_file_logging
+
+setup_file_logging("cli")
+
 from core.bulk_orchestrator import BulkOrchestrator, load_manifest
 from core.feature_store import FeatureStore
 from core.models import JobStatus

@@ -33,6 +33,20 @@ framing/zoom over time.
      from the Gesture worker, which give finer-grained framing information
      than face detection alone.
 
+## Values shown on the dashboard
+
+The **Camera** section has one KPI card and six charts:
+
+| Where | What it shows |
+|---|---|
+| KPI card: **Cuts** | Total number of scene cuts detected across the whole video. |
+| **Shot Type** chart | The dominant framing of each window — extreme close-up through very long shot — based on how much of the frame the subject fills. |
+| **Horizontal Angle** chart | Whether the subject is facing roughly toward the camera (frontal) or turned away (oblique), from shoulder orientation. |
+| **Vertical Angle** chart | Whether the camera is positioned above, level with, or below the subject's face (high / eye-level / low angle). |
+| **Scene Cuts** chart | How many cuts fall in each time window. |
+| **Face Area** chart | A rough zoom-level proxy: how much of the frame the largest detected face occupies. |
+| **Zoom Trend** chart | Whether the framing is zooming in or zooming out within each window. |
+
 ## Implementation notes
 
 - The Haar cascade is a fast, GPU-free, but low-accuracy face detector; the

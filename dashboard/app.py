@@ -30,6 +30,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from core.logging_setup import setup_file_logging
+
+setup_file_logging("dashboard")
+
 from core import corpus_analysis
 from core.bulk_orchestrator import BulkOrchestrator, load_manifest
 from core.drive_download import download_drive_file
@@ -809,7 +813,7 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
 
         # ── GESTURE ──────────────────────────────────────────────────────
         html.Div(style=SECTION_STYLE, children=[
-            section_header("Pose Estimation", C["gesture"], "MediaPipe Holistic · Kinematic features"),
+            section_header("Pose Estimation", C["gesture"], "MeTRAbs · Kinematic features"),
 
             html.Div(style={
                 "marginBottom": "28px", "paddingBottom": "24px",

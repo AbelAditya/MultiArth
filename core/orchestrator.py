@@ -70,7 +70,12 @@ from workers.camera_worker import CameraWorker
 from workers.prosody_worker import ProsodyWorker
 from workers.verbal_worker import VerbalWorker
 
-_GESTURE_SERVER_TIMEOUT_S = 300  # generous: first call pays MeTRAbs's ~15-22s load too
+_GESTURE_SERVER_TIMEOUT_S = 4800  # covers a whole video's worth of per-window
+# inference, not just the first call's ~15-22s model load — this scales with
+# video length/window count, so 300s (fine for short clips) silently timed
+# out on long ones. See _run_gesture_persistent: a timeout here now fails
+# the job properly instead of letting analyze()/fuse/ship proceed as if
+# gesture had actually finished.
 _GESTURE_SERVER_HEALTH_TIMEOUT_S = 30  # server process boot, not model load — should be quick
 
 
@@ -196,6 +201,11 @@ class Orchestrator:
             "camera":  lambda: self._camera_worker.process_job(job_id, meta, windows),
             "gesture": lambda: self._run_gesture(job_id, video_path),
         }
+        # Collect every worker's outcome before raising anything — waiting
+        # for all of them (not bailing on the first failure) means one
+        # worker's exception doesn't leave the others' threads to keep
+        # running detached from anything watching them.
+        failures: dict[str, BaseException] = {}
         with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
             futures = {pool.submit(fn): name for name, fn in tasks.items()}
             for future in as_completed(futures):
@@ -203,8 +213,18 @@ class Orchestrator:
                 exc = future.exception()
                 if exc:
                     logger.error(f"[orchestrator] Worker '{name}' raised: {exc}")
+                    failures[name] = exc
                 else:
                     logger.info(f"[orchestrator] Worker '{name}' finished")
+
+        if failures:
+            # Re-raise (rather than just log, as this used to) — otherwise
+            # analyze() has no way to know a worker failed, and proceeds to
+            # fuse/mark the job DONE/let it ship with that worker's data
+            # missing or incomplete. See analyze()'s own try/except, which
+            # already handles marking the job FAILED for exactly this.
+            names = ", ".join(failures)
+            raise RuntimeError(f"Worker(s) failed: {names}") from next(iter(failures.values()))
 
     def _run_sequential(self, job_id, meta, windows, video_path) -> None:
         self._prosody_worker.process_job(job_id, meta, windows)
@@ -263,8 +283,14 @@ class Orchestrator:
 
         if process.returncode != 0:
             logger.error(f"[orchestrator] Gesture subprocess for job {job_id} exited {process.returncode}")
-        else:
-            logger.info(f"[orchestrator] Gesture subprocess for job {job_id} finished")
+            # Raise (rather than just log, as this used to) — same reasoning
+            # as _run_gesture_persistent's except block: a silent return
+            # here looks like success to whatever called _run_gesture, and
+            # the job proceeds to fuse/DONE/ship with gesture data missing.
+            raise RuntimeError(
+                f"Gesture subprocess for job {job_id} exited {process.returncode}"
+            )
+        logger.info(f"[orchestrator] Gesture subprocess for job {job_id} finished")
 
     def _run_gesture_persistent(self, job_id: str, video_path: str) -> None:
         """
@@ -285,6 +311,16 @@ class Orchestrator:
             logger.info(f"[orchestrator] Persistent gesture server finished job {job_id}")
         except Exception:
             logger.exception(f"[orchestrator] Persistent gesture server failed on job {job_id}")
+            # Re-raise (rather than swallow, as this used to) — otherwise
+            # this looks like a successful "finished" to _run_parallel's
+            # future / _run_sequential's caller, and analyze() proceeds to
+            # fuse and mark the job DONE while gesture may still be running
+            # server-side (on a timeout, the server never got the memo that
+            # we gave up) or may have genuinely failed — either way the job
+            # should fail loudly, not ship with missing/incomplete gesture
+            # data. See analyze()'s own try/except, which already handles
+            # marking the job FAILED for exactly this kind of propagation.
+            raise
 
     def _ensure_gesture_server(self) -> None:
         """Starts workers/gesture_server.py if it isn't already running for this Orchestrator."""

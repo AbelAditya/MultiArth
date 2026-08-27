@@ -20,10 +20,15 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
+import time
 from collections import Counter
+from contextlib import ExitStack
+from pathlib import Path
 from typing import Optional
 
 import requests
+import soundfile as sf
 import spacy
 from faster_whisper import WhisperModel
 from loguru import logger
@@ -55,8 +60,21 @@ _ALT_ASR_LANGS = frozenset({"zh"})
 # Empty/unset means "load and run SenseVoice locally", the original behaviour.
 _REMOTE_URL_ENV = "SENSEVOICE_REMOTE_URL"
 _REMOTE_API_KEY_ENV = "SENSEVOICE_API_KEY"
-_REMOTE_TIMEOUT_S = 300  # generous: Colab cold-start + a multi-minute upload + inference
 _SENSEVOICE_MODEL = "iic/SenseVoiceSmall"
+
+# Remote transcription is chunked rather than sent as one whole-file request
+# — see _transcribe_alt_remote's docstring for why (it's not just about
+# request size). _REMOTE_CHUNKS_PER_REQUEST chunks are bundled into each
+# request as a list, so 5 x 60s = 300s of audio per request, matching the
+# server's own batch_size_s=300 so FunASR actually batches them together.
+_REMOTE_CHUNK_S = 60
+_REMOTE_CHUNKS_PER_REQUEST = 5
+_REMOTE_CHUNK_TIMEOUT_S = 180  # generous for one ~300s-of-audio batch request
+_REMOTE_CHUNK_RETRIES = 2      # extra attempts per batch before giving up on
+# remote entirely and letting _transcribe's existing fallback hand the whole
+# job to Whisper — retrying a batch here means one flaky request doesn't
+# throw away every chunk that already succeeded.
+_REMOTE_CHUNK_RETRY_BACKOFF_S = 3
 
 # _split_number_glue: a digit run immediately touching non-digit content,
 # in either direction ("30岁"/"5apples" = digit-prefix, "第5" = digit-suffix).
@@ -307,25 +325,122 @@ class VerbalWorker:
         HTTP against a colab/sensevoice_server.ipynb instance instead of a
         local funasr call — see _REMOTE_URL_ENV's module-level docstring.
 
-        Any failure here (network, timeout, bad response) is deliberately
-        let to propagate — _transcribe's own try/except around the
-        _transcribe_alt call already falls back to Whisper's output for this
-        job on any exception, so a dead/unreachable remote server degrades
-        the same way a local SenseVoice failure always has, not a new
-        failure mode.
+        The audio is split into _REMOTE_CHUNK_S-second pieces and sent
+        _REMOTE_CHUNKS_PER_REQUEST at a time, as a list, in one HTTP request
+        per batch, instead of the whole file in one request (the original
+        design). That bundling is doing two distinct jobs, not one:
+
+        - It's what actually lets the server's own batch_size_s=300 FunASR
+          setting do anything — a single whole-file request only ever gave
+          FunASR one item to batch, so that machinery sat idle. Sending
+          5 x 60s chunks per request (300s total, matching batch_size_s)
+          lets FunASR batch them together on the GPU instead of decoding
+          one long sequence serially — a real compute-side speedup, not
+          just a smaller request.
+        - Each request's duration is now bounded by _REMOTE_CHUNK_S x
+          _REMOTE_CHUNKS_PER_REQUEST regardless of the video's total length,
+          instead of scaling with it (the whole-file design's request
+          latency scaled with video length, which is what silently blew
+          past a fixed client timeout on long videos). One long silent wait
+          becomes a series of logged checkpoints instead (see the progress
+          log below), so a long transcription's progress is actually
+          visible while it runs.
+
+        Each batch retries up to _REMOTE_CHUNK_RETRIES times (network
+        errors, timeouts, bad/short responses) before this raises — same as
+        before, _transcribe's own try/except around _transcribe_alt then
+        falls back to Whisper for the whole job. Tokens from batches that
+        *did* succeed before a later batch exhausts its retries are
+        discarded rather than mixed with Whisper's output, so a job's
+        transcript always comes from a single engine end to end.
         """
-        
-        with open(audio_path, "rb") as f:
-            response = requests.post(
-                self._remote_url,
-                files={"file": (os.path.basename(audio_path), f, "audio/wav")},
-                data={"lang_code": lang_code},
-                headers={"X-API-Key": self._remote_api_key or ""},
-                timeout=_REMOTE_TIMEOUT_S,
-            )
-        response.raise_for_status()
-        payload = response.json()
-        return [WordToken(**tok) for tok in payload["tokens"]]
+        audio, sample_rate = sf.read(audio_path, dtype="int16")
+        total_s = len(audio) / sample_rate
+        chunk_frames = int(_REMOTE_CHUNK_S * sample_rate)
+        chunk_frame_starts = list(range(0, len(audio), chunk_frames))
+        logger.info(
+            f"[verbal] Sending {len(chunk_frame_starts)} chunks "
+            f"({_REMOTE_CHUNK_S}s each, {total_s:.0f}s total) to remote "
+            f"SenseVoice, {_REMOTE_CHUNKS_PER_REQUEST} chunks per request"
+        )
+
+        tokens: list[WordToken] = []
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            for batch_start in range(0, len(chunk_frame_starts), _REMOTE_CHUNKS_PER_REQUEST):
+                batch_frame_starts = chunk_frame_starts[batch_start:batch_start + _REMOTE_CHUNKS_PER_REQUEST]
+                batch: list[tuple[Path, float]] = []
+                for i, frame_start in enumerate(batch_frame_starts):
+                    frame_end = min(frame_start + chunk_frames, len(audio))
+                    chunk_path = Path(tmp_dir) / f"chunk_{batch_start + i}.wav"
+                    sf.write(str(chunk_path), audio[frame_start:frame_end], sample_rate)
+                    batch.append((chunk_path, frame_start / sample_rate))
+
+                tokens.extend(self._send_chunk_batch(batch, lang_code))
+
+                done_s = min((batch_start + len(batch)) * _REMOTE_CHUNK_S, total_s)
+                pct = (done_s / total_s * 100) if total_s else 100
+                logger.info(
+                    f"[verbal] Remote SenseVoice progress: {done_s:.0f}s / "
+                    f"{total_s:.0f}s ({pct:.0f}%) — {len(tokens)} tokens so far"
+                )
+
+        return tokens
+
+    def _send_chunk_batch(
+        self, batch: list[tuple[Path, float]], lang_code: str
+    ) -> list[WordToken]:
+        """
+        POST one batch of chunk files (as a list, so the server batches them
+        — see _transcribe_alt_remote's docstring) with retries, then offset
+        each chunk's returned tokens back onto the full audio's timeline.
+        Raises (after _REMOTE_CHUNK_RETRIES retries) if every attempt fails.
+        """
+        last_exc: Optional[Exception] = None
+        attempts = _REMOTE_CHUNK_RETRIES + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                with ExitStack() as stack:
+                    files = [
+                        ("files", (path.name, stack.enter_context(open(path, "rb")), "audio/wav"))
+                        for path, _ in batch
+                    ]
+                    response = requests.post(
+                        self._remote_url,
+                        files=files,
+                        data={"lang_code": lang_code},
+                        headers={"X-API-Key": self._remote_api_key or ""},
+                        timeout=_REMOTE_CHUNK_TIMEOUT_S,
+                    )
+                response.raise_for_status()
+                chunk_results = response.json()["chunks"]
+                if len(chunk_results) != len(batch):
+                    raise RuntimeError(
+                        f"Remote server returned {len(chunk_results)} chunk "
+                        f"results, expected {len(batch)}"
+                    )
+
+                tokens: list[WordToken] = []
+                for (_, chunk_offset_s), result in zip(batch, chunk_results):
+                    for tok in result["tokens"]:
+                        tokens.append(WordToken(
+                            word=tok["word"],
+                            start_s=tok["start_s"] + chunk_offset_s,
+                            end_s=tok["end_s"] + chunk_offset_s,
+                            confidence=tok["confidence"],
+                        ))
+                return tokens
+            except Exception as exc:
+                last_exc = exc
+                if attempt <= _REMOTE_CHUNK_RETRIES:
+                    logger.warning(
+                        f"[verbal] Remote SenseVoice batch failed "
+                        f"(attempt {attempt}/{attempts}): {exc} — retrying "
+                        f"in {_REMOTE_CHUNK_RETRY_BACKOFF_S}s"
+                    )
+                    time.sleep(_REMOTE_CHUNK_RETRY_BACKOFF_S)
+        raise RuntimeError(
+            f"Remote SenseVoice batch failed after {attempts} attempts"
+        ) from last_exc
 
     def _process_window(
         self,

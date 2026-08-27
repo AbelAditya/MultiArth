@@ -172,6 +172,23 @@ lexical statistics with **spaCy**.
      displayed word is the original typed contraction, the timestamp is the
      **first** token's, and the span extends to the second token's end.
 
+## Values shown on the dashboard
+
+The **Verbal Language** section has four tabs plus one KPI card, all driven
+by this worker's output:
+
+| Where | What it shows |
+|---|---|
+| KPI card: **Words** | Total word count for the whole video. |
+| **Transcript** tab | The full transcript, with the line for whatever moment the video is currently playing highlighted. |
+| **Concordance** tab | Every occurrence of a searched word, shown with the text around it (keyword-in-context), plus how often it occurs overall. |
+| **Word Sketch & Thesaurus** tab | For a searched word: what it typically appears *with*, broken down by role (e.g. what it modifies, what modifies it, what verbs govern it); a **Distributional Thesaurus** listing other words used in similar contexts; and, if a second word is entered, a side-by-side comparison of the two words' usage patterns. |
+| **Frequency** tab | A ranked word list for the whole transcript, filterable by part of speech (noun, verb, adjective, adverb). |
+
+All four tabs operate on the same transcript and word-level timestamps — the
+tab you're on changes how that data is sliced and displayed, not which
+video's words you're looking at.
+
 ## Multi-language support
 
 - Whisper auto-detects the spoken language; the matching spaCy model is
