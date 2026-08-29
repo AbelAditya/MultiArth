@@ -186,6 +186,7 @@ import cv2
 import numpy as np
 import requests
 from loguru import logger
+from scenedetect import ContentDetector, SceneManager, open_video
 
 from core.feature_store import FeatureStore
 from core.models import GestureFeatures, GestureFrame, Landmark, PoseKeyframe, TimeWindow
@@ -224,6 +225,30 @@ _JPEG_QUALITY = 85
 # resolution" section for why this loses ~nothing MeTRAbs can actually use.
 _MAX_DIM = 960
 
+# Same ContentDetector default CameraWorker uses (core/camera_worker.py) —
+# not shared/imported from there deliberately, see _detect_scene_cuts.
+_SCENE_CUT_THRESHOLD = 27.0
+
+# If the nearest-to-ref_pos candidate is farther than this (normalised
+# [0,1] frame-fraction distance) from the last known position, it's treated
+# as implausible — track loss, not a real continuation — and a fresh
+# centrality vote runs instead of trusting it. Starting value, not
+# empirically tuned yet.
+_MAX_TRACK_JUMP = 0.3
+
+# Background-subtraction-based foreground filtering was tried here and
+# reverted — measured directly against real footage, a real continuously-
+# present, actively-gesturing speaker's own bounding box scored a mean
+# foreground ratio of just 0.088 (some frames as low as 0.000), because a
+# speaker mostly stands still (torso/legs/head largely stationary, only
+# hands/arms moving) and MOG2 can't distinguish that from genuine static
+# background within a single 5s window. It would have rejected the real
+# subject far more often than it caught anything static/false. Revisit
+# alongside per-candidate motion-scoring (deferred) rather than as a
+# separate mechanism — same underlying signal, better suited to relative
+# comparison between candidates than absolute background/foreground
+# classification of one.
+
 
 def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
@@ -233,7 +258,7 @@ def _resize_scale(width: int, height: int, max_dim: int = _MAX_DIM) -> float:
     """<=1.0 factor to shrink (width, height) so its longer edge is at most
     max_dim; 1.0 (no-op) if it's already smaller."""
     longest = max(width, height)
-    return min(1.0, max_dim / longest) if longest > max_dim else 1.0
+    return min(1.0, max_dim/longest)
 
 
 class GestureWorker:
@@ -283,9 +308,13 @@ class GestureWorker:
         self._remote_failed_this_job = False
 
         logger.info(f"[gesture] Starting job {job_id} — {len(windows)} windows")
+        cuts = self._detect_scene_cuts(meta.path)
+        logger.info(f"[gesture] Found {len(cuts)} scene cuts (own independent pass)")
+
         for idx, (start, end) in enumerate(windows):
             try:
-                features = self._process_window(meta, start, end)
+                window_cuts = [c for c in cuts if start <= c < end]
+                features = self._process_window(meta, start, end, window_cuts)
                 self.store.put_gesture(job_id, idx, features)
                 logger.debug(f"[gesture] window {idx} done")
             except Exception as exc:
@@ -296,15 +325,40 @@ class GestureWorker:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _detect_scene_cuts(video_path: str) -> list[float]:
+        """
+        This worker's own PySceneDetect pass — deliberately independent
+        from CameraWorker's own identical pass (core/camera_worker.py),
+        not wired to it. Orchestrator._run_parallel dispatches gesture and
+        camera concurrently with no ordering guarantee between them, and
+        gesture runs in its own subprocess in both isolated (per-video) and
+        persistent-server (bulk) modes — see module docstring — so sharing
+        one worker's cut list with the other would mean either serializing
+        dispatch order or shipping cut data across a process boundary.
+        Running the same detection pass twice is a real, accepted cost for
+        keeping the two workers' concurrency untouched.
+
+        Returns just the cut timestamps (seconds) — gesture only needs
+        "did a cut happen here" for ref_pos resets, not a full SceneCut
+        record (frame index, cut score) the way Camera's dashboard chart
+        does.
+        """
+        video = open_video(video_path)
+        scene_manager = SceneManager()
+        scene_manager.add_detector(ContentDetector(threshold=_SCENE_CUT_THRESHOLD))
+        scene_manager.detect_scenes(video, show_progress=False)
+        return [start_tc.get_seconds() for start_tc, _ in scene_manager.get_scene_list()]
+
     def _process_window(
-        self, meta: VideoMeta, start_s: float, end_s: float
+        self, meta: VideoMeta, start_s: float, end_s: float, window_cuts: list[float]
     ) -> GestureFeatures:
         raw_frames = frames_for_window(meta.path, start_s, end_s, meta.fps)
 
         gesture_frames: Optional[list[GestureFrame]] = None
         if self._remote_url and not self._remote_failed_this_job:
             try:
-                gesture_frames = self._process_window_remote(raw_frames, meta)
+                gesture_frames = self._process_window_remote(raw_frames, meta, window_cuts)
                 logger.info("RUNNING POSE ESTIMATION REMOTELY")
             except Exception as exc:
                 logger.warning(
@@ -314,12 +368,15 @@ class GestureWorker:
                 self._remote_failed_this_job = True
 
         if gesture_frames is None:
-            gesture_frames = self._process_window_local(raw_frames, meta)
+            gesture_frames = self._process_window_local(raw_frames, meta, window_cuts)
 
         return self._aggregate(start_s, end_s, gesture_frames, meta.width, meta.height)
 
     def _process_window_local(
-        self, raw_frames: list[tuple[float, np.ndarray]], meta: VideoMeta
+        self,
+        raw_frames: list[tuple[float, np.ndarray]],
+        meta: VideoMeta,
+        window_cuts: list[float],
     ) -> list[GestureFrame]:
         import tensorflow as tf  # deferred — see module docstring; cheap
         # after the first call (module import is cached), whether that was
@@ -327,11 +384,13 @@ class GestureWorker:
 
         model = self._get_model()
         gesture_frames: list[GestureFrame] = []
-        # None until the first frame with any detection in this window —
-        # that frame runs the centrality vote; every frame after just tracks
-        # whoever was picked. Reset every window (never carried across
-        # windows), same design as the remote path's selection logic.
+        # None until the first frame with any detection in this window (or
+        # since the last scene cut within it) — that frame runs the
+        # centrality vote; every frame after just tracks whoever was
+        # picked. Reset every window (never carried across windows) *and*
+        # at every scene cut within a window — see next_cut_idx below.
         ref_pos: Optional[tuple[float, float]] = None
+        next_cut_idx = 0
 
         # See module docstring's "Frame resolution" section — MeTRAbs's
         # detector and pose network only ever produce useful signal at a
@@ -353,6 +412,14 @@ class GestureWorker:
             # we go, rather than keeping the whole window's raw frames alive
             # for the entire loop — see module docstring's "Frame resolution"
             # section for why this and downscaling matter together.
+
+            # A cut landing anywhere at-or-before this frame's timestamp
+            # invalidates whatever we were tracking — the next frame is a
+            # different shot, so "nearest to ref_pos" would be measuring
+            # distance in a scene ref_pos was never computed from.
+            while next_cut_idx < len(window_cuts) and window_cuts[next_cut_idx] <= ts:
+                ref_pos = None
+                next_cut_idx += 1
 
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             if scale < 1.0:
@@ -383,6 +450,11 @@ class GestureWorker:
                 chosen = min(range(len(centers)), key=lambda i: _dist(centers[i], _FRAME_CENTER))
             else:
                 chosen = min(range(len(centers)), key=lambda i: _dist(centers[i], ref_pos))
+                if _dist(centers[chosen], ref_pos) > _MAX_TRACK_JUMP:
+                    # Implausible jump — more likely a track switch onto
+                    # someone/something else than real motion. Treat as
+                    # track loss: re-vote by centrality instead of trusting it.
+                    chosen = min(range(len(centers)), key=lambda i: _dist(centers[i], _FRAME_CENTER))
             ref_pos = centers[chosen]
 
             gf = self._build_frame(
@@ -393,7 +465,10 @@ class GestureWorker:
         return gesture_frames
 
     def _process_window_remote(
-        self, raw_frames: list[tuple[float, np.ndarray]], meta: VideoMeta
+        self,
+        raw_frames: list[tuple[float, np.ndarray]],
+        meta: VideoMeta,
+        window_cuts: list[float],
     ) -> list[GestureFrame]:
         """
         Sends this window's frames to colab/gesture_server.ipynb as one
@@ -401,6 +476,16 @@ class GestureWorker:
         `_process_window_local` produces — see module docstring's "Remote
         MeTRAbs, local fallback" for the full design and why per-window
         (not per-frame or per-video).
+
+        window_cuts is sent along in the request body so the server can
+        apply the same scene-cut ref_pos reset _process_window_local does —
+        the server has no way to compute this itself (it only ever
+        receives one window's worth of already-extracted frames, never the
+        source video file, and PySceneDetect needs sequential whole-video
+        access to work at all). The max-jump ambiguity guard, by contrast,
+        only needs this window's own frames, so it runs server-side
+        directly, duplicated the same way the vote/track selection logic
+        already was.
 
         Frames are downscaled before encoding (see module docstring's
         "Frame resolution" section) — the *resized* dimensions are what get
@@ -437,7 +522,10 @@ class GestureWorker:
 
         response = requests.post(
             self._remote_url,
-            json={"width": resized_wh[0], "height": resized_wh[1], "frames": frames_payload},
+            json={
+                "width": resized_wh[0], "height": resized_wh[1],
+                "frames": frames_payload, "cuts": window_cuts,
+            },
             headers={"X-API-Key": self._remote_api_key or ""},
             timeout=_REMOTE_TIMEOUT_S,
         )
@@ -584,10 +672,19 @@ class GestureWorker:
         frames: list[GestureFrame],
         width: int,
         height: int,
-        step: int = 3,
+        step: int = 1,
     ) -> list[PoseKeyframe]:
         """
         Return every `step`-th frame as a PoseKeyframe with normalised coords.
+        step=1 (no subsampling) — frames here is already pose_present (real
+        detections only), and for content analyzed at full native-frame
+        density (frames_for_window's own step==1, true whenever
+        native_fps * window_size_s <= max_frames — e.g. any video at or
+        below ~30fps with the default 5s window), that means one keyframe
+        per real detection, matching the dashboard overlay's render-time
+        max-gap cap (see dashboard/app.py's drawLoop) rather than leaving
+        real, already-computed predictions on the floor. The old step=3
+        thinned this by two-thirds for no benefit beyond a smaller payload.
         y is pre-flipped (stored as 1 − raw_y) so the JS viewer doesn't need
         to re-flip it.
         """

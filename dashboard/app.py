@@ -1711,6 +1711,20 @@ clientside_callback(
                 if (frames[mid].ts < t) lo = mid + 1; else hi = mid;
             }
             if (lo > 0 && Math.abs(frames[lo-1].ts - t) < Math.abs(frames[lo].ts - t)) lo--;
+
+            // Reject the match if it's too far from the current playback
+            // moment — without this, a span with no real detections at all
+            // (opening-graphics intro, a slide cutaway) still finds
+            // *something* as "nearest" and renders it statically for the
+            // whole span, however far away it actually is in time. At
+            // step=1 keyframe density (see gesture_worker.py's
+            // _extract_keyframes), real gaps during active tracking are on
+            // the order of one native frame's duration — comfortably under
+            // this cap — so it only ever suppresses genuinely empty spans,
+            // not normal tracking.
+            var MAX_KEYFRAME_GAP_S = 0.3;
+            if (Math.abs(frames[lo].ts - t) > MAX_KEYFRAME_GAP_S) return;
+
             var f = frames[lo];
             var px = f.px, py = f.py, pv = f.pv, nKp = px.length;
             if (nKp < 19) return;  // coco_19 keypoint count (was 17 under RTMPose, 33 under MediaPipe)
