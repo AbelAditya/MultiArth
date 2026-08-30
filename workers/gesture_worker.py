@@ -672,19 +672,26 @@ class GestureWorker:
         frames: list[GestureFrame],
         width: int,
         height: int,
-        step: int = 1,
+        step: int = 2,
     ) -> list[PoseKeyframe]:
         """
         Return every `step`-th frame as a PoseKeyframe with normalised coords.
-        step=1 (no subsampling) — frames here is already pose_present (real
-        detections only), and for content analyzed at full native-frame
-        density (frames_for_window's own step==1, true whenever
-        native_fps * window_size_s <= max_frames — e.g. any video at or
-        below ~30fps with the default 5s window), that means one keyframe
-        per real detection, matching the dashboard overlay's render-time
-        max-gap cap (see dashboard/app.py's drawLoop) rather than leaving
-        real, already-computed predictions on the floor. The old step=3
-        thinned this by two-thirds for no benefit beyond a smaller payload.
+        frames here is already pose_present (real detections only), and for
+        content analyzed at full native-frame density (frames_for_window's
+        own step==1, true whenever native_fps * window_size_s <= max_frames
+        — e.g. any video at or below ~30fps with the default 5s window),
+        step controls how many of those already-computed real detections
+        actually become keyframes.
+
+        step=1 (one keyframe per real detection) was tried first and
+        reverted — MeTRAbs has no built-in temporal smoothing between
+        frames (each frame's landmarks are estimated independently), so at
+        full density the overlay visibly picked up that per-frame jitter,
+        reported as the rendered skeleton "jumping around a lot" rather
+        than tracking smoothly. step=2 widens the gap between consecutive
+        *displayed* keyframes enough that real motion dominates over that
+        per-frame noise, while still keeping meaningfully more of the
+        already-computed predictions than the original step=3 did.
         y is pre-flipped (stored as 1 − raw_y) so the JS viewer doesn't need
         to re-flip it.
         """

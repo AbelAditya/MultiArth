@@ -13,3 +13,4 @@ __pycache__/
 colocations.json
 rel_labels.json
 /tmp/
+colab/

@@ -1702,28 +1702,34 @@ clientside_callback(
             var timeline = state.timeline;
             if (!state.visible || !timeline || !timeline.frames || !timeline.frames.length) return;
 
-            // Binary-search nearest keyframe to video.currentTime
+            // Binary-search for the most recent keyframe at-or-before
+            // video.currentTime (never the next one) — a pose is only ever
+            // shown once it's actually happened in the video's own
+            // timeline, never slightly early. Standard upper_bound search:
+            // find the first index whose ts is *past* t, then step back
+            // one to land on the last index at-or-before it.
             var t = video.currentTime;
             var frames = timeline.frames;
-            var lo = 0, hi = frames.length - 1;
+            var lo = 0, hi = frames.length;
             while (lo < hi) {
                 var mid = (lo + hi) >> 1;
-                if (frames[mid].ts < t) lo = mid + 1; else hi = mid;
+                if (frames[mid].ts <= t) lo = mid + 1; else hi = mid;
             }
-            if (lo > 0 && Math.abs(frames[lo-1].ts - t) < Math.abs(frames[lo].ts - t)) lo--;
+            lo--;
+            if (lo < 0) return;  // nothing at or before this moment yet
+            // (e.g. before the first real detection of the video/window).
 
-            // Reject the match if it's too far from the current playback
-            // moment — without this, a span with no real detections at all
-            // (opening-graphics intro, a slide cutaway) still finds
-            // *something* as "nearest" and renders it statically for the
-            // whole span, however far away it actually is in time. At
-            // step=1 keyframe density (see gesture_worker.py's
-            // _extract_keyframes), real gaps during active tracking are on
-            // the order of one native frame's duration — comfortably under
-            // this cap — so it only ever suppresses genuinely empty spans,
-            // not normal tracking.
+            // Reject the match if it's too stale — without this, a span
+            // with no real detections at all (opening-graphics intro, a
+            // slide cutaway) still finds the last real keyframe before it
+            // and holds it, frozen, for the whole span, however long ago
+            // it actually was. At step=2 keyframe density (see
+            // gesture_worker.py's _extract_keyframes), real gaps during
+            // active tracking are on the order of two native frames'
+            // duration — comfortably under this cap — so it only ever
+            // suppresses genuinely empty spans, not normal tracking.
             var MAX_KEYFRAME_GAP_S = 0.3;
-            if (Math.abs(frames[lo].ts - t) > MAX_KEYFRAME_GAP_S) return;
+            if (t - frames[lo].ts > MAX_KEYFRAME_GAP_S) return;
 
             var f = frames[lo];
             var px = f.px, py = f.py, pv = f.pv, nKp = px.length;
