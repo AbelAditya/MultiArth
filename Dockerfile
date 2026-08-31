@@ -18,12 +18,13 @@ COPY pyproject.toml uv.lock ./
 # pynndescent), instead of the modern 0.48.0 the local lockfile pins.
 RUN uv sync --frozen --no-dev --no-install-project
 
-# scenedetect pulls in opencv-python; opencv-contrib-python isn't pulled in
-# by anything else in the dependency tree (MeTRAbs uses TensorFlow directly,
-# not OpenCV), but camera_worker.py needs its Haar cascade data, which
-# plain opencv-python doesn't ship. Installing it explicitly, after
-# scenedetect, forces its complete file set to win the site-packages/cv2/
-# merge deterministically instead of leaving the outcome to install order.
+# scenedetect pulls in opencv-python; on this branch mediapipe pulls in
+# opencv-contrib-python itself too (confirmed directly against its own
+# PyPI metadata) — but camera_worker.py needs Haar cascade data specifically,
+# which isn't guaranteed to win whichever variant's file set install order
+# happens to leave in site-packages/cv2/. Installing opencv-contrib-python
+# explicitly, last, forces its complete file set to win that merge
+# deterministically rather than leaving the outcome to install order.
 RUN uv pip install --reinstall-package opencv-contrib-python "opencv-contrib-python==4.13.0.92"
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
@@ -31,8 +32,8 @@ FROM python:3.11-slim AS runtime
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-# System deps: ffmpeg for audio extraction, OpenCV runtime libs, curl+unzip
-# to fetch the MeTRAbs model below
+# System deps: ffmpeg for audio extraction, OpenCV runtime libs, curl to
+# fetch the MediaPipe models below (no unzip needed — .task files, not zips)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libgl1 \
@@ -41,7 +42,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libxrender1 \
     curl \
-    unzip \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -73,17 +73,16 @@ AutoModel(
     disable_update=True,
 )
 EOF
-# Pre-download the MeTRAbs pose model (see workers/gesture_worker.py) —
-# a standalone TensorFlow SavedModel, not distributed via pip. Uses the
-# YOLOv4-tiny-detector variant (mob3s_y4t, ~31MB) rather than the
-# full-YOLOv4 one (mob3s_y4, ~248MB) — the latter's runtime footprint
-# was part of why this needed to move to an isolated subprocess (see
-# workers/gesture_subprocess.py, core/orchestrator.py).
+# Pre-download the MediaPipe pose model (see workers/gesture_worker.py) —
+# a small .task file, not distributed via pip. workers/gesture_worker.py's
+# _ensure_model would also download this lazily at first use if this step
+# were skipped, but baking it in at build time avoids paying that ~ a few
+# hundred ms->seconds download cost (network-dependent) on a container's
+# first real job. No hand model — HandLandmarker was tried and removed
+# again (see workers/gesture_worker.py's module docstring).
 RUN mkdir -p models && \
-    curl -sL -o /tmp/metrabs.zip \
-      https://omnomnom.vision.rwth-aachen.de/data/metrabs/metrabs_mob3s_y4t.zip && \
-    unzip -q /tmp/metrabs.zip -d models && \
-    rm /tmp/metrabs.zip
+    curl -sL -o models/pose_landmarker_lite.task \
+      https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task
 
 # Copy application code
 COPY . .

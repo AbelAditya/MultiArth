@@ -19,53 +19,53 @@ from core.models import (
 )
 
 
-# MeTRAbs "coco_19" skeleton indices — see workers/gesture_worker.py for how
-# these were established (verified directly against the model, no
-# authoritative public spec exists). Neither MediaPipe's old 33-point
-# topology nor RTMPose's COCO-17 apply anymore.
-_NOSE = 1
-_L_HIP, _R_HIP = 6, 12
-_L_KNEE, _R_KNEE = 7, 13
-_L_ANKLE, _R_ANKLE = 8, 14
-_L_SHOULDER, _R_SHOULDER = 3, 9
-_L_EAR, _R_EAR = 16, 18
+# MediaPipe BlazePose 33-point skeleton indices — see
+# workers/gesture_worker.py's module docstring for the full topology. This
+# is the standard, published index scheme (not model-specific/verified the
+# way MeTRAbs's coco_19 indices had to be), and matches this project's own
+# original MediaPipe-era fusion_engine.py exactly (confirmed via git
+# history — commits b463547/197a753 — after the intervening coco_19-era
+# code, which used different indices for a differently-shaped skeleton,
+# was replaced).
+_NOSE = 0
+_L_EAR, _R_EAR = 7, 8
+_L_SHOULDER, _R_SHOULDER = 11, 12
+_L_HIP, _R_HIP = 23, 24
+_L_KNEE, _R_KNEE = 25, 26
+_L_ANKLE, _R_ANKLE = 27, 28
+_L_FOOT, _R_FOOT = 31, 32
 
 
 def _classify_shot_from_pose(keyframes: list[PoseKeyframe]) -> ShotType:
     """
     Determine shot type from which body landmarks are consistently visible
-    across keyframes. Indices are MeTRAbs's "coco_19" skeleton (see
-    workers/gesture_worker.py), not MediaPipe's old 33-point topology or
-    RTMPose's COCO-17.
+    across keyframes.
 
     Landmark y-coords in PoseKeyframe are stored pre-flipped as (1 - raw_y),
     so pose_y=1.0 is the top of the frame and pose_y=0.0 is the bottom.
 
     Classification ladder (most inclusive wins):
-      ankles visible + tall person  → LONG
-      ankles visible + small person → VERY_LONG
+      feet   visible + tall person  → LONG
+      feet   visible + small person → VERY_LONG
+      ankles visible (feet not)     → MEDIUM_LONG
       knees  visible                → MEDIUM
       hips   visible                → MEDIUM_CLOSE
       shoulders visible             → CLOSE_UP
       nose   only                   → EXTREME_CLOSE_UP
       nothing detected              → UNKNOWN
 
-    Like COCO-17, coco_19 has no foot/toe landmark distinct from ankle
-    (MediaPipe had both, at 27/28 and 31/32), so the old feet-vs-ankle
-    split — LONG/VERY_LONG vs. a separate MEDIUM_LONG tier — stays
-    collapsed into one ankle-based tier here. MEDIUM_LONG is not emitted.
-
-    "Visible" here is a pseudo-visibility MeTRAbs itself doesn't provide
-    (see workers/gesture_worker.py's module docstring) — a landmark counts
-    if its 2D projection actually lands inside the frame, not extrapolated
-    off-screen from occlusion. VIS_MIN below effectively just distinguishes
-    that 0.0/1.0 flag; it isn't a real confidence threshold anymore.
+    This restores the original MediaPipe-era feet-vs-ankle distinction
+    (confirmed via git history) — the intervening coco_19-based model had
+    no foot/toe landmark distinct from ankle, so LONG/VERY_LONG and
+    MEDIUM_LONG were collapsed into one ankle-based tier for a while.
+    BlazePose has real, separate ankle (27/28) and foot-index (31/32)
+    landmarks again, so that distinction is meaningful once more.
     """
     n = len(keyframes)
     if n == 0:
         return ShotType.UNKNOWN
 
-    VIS_MIN    = 0.5   # in-frame flag threshold (see docstring)
+    VIS_MIN    = 0.5   # MediaPipe visibility threshold
     IN_FRAME_Y = 0.05  # landmark must be >5% above bottom edge (pose_y > 0)
     THRESH     = 0.4   # fraction of frames the landmark must be visible
 
@@ -81,6 +81,7 @@ def _classify_shot_from_pose(keyframes: list[PoseKeyframe]) -> ShotType:
                 count += 1
         return count / n
 
+    foot_r     = ratio([_L_FOOT, _R_FOOT])
     ankle_r    = ratio([_L_ANKLE, _R_ANKLE])
     knee_r     = ratio([_L_KNEE, _R_KNEE])
     hip_r      = ratio([_L_HIP, _R_HIP])
@@ -90,19 +91,20 @@ def _classify_shot_from_pose(keyframes: list[PoseKeyframe]) -> ShotType:
     if shoulder_r < THRESH and nose_r < THRESH:
         return ShotType.UNKNOWN
 
-    if ankle_r >= THRESH:
+    if foot_r >= THRESH:
         heights = []
         for kf in keyframes:
             if kf.pose_vis[_NOSE] > VIS_MIN:
-                ankle_ys = [
-                    kf.pose_y[i] for i in [_L_ANKLE, _R_ANKLE]
+                foot_ys = [
+                    kf.pose_y[i] for i in [_L_FOOT, _R_FOOT]
                     if i < len(kf.pose_vis) and kf.pose_vis[i] > VIS_MIN
                 ]
-                if ankle_ys:
-                    heights.append(kf.pose_y[_NOSE] - min(ankle_ys))
+                if foot_ys:
+                    heights.append(kf.pose_y[_NOSE] - min(foot_ys))
         mean_height = float(np.mean(heights)) if heights else 0.5
         return ShotType.LONG if mean_height >= 0.4 else ShotType.VERY_LONG
 
+    if ankle_r    >= THRESH: return ShotType.MEDIUM_LONG
     if knee_r     >= THRESH: return ShotType.MEDIUM
     if hip_r      >= THRESH: return ShotType.MEDIUM_CLOSE
     if shoulder_r >= THRESH: return ShotType.CLOSE_UP
@@ -121,39 +123,38 @@ def _compute_angles_from_pose(
       positive = subject looking up (HIGH angle), negative = looking down (LOW).
 
     Needs metric 3D world-space landmarks (kf.world_x/world_y/world_z).
-    MediaPipe provided these; RTMPose (2D-only) didn't. MeTRAbs (the current
-    model — see workers/gesture_worker.py) provides them again, in
-    millimetres, camera-relative: verified directly (not just from docs)
-    that x increases rightward and y increases downward — same convention
-    MediaPipe used, so the formulas below are unchanged from the
-    MediaPipe-era version — and z increases *away* from the camera (the
-    opposite of MediaPipe's "toward camera positive" — confirmed from a
-    real detection where a facing-camera subject's nose had a smaller z
-    than their neck, i.e. closer to camera, which only makes sense if
-    smaller-z means nearer). The shoulder-yaw formula doesn't care about
-    the z sign (atan2(dz, dx) still gives ~0° for a frontal pose either
-    way), but the docstring here is corrected since the underlying model
-    changed.
+    Provided by MediaPipe's PoseLandmarker (`pose_world_landmarks`) —
+    hip-relative, not truly absolute camera-space depth (see
+    workers/gesture_worker.py's module docstring, "World coordinates"), but
+    that doesn't affect these formulas, which only use relative
+    differences between landmarks, not absolute position.
 
-    The `len(kf.world_x) < 19` guard reflects MeTRAbs's coco_19 skeleton
-    (19 landmarks), not MediaPipe's old 33.
+    x/y convention verified directly against real output (not assumed):
+    y increases downward. z's sign isn't load-bearing for the yaw formula
+    either way (atan2(dz, dx) still gives ~0° for a frontal pose whichever
+    way z points, since a genuinely frontal pose has dz≈0 regardless).
+
+    The `len(kf.world_x) < 33` guard reflects BlazePose's 33-landmark
+    skeleton.
     """
     yaws: list[float] = []
     pitches: list[float] = []
 
     for kf in keyframes:
-        if kf.world_x is None or len(kf.world_x) < 19:
+        if kf.world_x is None or len(kf.world_x) < 33:
             continue
 
         wx, wy, wz = kf.world_x, kf.world_y, kf.world_z
 
-        # Shoulder yaw. L-R (not R-L) so a frontal pose lands near 0°: verified
-        # against a real detection that dx=wx[R]-wx[L] is consistently
-        # negative for a camera-facing subject under MeTRAbs's x convention
-        # (left shoulder appears at larger x, i.e. screen-right, than right
-        # shoulder — same handedness MediaPipe had, but atan2 needs the
-        # operand order that puts frontal poses at 0 given this model's
-        # actual sign convention, confirmed by hand-checking real output).
+        # Shoulder yaw. L-R (not R-L) so a frontal pose lands near 0° —
+        # verified directly (not assumed) against real MediaPipe output:
+        # for a camera-facing subject, wx[_L_SHOULDER] is consistently
+        # *larger* than wx[_R_SHOULDER], so dx must be computed L-R (not
+        # R-L) for atan2 to land near 0° rather than ±180° for a frontal
+        # pose. This needed re-verifying, not just carrying forward from
+        # this project's own original MediaPipe-era code (which used R-L)
+        # — that order does not reproduce ~0° for a frontal pose against
+        # this project's current MediaPipe Tasks API output.
         dx = wx[_L_SHOULDER] - wx[_R_SHOULDER]
         dz = wz[_L_SHOULDER] - wz[_R_SHOULDER]
         if abs(dx) + abs(dz) > 1e-4:

@@ -1,14 +1,23 @@
 # Gesture Worker
 
 Source: [`workers/gesture_worker.py`](../workers/gesture_worker.py),
-run via [`workers/gesture_subprocess.py`](../workers/gesture_subprocess.py)
-/ [`workers/gesture_server.py`](../workers/gesture_server.py) and
-dispatched by [`core/orchestrator.py`](../core/orchestrator.py) — see
-"Running in isolation" / "Bulk runs" below. Optionally offloaded to
-[`colab/gesture_server.ipynb`](../colab/gesture_server.ipynb) — see
-"Remote MeTRAbs, local fallback" below.
+dispatched in-process by [`core/orchestrator.py`](../core/orchestrator.py)
+— same as prosody/verbal/camera, no subprocess involved.
 Dashboard section: **Pose Estimation**
 Feature model: [`GestureFeatures`](../core/models.py) (in `core/models.py`)
+
+> **Branch note (`light-gesture`):** this branch replaces the main
+> branch's MeTRAbs setup entirely with local MediaPipe PoseLandmarker — no
+> TensorFlow, no remote-Colab option, and (after an explicit later decision
+> — see "Isolation was removed" below) no subprocess isolation either.
+> HandLandmarker was also tried on this branch and then deliberately
+> removed again (see "Hand landmarks — tried, removed" below); nothing in
+> this doc describes hand/finger data any more. This page describes the
+> MediaPipe-based implementation as it exists *on this branch*; the main
+> branch's `wikis/Gesture-Worker.md` (MeTRAbs, remote offload, subprocess
+> isolation, the memory-growth history that motivated all of it) doesn't
+> apply here. See "Why this branch exists" below for the reasoning, and
+> "vs. the main branch" throughout for what did/didn't carry over.
 
 ## What it does
 
@@ -16,496 +25,263 @@ For every time window, `GestureWorker`:
 
 1. Reads frames from the video for that window
    (`frames_for_window`, [`core/preprocessing.py`](../core/preprocessing.py)).
-2. Runs **MeTRAbs** on each frame — a metric-scale, absolute 3D, multi-person
-   pose model (it detects every person in frame and estimates a 19-point
-   skeleton, in millimetre-scale 3D world coordinates, for each one in a
-   single pass) — and selects which detected person is "the subject":
-   - **First frame of the window**: whoever's detection-box center is
-     closest to the frame center is picked. This is the one and only
-     "vote" for the whole window.
-   - **Every subsequent frame**: no re-vote — whoever's box center is
-     closest to the *previously selected* person's position is picked
-     instead, and that becomes the new reference position. This
-     deliberately doesn't re-open "who's the subject" mid-window, so a
-     second person becoming briefly more central doesn't cause the
-     selection to flip. There's currently no "is this still plausibly the
-     same person" ambiguity guard (e.g. a max-distance cutoff) — held off
-     pending more real multi-person test data to judge whether it's
-     actually needed.
-   - The vote resets fresh at the start of every window (never carried
-     across windows), bounding how long a bad pick can persist to at most
-     one window (5s by default) before self-correcting.
-   - Everyone *not* selected in a given frame is discarded before a
-     `GestureFrame` is ever built — downstream code (`FusionEngine`, the
-     dashboard) has no idea multiple people were ever in frame.
-3. Aggregates the selected person's per-frame landmarks into window-level
-   kinematic features:
-   - `mean_wrist_velocity` — mean speed (px/s) of both wrists across the window.
-   - `max_wrist_displacement` — largest bounding displacement of either wrist.
-   - `pose_present_ratio` — fraction of frames where a full 19-point pose was detected.
-   - `handedness_ratio` — ratio of right- vs. left-hand motion (−1 fully
-     left-dominant → +1 fully right-dominant).
-   - `pose_keyframes` — subsampled (every 3rd frame), normalised pose
-     snapshots (2D **and** 3D world coordinates) used to drive the animated
-     pose overlay in the dashboard and `FusionEngine`'s camera-angle math.
-4. Stores the resulting `GestureFeatures` record in the Redis
-   [`FeatureStore`](../core/feature_store.py) under `job:{id}:gesture:{w}`.
+2. Runs **MediaPipe Tasks' PoseLandmarker** (multi-person, 33-point
+   BlazePose topology) on each frame, in `VIDEO` running mode — not
+   `IMAGE` mode — so MediaPipe uses its own internal frame-to-frame
+   tracking rather than re-detecting from scratch every frame (faster, and
+   reduces jitter — see "VIDEO mode" below).
+3. Selects which detected person is "the subject" — same design as the
+   main branch's MeTRAbs implementation, ported over: most-central at a
+   window's first frame or right after a scene cut (voted once), then
+   nearest-to-last-known-position otherwise, with a max-jump ambiguity
+   guard and its own independent scene-cut detection pass. See "Speaker
+   selection" below for the one real difference (no bounding box).
+4. Computes kinematic features (velocity, amplitude, handedness) from only
+   the selected person's landmarks — everyone else discarded before a
+   `GestureFrame` is ever built, same as before.
 
-## Values shown on the dashboard
+No hand/finger model runs — `GestureFrame.left_hand`/`right_hand` are
+always empty, same as on the main branch, though for a different reason
+(see "Hand landmarks — tried, removed" below).
 
-The **Pose Estimation** section has one KPI card and two charts, plus the
-video-overlaid skeleton:
+## Why this branch exists
 
-| Where | What it shows |
-|---|---|
-| KPI card: **Wrist Vel.** | Average wrist speed across the whole video. |
-| Pose overlay (on the video itself) | The tracked skeleton drawn over the video at the current playback moment, toggleable by body segment (Head/Face, Arms, Hands, Torso, Gaze) so you can isolate the part you care about. |
-| **Wrist Velocity** chart | How fast the hands are moving, per time window — a higher value means more energetic/animated gesturing in that window. |
-| **Handedness** chart | Which hand is doing more of the moving in each window, from −1 (fully left-dominant) through 0 (both hands equally) to +1 (fully right-dominant). |
+The main branch moved from MediaPipe to YOLO-Pose to MeTRAbs specifically
+to get genuine multi-person detection with absolute 3D output (see main's
+own wiki history). That's real capability, but it comes with real cost:
+TensorFlow as a dependency, a model that needed isolating into its own
+subprocess to avoid crashing the host machine, and — for meaningfully
+faster local inference — a whole remote-Colab-offload system (tunnel
+management, a duplicated selection-logic notebook, the associated
+operational friction documented at length in main's wiki history).
 
-`max_wrist_displacement` and `pose_present_ratio` are computed per window but
-aren't currently surfaced anywhere in the dashboard UI.
+This branch trades some of that capability back for a simpler dependency
+footprint: MediaPipe's models are a few MB each, install via a single pip
+package, and need no GPU/CUDA reasoning at all. It's not a strictly
+lighter setup in every dimension, though — see "Honest tradeoffs vs. the
+main branch" below before assuming "lighter" means "better across the
+board."
 
-## Why MeTRAbs, and what changed getting there
+## VIDEO mode
 
-This worker has been through several pose-estimation engines, each swapped
-in response to a concrete problem with the previous one:
+`PoseLandmarker` supports a `VIDEO` running mode
+(`detect_for_video(image, timestamp_ms)`, timestamps strictly increasing
+across calls to the same landmarker instance) instead of `IMAGE` mode's
+independent-per-call detection. VIDEO mode lets MediaPipe track between
+consecutive frames rather than re-running full detection every time —
+faster, and reduces frame-to-frame jitter (the same underlying problem
+`_extract_keyframes`' `step=2` — see below — works around from the other
+direction).
 
-1. **MediaPipe Holistic** (original) — a single-person model, which handled
-   multiple people in frame poorly (no concept of tracking a specific
-   person; whichever region its internal detector picked could silently
-   swap between people frame to frame, corrupting velocity/displacement
-   features and shot-type classification alike).
-2. **MediaPipe's own multi-person API** (Tasks API `PoseLandmarker`,
-   `num_poses`) — lowest migration cost at the time (same vendor, same
-   BlazePose lineage), but a side-by-side accuracy comparison showed its
-   predictions were still worse than expected.
-3. **YOLO-Pose** (Ultralytics) — better accuracy, but AGPL-3.0-licensed,
-   which wasn't accepted on this branch (built and kept on a separate one).
-4. **RTMPose** (via `rtmlib`, not the full `mmpose` framework — see below
-   for why) — Apache 2.0, good multi-person accuracy, no PyTorch
-   dependency. Landed here for a while, but it's a **2D-only** model:
-   `FusionEngine`'s camera yaw/pitch angle computation needs 3D world-space
-   landmarks and had nothing to compute from, permanently returning `None`
-   (rendered as empty "UNKNOWN" bars in the dashboard).
-5. **MeTRAbs**, landed on here — chosen after researching alternatives that
-   support 3D world-space output specifically:
-   - MediaPipe's multi-person API does give 3D world landmarks, but reusing
-     it would reopen the same accuracy complaint that motivated leaving it
-     in step 2.
-   - **NLF** (NeurIPS'24, a newer relative of MeTRAbs, reportedly even more
-     accurate) has MIT-licensed code but **noncommercial-research-only**
-     pretrained weights — ruled out the same way YOLO-Pose's AGPL-3.0 was.
-   - **MeTRAbs**: MIT license (code *and* weights), natively multi-person,
-     absolute metric-scale 3D output — and per an independent 2025 study
-     benchmarking 16 pose frameworks head-to-head (MediaPipe, `rtmlib`,
-     YOLOv8, MMPose, ViTPose, etc.), the single highest-accuracy performer
-     overall, with MediaPipe notably absent from the top tier.
+The landmarker is created **once per job** (`process_job`, not once per
+worker instance and not per-window) and closed in a `finally` block at the
+end of that same method — confirmed directly, not assumed, that this
+matters: MediaPipe's monotonic-timestamp requirement applies *within one
+landmarker instance's lifetime*, and each video has its own independent,
+0-based timeline, so one instance genuinely can't validly span two
+different videos, even though the *worker object* itself is reused across
+many videos in a bulk run (see "Bulk runs" below).
 
-   Loaded as a **standalone TensorFlow SavedModel**, not via the training
-   codebase or `tensorflow-hub` — `tf.saved_model.load()` on a model
-   directory downloaded once at build time (see Implementation notes).
-   Plain `tensorflow` on PyPI is CPU-only by default and, unlike plain
-   `torch`, doesn't pull in a CUDA toolkit — confirmed via a clean install.
+## Speaker selection
 
-   (Aside, from the RTMPose era, still true here: `mmcv`/`mmdet`/`mmpose`
-   — the full framework MeTRAbs's underlying research area is normally
-   associated with — haven't been co-released since ~early 2024, and
-   getting a working combination against a current toolchain means
-   precisely pinning `setuptools`/`numpy`/`torch`/`mmcv`/`mmdet` all at
-   once, several of which conflict with each other — confirmed hands-on to
-   be a real dead end. MeTRAbs sidesteps this entirely by shipping as a
-   plain TensorFlow SavedModel with no dependency on any of it.)
+Ported from the main branch's MeTRAbs implementation almost unchanged —
+vote-once/track-thereafter, scene-cut-aware resets (this worker's own
+independent PySceneDetect pass, same as main, for the same reason: keeping
+gesture and camera's dispatch concurrent without cross-worker wiring), a
+max-jump ambiguity guard. The one real difference: MeTRAbs's detector gave
+an explicit per-person bounding box to compute a "center" from;
+`PoseLandmarkerResult` doesn't expose one at all (confirmed directly
+against the installed library — it has `pose_landmarks`,
+`pose_world_landmarks`, `segmentation_masks`, nothing box-shaped).
 
-Two real, current tradeoffs worth knowing about:
+A raw min/max bounding box over all 33 landmarks was considered and
+rejected — BlazePose, like MeTRAbs, always estimates a plausible position
+for every landmark even when occluded or off-screen (e.g. ankles in a
+close-up shot), and those wildly extrapolated points would skew a bbox
+center away from where the visible person actually is. Centering instead
+on the mean of just the shoulder and hip landmarks (BlazePose indices 11,
+12, 23, 24 — its own stable torso anchors) is a closer analogue to what
+MeTRAbs's detector box represented.
 
-- **No per-joint confidence.** Unlike RTMPose/MediaPipe, MeTRAbs's
-  `detect_poses` returns only a per-*person* detection-box confidence — no
-  per-keypoint score, occlusion flag, or uncertainty (confirmed directly
-  against the model, not just its docs). It always estimates a plausible
-  position for all 19 joints of a detected person, including ones that are
-  occluded or entirely outside the frame (e.g. cropped-off legs),
-  extrapolated from its learned body-shape prior. In place of a real
-  confidence value, every landmark gets a pseudo-visibility of 1.0 if its
-  2D projection actually lands inside the frame, else 0.0 — good enough for
-  the existing visibility-threshold logic downstream (shot classification,
-  wrist-motion filtering), but it's an in-frame check, not a confidence
-  estimate.
-- **Speed/footprint.** This is a TensorFlow model running on CPU — real,
-  unavoidable baseline overhead regardless of checkpoint choice (~1.8GB
-  resident just from loading the runtime + model, measured directly). Uses
-  `metrabs_mob3s_y4t`: MobileNetV3-Small backbone *and* YOLOv4-**tiny** as
-  the person detector. The detector dominates total footprint far more
-  than backbone choice does — confirmed by comparing published checkpoint
-  sizes, where a backbone jump (`mob3s_y4` -> `mob3l_y4`) changes the
-  download by <5%, but the `t`-suffixed (tiny-detector) variant is 8x
-  smaller (248MB -> 31MB). Originally shipped with the full-YOLOv4
-  `metrabs_mob3s_y4` instead; its ~5.9GB resident footprint during
-  inference caused a real out-of-memory crash on a development laptop
-  (15Gi total RAM) — switching to the tiny-detector variant brought peak
-  RSS for a full window down to ~2.7GB and roughly halved per-window
-  processing time, with detection output looking equivalent on the
-  (single-subject) test videos tried so far. Real tradeoff, per MeTRAbs's
-  own published numbers: worse multi-person detection accuracy (MuPoTS
-  PCK@150mm 76.8 vs 81.8 — see "Benchmark accuracy" below) — acceptable
-  here since this pipeline only needs the detector to reliably find *the*
-  subject, not exhaustively catalog everyone in frame, but worth
-  revisiting if that stops being true.
-  Larger backbones (EfficientNetV2-based, up to `eff2l`) exist for more
-  accuracy at more cost, but backbone was never really the lever that
-  mattered here — see `docs/MODELS_6_DATASETS.md` in the MeTRAbs repo.
+Background-subtraction-based foreground filtering was tried and reverted
+on the main branch before this one existed (measured directly: it
+rejected a real, continuously-present, actively-gesturing speaker's own
+bounding box far more often than it caught anything static/false, since a
+speaker mostly stands still and MOG2 can't tell that apart from genuine
+background). That finding wasn't model-specific, so it wasn't retried here.
 
-And one real, current *gain* over every prior engine: MeTRAbs's `coco_19`
-skeleton includes both a **neck** and a **pelvis** landmark, which neither
-MediaPipe's 33-point topology nor RTMPose's COCO-17 had as dedicated
-points — useful stable torso anchors, and camera yaw/pitch
-(`core/fusion_engine.py`) work again, computed from real 3D data instead of
-always returning `None`.
+## Hand landmarks — tried, removed
 
-## Running in isolation, not in the dashboard's main process
+This branch tried adding **HandLandmarker** (21-point per hand) alongside
+PoseLandmarker — a separate model with no built-in link to a detected
+body, so it required its own proximity-based matching (nearest detected
+hand's wrist to the selected person's pose-landmark wrist,
+`_HAND_MATCH_MAX_DIST` normalised distance) to attach a hand to the
+selected subject. It worked: verified directly against real footage (not
+just unit-tested in isolation), a 5-second clean window tracked the same
+person's hands consistently across 123/125 and 122/125 frames
+respectively, no visible flicker. One real gap found only by testing: hand
+landmarks carry a `visibility` attribute but it's always `None` in
+practice — unlike pose landmarks, HandLandmarker doesn't populate a real
+per-point confidence, so matched hand points were given a flat `1.0`
+instead of a genuine score.
 
-Even the tiny-detector checkpoint's ~2.7GB footprint (see above) was still
-enough to crash a 15GB-RAM development laptop **twice** in practice —
-including once as a full system hang requiring a hard reboot (no swap
-configured on that machine at the time). The actual cause wasn't the model
-size alone: `Orchestrator` used to construct every worker — including
-`GestureWorker` — eagerly in `__init__`, meaning MeTRAbs's TensorFlow
-runtime was loaded and resident for the *entire dashboard server
-lifetime*, and `core/orchestrator.py`'s `_run_parallel` ran all four
-workers' `process_job` calls concurrently via a `ThreadPoolExecutor` —
-so MeTRAbs's own inference-time memory compounded with Whisper
-(`VerbalWorker`, also loaded eagerly at startup) and the other workers all
-being active at once.
+It was removed again anyway: nothing downstream (`FusionEngine`, the
+dashboard's pose overlay) ever consumed the real per-finger data it
+produced — the dashboard's "hands" highlight segment only ever drew
+BlazePose's own crude wrist/fingertip-proxy pose landmarks (17-22), both
+before this was added and after it was removed, since that overlay was
+never wired up to the real 21-point data. Running HandLandmarker roughly
+doubled per-frame inference cost for that zero downstream payoff, so it
+was pulled: `workers/gesture_worker.py` no longer imports/creates a
+`HandLandmarker` at all, `models/hand_landmarker.task` is no longer
+downloaded (Dockerfile, `_ensure_model`), and `GestureFrame.left_hand`/
+`right_hand` are back to always-empty — same as they were on the MeTRAbs
+branch, for the same-shaped reason (no hand model runs), if not quite the
+same underlying cause (MeTRAbs never had a hand model to remove).
+Revisit if a real downstream consumer (a finger-specific kinematic
+feature, or a dashboard overlay actually wired to per-finger data) is
+ever built — the matching logic above worked and can be resurrected from
+git history rather than re-derived from scratch.
 
-Before landing on MeTRAbs's current setup, two lighter-weight 3D
-alternatives were checked and ruled out: **NLF** (a newer, reportedly even
-more accurate relative of MeTRAbs) — its only genuinely multi-person
-checkpoints are ~287MB (PyTorch) or ~613MB (TensorFlow), comparable to or
-bigger than the MeTRAbs checkpoint that already crashed the laptop, and
-PyTorch would reintroduce the "pip torch pulls the full CUDA toolkit"
-problem already avoided once (by choosing `rtmlib` over YOLO-Pose,
-earlier). **OpenPose** and **AlphaPose** were also considered as
-non-TensorFlow options, but both were ruled out on licensing grounds first
-(noncommercial-research-only and restrictive/unclear licenses
-respectively) before their weight was even evaluated.
+## Frame resolution
 
-The actual fix has two parts, both necessary — one alone doesn't solve it:
+Frames are still downscaled (`_resize_scale`, aspect-preserving, longer
+edge capped at `_MAX_DIM` = 960px) before being held or sent anywhere —
+carried over from the main branch, and *re-verified* rather than assumed
+to still apply: BlazePose's landmark model is also a detector+crop
+architecture, running on a fixed 256x256 crop per detected person
+regardless of source resolution (confirmed against MediaPipe's own
+published architecture description), so the same "full source resolution
+buys nothing the landmark model can use" reasoning holds. This also still
+matters for the same memory reason it did on main:
+`core/preprocessing.py`'s `frames_for_window` holds up to 150
+full-resolution frames per window in one list regardless of which model
+consumes them — at 1080p that's ~930MB, at 4K ~3.7GB, held raw before any
+inference starts. That memory-safety motivation is independent of MeTRAbs
+vs. MediaPipe.
 
-1. **`GestureWorker` is never constructed in `Orchestrator.__init__`.**
-   It doesn't exist anywhere in the main dashboard process's memory.
-2. **Gesture analysis runs in its own subprocess, once per job** —
-   `workers/gesture_subprocess.py`, invoked via `subprocess.run(["python",
-   "-m", "workers.gesture_subprocess", job_id, video_path,
-   window_size_s])` from `Orchestrator._run_gesture_isolated`. That
-   subprocess imports `tensorflow`, loads MeTRAbs fresh, runs
-   `GestureWorker.process_job`, writes results straight to the same
-   Redis-backed `FeatureStore` the main process uses (same
-   `REDIS_HOST`/`REDIS_PORT` env vars), and then **exits completely**.
+One real simplification: MediaPipe's coordinates come back already
+normalised to [0, 1] (unlike MeTRAbs's raw pixel output), so there's no
+rescale-back-to-original-resolution step needed the way MeTRAbs's
+pixel-space output required — a normalised coordinate means the same
+thing regardless of what resolution produced it. Pixel-space
+`Landmark.x/y` (matching `_aggregate`'s existing velocity/displacement
+math, which expects pixels) are reconstructed by multiplying against the
+*original* `meta.width`/`meta.height` once, immediately after detection.
 
-Point 2 matters for a specific, verified reason: TensorFlow's memory
-allocator does **not** reliably release memory back to the OS even after
-the Python model object is deleted and `gc.collect()` is run — a
-well-documented TensorFlow behavior, not something specific to this
-project. An in-process "load lazily, then `del` it" approach would not
-have been a reliable fix; only a subprocess that fully terminates
-guarantees the OS reclaims everything. This was confirmed directly: a real
-end-to-end run's memory was sampled every 5s, and usage dropped by
-~550MB the moment the gesture subprocess exited.
+## Bulk runs
 
-`Orchestrator.analyze()` originally ran the gesture subprocess **strictly
-after**, never alongside, the other three workers — isolation by itself
-only guarantees memory gets released *afterward*, it says nothing about
-whether MeTRAbs was the only heavy thing running *at the time*, which is
-what actually caused the crashes, so both parts (isolation + not
-overlapping) were needed together. That "run strictly after" half has
-since been deliberately reverted: gesture's subprocess is now dispatched
-*alongside* prosody/verbal/camera (a 4th task in `_run_parallel`'s
-`ThreadPoolExecutor`), a known, explicitly chosen tradeoff — accepting the
-real risk of the crash pattern recurring in exchange for shorter total
-wall-clock time per job, on the reasoning that isolation still guarantees
-the memory gets reclaimed once the job ends, even though it no longer
-guarantees gesture was the only heavy thing running while it was active.
-Worth reverting back to strictly-after if that tradeoff stops being
-acceptable, e.g. on a machine without much RAM headroom and no swap
-configured.
+`workers/gesture_subprocess.py`/`workers/gesture_server.py` (main
+branch's per-job spawn and persistent-server subprocess machinery,
+respectively) don't exist on this branch at all — see "Isolation was
+removed" below. Bulk runs (CLI `analyze bulk`, the dashboard's Bulk Upload
+tab) instead get warm-across-the-batch gesture handling for free, the same
+way prosody/verbal/camera already did: `BulkOrchestrator` constructs one
+`Orchestrator` for the whole manifest, and `Orchestrator._gesture_worker`
+is a lazy property (same pattern as the other three) — so one
+`GestureWorker` instance, in-process, gets reused across every video in
+the batch.
 
-The real cost of the *isolation* itself (independent of the above): a
-fresh spawn-per-job subprocess pays MeTRAbs's ~15-22s model-load time on
-**every job**, not once — a deliberate trade of latency for memory safety,
-for single-video jobs. See the next section for how bulk runs avoid paying
-that cost per video while keeping the same reclaim-on-exit guarantee.
+Because one landmarker instance can't span multiple videos (see "VIDEO
+mode" above), `GestureWorker.process_job` still opens fresh landmarkers at
+the start of every job and closes them at the end, even though the worker
+object itself persists across the whole batch — unlike MeTRAbs's model,
+which really did just stay loaded across every job it ever handled.
+Measured directly, that reopen-per-job cost turns out to be cheap in
+practice: ~4.5s the first time in a process (paying Python's one-time
+`import mediapipe` cost), then ~0.09s on every subsequent job in the same
+process — so a bulk batch still only pays a real load cost once, for its
+first video, via near-instant recreation rather than never closing the
+landmarkers at all.
 
-**Logs stream live, not in one dump at the end.** `Orchestrator._run_gesture_isolated`
-uses `Popen` with a piped stdout/stderr, reading and re-logging each line
-as the subprocess produces it (`for line in process.stdout: logger.info(...)`),
-rather than `subprocess.run(..., capture_output=True)` — that call is fully
-blocking and only hands back output once the whole subprocess has already
-exited, so nothing would be visible while a job is running, only a dump
-afterward. Matters in practice for actually seeing, live, whether a given
-job ran locally or hit remote MeTRAbs successfully (see "Remote MeTRAbs"
-below) — `subprocess.run`'s capture used to silently swallow that on the
-(common) success path entirely, only printing it on failure. Getting real
-streaming also needed the child's own invocation to include `-u`
-(`python -u -m workers.gesture_subprocess ...`) — Python block-buffers
-stdout by default when it isn't an interactive terminal (a pipe never is),
-so without it the child would sit on its own output internally regardless
-of how promptly the parent reads its end of the pipe. Verified directly:
-timestamped log lines arrive progressively across a job's real runtime
-(model load at t≈2.5s, window completions spread across the full ~100s a
-job took), not all at once at the end.
+## Honest tradeoffs vs. the main branch
 
-## Bulk runs: a persistent gesture server instead
+Measured directly against real footage (`vids/test_vid1.mp4`, 1920x1080
+@25fps) rather than assumed from architecture alone:
 
-Single-video jobs (the dashboard's main Analyze tab, CLI's `analyze run`)
-use the spawn-per-job subprocess above — reasonable for occasional,
-casual use, where you don't want MeTRAbs resident in memory in between.
-Bulk runs (CLI `analyze bulk`, the dashboard's Bulk Upload tab) are
-different: potentially dozens of videos processed back to back, where
-paying that ~15-22s load cost *per video* adds up to real, wasted time
-across a whole manifest.
-
-For these, `Orchestrator(persistent_gesture=True)` — set automatically by
-both bulk entrypoints — routes gesture dispatch to
-[`workers/gesture_server.py`](../workers/gesture_server.py) instead of
-`workers/gesture_subprocess.py`: a long-lived, localhost-only HTTP server
-(`Orchestrator._ensure_gesture_server` starts it on first use, picking a
-free port) that loads MeTRAbs once, on its first `/process_job` request,
-and stays warm for every subsequent video in the batch — verified directly
-(two jobs sent to the same running server reused the same OS process, and
-the second job showed no reload cost). `Orchestrator.close()` — already
-called by both `BulkOrchestrator.run()` and the CLI's `run`/`bulk` commands
-in a `finally` block — terminates that server process when the whole batch
-finishes, so the OS reclaims its memory at that point (confirmed directly:
-system memory dropped back to its pre-batch baseline immediately after
-`close()`), same reclaim guarantee as the per-job subprocess, just on a
-batch-scoped cycle instead of a job-scoped one rather than lingering
-indefinitely the way an in-process `GestureWorker` reused across a batch
-would have (TensorFlow's allocator not reliably releasing memory applies
-here exactly as it does everywhere else in this file — a process actually
-exiting is what makes reclaim reliable, so `gesture_server.py` being a
-separate process, not a plain object living inside the long-running
-dashboard process, is what makes this safe for the dashboard's Bulk Upload
-tab specifically, not just the CLI's naturally-short-lived process).
-
-## Remote MeTRAbs, local fallback
-
-`GESTURE_REMOTE_URL` (+ `GESTURE_API_KEY`), if set, points at a
-[`colab/gesture_server.ipynb`](../colab/gesture_server.ipynb) instance —
-the same MeTRAbs checkpoint, running on Colab's GPU (typically a T4)
-instead of this project's CPU-only local setup. Chosen deliberately, not
-by default: a local GPU was already ruled out earlier (CUDA-version
-mismatch against the system install, and only 4GB VRAM on the dev
-laptop) — Colab sidesteps both.
-
-**HTTP requests are per window, not per frame or per video — but the
-*model* is called per frame within that.** These are two independent
-decisions, worth separating clearly:
-
-- *Network batching (per window)*: a per-frame HTTP calling pattern was
-  considered and rejected outright — a window can have up to 150 frames
-  (`frames_for_window`'s cap), and network latency across that many
-  individual round-trips would likely dwarf actual inference time; this is
-  exactly why gesture wasn't the first worker remoted (SenseVoice was,
-  specifically because it needs only one call per *video*). Whole-video-
-  at-once was also considered — fewer round-trips still, and video codecs
-  compress better than a pile of independent JPEG frames — but per-window
-  was chosen instead because it keeps a natural, low-effort path to real
-  per-window progress reporting later (each window's result already
-  arrives as its own discrete response), for a modest cost: dozens of
-  round-trips per video instead of one.
-- *Model batching (per frame, not per window)*: the notebook originally
-  used MeTRAbs's own batched-inference call (`detect_poses_batched` —
-  confirmed directly against the model: takes a stacked `[N, H, W, 3]`
-  array, returns `boxes`/`poses2d`/`poses3d` as `RaggedTensor`s, one
-  ragged row per frame) to process a whole window's frames in one model
-  call. This caused a real, measured problem — see "A memory-growth dead
-  end, and what actually fixed it" below — and was replaced with a loop
-  calling the single-image `detect_poses` once per frame, still within
-  the one per-window HTTP request.
-
-## A memory-growth dead end, and what actually fixed it
-
-Colab's system RAM (not GPU RAM — checked explicitly) climbed until the
-notebook crashed partway through real use. Root cause, confirmed by direct
-measurement, not guessed: `detect_poses_batched` is a `tf.function`
-internally, and TensorFlow permanently caches a freshly-compiled graph for
-every *new* input shape it sees — it never gets freed. A window's frame
-count varies almost every request (the last window of a video is shorter,
-`frames_for_window`'s fps-dependent subsampling varies, etc.), so nearly
-every request hit a batch size TensorFlow hadn't seen before:
-
-```
-RSS after model load: 1870 MB
-call  1 (batch=129): RSS = 6587 MB   <- first-ever trace, huge one-time jump
-call  2 (batch=133): RSS = 7161 MB
-...
-call 12 (batch=144): RSS = 7860 MB   <- still climbing, no sign of levelling off
-```
-
-First fix tried: pad every window's frames to a **fixed** batch size
-(`_MAX_BATCH = 150`) with dummy frames, so there's only ever one shape to
-trace. This measurably worked *for the retracing problem specifically* —
-growth dropped from a continuous climb to a plateau by around the 10th
-call — but real Colab usage still ran out of RAM. The batched call itself,
-even at a constant shape, still requires TensorFlow to allocate buffers
-sized for a 150-image batch on every single call — a large, unavoidable
-per-call cost that padding didn't address, since it only fixed *which*
-shapes got traced, not how much memory one call needs regardless of shape.
-
-The fix that actually worked: stop batching the model call at all. Loop
-over the window's frames and call plain `detect_poses` once per frame —
-the same design `_process_window_local` already used locally, which never
-showed this problem, for a simple reason: a single video's frames are
-always the same resolution, so a per-frame call's input shape is constant
-within a video, meaning at most one trace per resolution, not one per
-window. Measured directly, same test scenario as above (varying "real"
-frame counts, now processed one at a time instead of batched-with-
-padding):
-
-```
-RSS after model load: 1871 MB
-window 1 (30 frames): RSS = 2456 MB
-window 2 (30 frames): RSS = 2474 MB
-window 3 (30 frames): RSS = 2479 MB
-window 4 (30 frames): RSS = 2487 MB   <- plateaued, and at a much lower level
-```
-
-Real tradeoff: `detect_poses_batched` was almost certainly faster per
-window than 150 sequential single-frame calls (better GPU utilisation from
-batching) — worth it given the alternative was fast until it crashed. The
-**local** paths (`gesture_subprocess.py`/`gesture_server.py`) were never
-affected by any of this — they always called `detect_poses` per frame, not
-batched, so this whole investigation only changed the notebook.
-
-**Selection logic runs on the remote side.** The vote-once/track-
-thereafter subject-selection logic (see "What it does" above) is
-duplicated into the notebook rather than only living in this file — same
-trade already accepted for `colab/sensevoice_server.ipynb` duplicating
-`_transcribe_alt`'s call; **keep the two in sync** if this logic ever
-changes. This keeps response payloads down (only the *selected* person's
-landmarks per frame, not everyone detected) and is safe to do statelessly
-per window, since the vote always resets fresh at a window's start —
-never carried across windows, by design — so no tracking state needs to
-cross the network boundary at all; each window's request is fully
-self-contained.
-
-**Local fallback, not a hard requirement once remote is configured.** Any
-failure calling remote (network, timeout, bad response) falls back to
-running MeTRAbs locally for that window — and every subsequent window in
-the same job, via a per-job flag (`_remote_failed_this_job`), so a dead
-tunnel doesn't retry-and-fail on every single window of a video, just
-once. The flag resets at the start of the next job, so a later video gets
-a fresh chance in case the failure was transient. Local MeTRAbs, when it
-does run, still runs inside the same isolated-subprocess/persistent-server
-setup described above ("Running in isolation" / "Bulk runs") — unchanged;
-neither `Orchestrator` nor `gesture_subprocess.py`/`gesture_server.py`
-have any idea whether a given call ended up hitting Colab or running
-locally, that decision is entirely internal to `GestureWorker`.
-
-**TensorFlow's own `import` is deferred**, not just the model load — moved
-from module top-level into `_get_model()`, mirroring
-`VerbalWorker._get_sensevoice`'s lazy `from funasr import AutoModel`
-exactly. This means a successful remote call costs nothing TF-related in
-whichever process runs it, even though that process (the per-job
-subprocess, or the persistent bulk server) still technically exists and
-still gets spawned — the process-spawn overhead itself (~1-2s of Python
-startup) was judged an acceptable, much smaller cost than the alternative
-of restructuring `Orchestrator`/the subprocess entrypoints to skip
-spawning entirely on a remote success, which would have meant a bigger
-refactor for a comparatively small win.
-
-## Benchmark accuracy (published)
-
-MeTRAbs's own published numbers (`docs/MODELS_6_DATASETS.md` in the
-[MeTRAbs repo](https://github.com/isarandi/metrabs)), verified directly
-against the table, for the exact checkpoint family this project uses
-(MobileNetV3-Small backbone) — 3DPW is single-person body-shape accuracy,
-MuPoTS is multi-person detection accuracy:
-
-| Checkpoint | Detector | 3DPW PCK@50mm | 3DPW MPJPE | MuPoTS PCK@150mm |
-|---|---|---|---|---|
-| `metrabs_mob3s_y4t` (**used by this project**) | YOLOv4-**tiny** | 36.3% | 87.3 mm | 76.8 |
-| `metrabs_mob3s_y4` | YOLOv4 (full) | 36.5% | 86.4 mm | 81.8 |
-
-Reading this: switching to the tiny detector (done specifically to fix the
-out-of-memory crashes described above) cost almost nothing on single-
-person body-shape accuracy (36.3% vs 36.5% PCK, 87.3mm vs 86.4mm MPJPE —
-both come from the *same* pose backbone, only the detector changed) but a
-real, measurable ~5-point drop in multi-person detection accuracy (76.8
-vs 81.8 MuPoTS PCK). Consistent with why this tradeoff was accepted: this
-pipeline only needs the detector to reliably find *the* subject in frame,
-not to exhaustively catalogue every person present, so the accuracy this
-project actually depends on barely moved.
-
-For context, larger backbones on the *same* full detector (`y4`) trade
-more compute for more single-person accuracy — backbone was never the
-lever that mattered for this project's memory problems, only detector
-choice was:
-
-| Backbone | 3DPW PCK@50mm | 3DPW MPJPE |
+| | MediaPipe (this branch) | MeTRAbs (main branch) |
 |---|---|---|
-| MobileNetV3-Small (`mob3s_y4`) | 36.5% | 86.4 mm |
-| MobileNetV3-Large (`mob3l_y4`) | 44.6% | 73.1 mm |
-| EfficientNetV2-Large (`eff2l_y4`) | 53.3% | 61.9 mm |
+| Peak local memory (after real use) | ~1.9GB — measured while HandLandmarker was still running; not re-benchmarked after its removal (see below), presumably somewhat lower now | ~1.8-2.7GB |
+| Model load time | ~4.5s first time in a process, ~0.09s after | ~15-22s, every time |
+| Per-joint confidence | Real `visibility`/`presence` per landmark | Only a per-person box score; this project faked a pseudo-visibility (in-frame-bounds check) |
+| World coordinates | `pose_world_landmarks` — metric (meters), but **hip-relative, not absolute camera-space depth** (confirmed: sample values sit in roughly [-1, 1] meters) | Genuinely absolute, camera-relative metric 3D, in millimetres (derived from an assumed FOV) |
+| Hand/finger landmarks | None — tried (HandLandmarker), then removed again; see "Hand landmarks — tried, removed" above | None at all |
+| Remote/GPU offload option | None — solely local by design | Optional, via Colab (see main's wiki) |
+| Dependency footprint | `mediapipe` only, a few MB of model files | `tensorflow`, a much larger model download, GPU/CUDA reasoning for the (unused, locally) remote path |
+| Process isolation | None — runs in-process, same as prosody/verbal/camera (see "Isolation was removed" below) | Isolated subprocess/persistent server, required — TensorFlow's allocator doesn't reliably release memory back to the OS otherwise |
 
-An independent 2025 study benchmarking 16 pose frameworks head-to-head
-(MediaPipe, `rtmlib`, YOLOv8, MMPose, ViTPose, MeTRAbs, and others) — the
-study already cited in "Why MeTRAbs" above, motivating the switch away
-from MediaPipe in the first place — found MeTRAbs the single
-highest-accuracy performer overall across that comparison, with MediaPipe
-notably absent from the top tier.
+The headline "lighter" framing for this branch is real for *load time* and
+*dependencies*, not for *peak memory* — worth not overstating that in
+either direction, especially given the isolation decision below.
+
+## Isolation was removed — a deliberate, acknowledged risk
+
+Subprocess isolation was kept initially on this branch, specifically
+*because* the measured ~1.9GB figure above is comparable to what
+originally caused real out-of-memory crashes when MeTRAbs ran
+concurrently with the other three workers (see main branch's wiki history
+for that story) — there was no measured basis to assume dropping it was
+safe just because the model changed. It was subsequently removed anyway,
+by explicit decision, once gesture became "just another lazy in-process
+worker" felt more valuable than the safety margin isolation provided.
+
+Worth being direct about what that means: this branch now runs gesture in
+the *same* process as prosody/verbal/camera, sharing memory with all three
+concurrently the same way MeTRAbs did before isolation was added — the
+same category of risk that motivated isolating it in the first place,
+reintroduced here on the reasoning that MediaPipe's absolute footprint
+(~1.9GB) is smaller than whatever full-pipeline peak actually crashed the
+original 15GB-RAM dev laptop (that number isn't in this project's own
+measured record, only the MeTRAbs-alone figure is). Removing HandLandmarker
+(see "Hand landmarks — tried, removed" above) trims real per-frame
+inference cost, but the ~1.9GB peak-memory figure above was measured
+*with* HandLandmarker running, so this branch's actual footprint now is
+unmeasured-but-presumably-somewhat-lower, not re-benchmarked after its
+removal. No crash has been
+observed under this setup so far, but it also hasn't been stress-tested
+against a long video or a large bulk batch the way the original crash was
+found — this is a live, accepted tradeoff, not a closed question, and
+worth revisiting if this branch ever sees a crash resembling the
+MeTRAbs-era ones.
+
+One more piece of real history worth knowing, which is what this decision
+actually returns to: neither `gesture_server.py` nor
+`gesture_subprocess.py` existed during this project's *original*
+MediaPipe era (confirmed via git history — both were added in the same
+commit that introduced MeTRAbs). Back then gesture ran in-process like
+every other worker, no isolation at all — though that was a simpler,
+single-person Holistic-only setup — lighter than this branch's
+multi-person PoseLandmarker even after HandLandmarker's removal — so "no
+isolation worked fine before" isn't quite the same claim as "no isolation
+is fine for *this* setup" — the paragraph above is the honest version of
+that claim.
 
 ## Implementation notes
 
-- A pose is only counted if all 19 `coco_19` keypoints are present, so
-  downstream landmark-index lookups (e.g. left/right wrist, index 5/11)
-  are always safe. In practice this is equivalent to "was anyone detected
-  at all this frame", since MeTRAbs always returns the full 19-point set
-  for a detected person.
-- Wrist positions are only used when the pseudo-visibility flag is 1.0
-  (i.e. the wrist's 2D projection is actually inside the frame).
-- `pose_keyframes.pose_y` is pre-flipped (`1 − raw_y`) so the browser-side
-  canvas overlay doesn't need to re-flip the Y axis.
-- World coordinates are in millimetres, camera-relative: `x` increases
-  rightward, `y` increases downward (same convention MediaPipe used), `z`
-  increases *away* from the camera (the opposite of MediaPipe's "toward
-  camera positive" — verified from a real detection where a facing-camera
-  subject's nose had a smaller `z` than their neck, i.e. nearer to camera).
-  `FusionEngine`'s shoulder-yaw formula was hand-checked against real
-  output and needed its subtraction order flipped (left-minus-right, not
-  right-minus-left) to correctly land frontal poses near 0°.
-- The local MeTRAbs `tf.saved_model` is loaded lazily (`_get_model`, not
-  `__init__`) on first actual local-inference need, then reused across
-  every window *within that instance's job* — inference itself is
-  stateless per frame (unlike MediaPipe's Tasks API `PoseLandmarker` in
-  `VIDEO` mode), so there's no cross-window timestamp bookkeeping to worry
-  about, and `close()` is a no-op. If a job's every window is served by
-  remote MeTRAbs successfully, the local model is never touched at all. A
-  `GestureWorker` instance's whole lifetime is scoped to a single
-  subprocess handling a single job (see "Running in isolation" above) —
-  unlike `rtmlib` before it, there's no reuse *across* jobs; the local
-  model, if it loads at all, gets reloaded from scratch every time.
-- The model file itself (`metrabs_mob3s_y4t`, ~50MB unzipped) is **not**
-  distributed via pip — it's downloaded once from
-  `https://omnomnom.vision.rwth-aachen.de/data/metrabs/metrabs_mob3s_y4t.zip`
-  and unzipped into `models/metrabs_mob3s_y4t/` (gitignored). The Dockerfile
-  does this automatically at build time; for local development without
-  `GESTURE_REMOTE_URL` set, download and unzip it manually first
-  (`GestureWorker._get_model` raises a clear `FileNotFoundError` with the
-  exact commands the first time local inference is actually attempted).
+- Windows must be processed in non-decreasing `start_s` order across a
+  job — confirmed directly (not assumed): `detect_for_video` raises
+  `ValueError("Input timestamp must be monotonically increasing")`
+  otherwise. `process_job`'s own loop already guarantees this
+  (`core/preprocessing.py`'s `compute_windows` builds windows in
+  chronological order), so this isn't something callers need to actively
+  manage today — worth knowing if that ever changes.
+- `_extract_keyframes` keeps `step=2` (not `1`), carried over from the
+  main branch's own finding that full per-frame density visibly picked up
+  per-frame jitter with no temporal smoothing between displayed samples.
+  VIDEO mode's own internal tracking may make `step=1` viable here even
+  though it wasn't on main, but that hasn't been tested — `step=2` is kept
+  as the known-good starting point.
 
 ## Package documentation
 
 | Package | Role | Docs |
 |---|---|---|
-| tensorflow | Runs the MeTRAbs SavedModel (multi-person 3D pose), local path only | https://www.tensorflow.org/api_docs |
-| fastapi / uvicorn | `gesture_server.py`'s persistent-bulk HTTP server, and `colab/gesture_server.ipynb`'s remote server | https://fastapi.tiangolo.com/ · https://www.uvicorn.org/ |
-| requests | `_process_window_remote`'s HTTP client (calls `colab/gesture_server.ipynb`) | https://requests.readthedocs.io/en/latest/ |
-| OpenCV (`opencv-contrib-python`) | Frame I/O, BGR→RGB conversion (pulled in by scenedetect/camera_worker) | https://docs.opencv.org/4.x/ |
-| NumPy | Velocity/displacement math (`np.mean`, `np.sqrt`) | https://numpy.org/doc/stable/ |
-| Pydantic | `GestureFeatures` / `GestureFrame` / `PoseKeyframe` models | https://docs.pydantic.dev/latest/ |
-| loguru | Per-window logging | https://loguru.readthedocs.io/en/stable/ |
-
-MeTRAbs itself: https://github.com/isarandi/metrabs (model/API docs under `docs/`).
+| mediapipe | PoseLandmarker (body only — HandLandmarker was tried and removed, see above) | https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker |
+| PySceneDetect (`scenedetect`) | This worker's own independent scene-cut pass for `ref_pos` resets | https://www.scenedetect.com/docs/latest/api.html |
+| OpenCV (`opencv-contrib-python`, pulled in by mediapipe itself on this branch) | Frame colour conversion, resizing | https://docs.opencv.org/4.x/ |
+| NumPy | Velocity/displacement math | https://numpy.org/doc/stable/ |
+| Pydantic | `GestureFeatures`/`GestureFrame`/`Landmark` models | https://docs.pydantic.dev/latest/ |
+| loguru | Per-window/job logging | https://loguru.readthedocs.io/en/stable/ |
 
 See also [Home](Home.md) for the full dependency list.

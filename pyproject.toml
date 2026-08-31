@@ -6,40 +6,25 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     # Video / vision
-    # MeTRAbs — metric-scale absolute 3D multi-person pose estimation for
-    # GestureWorker (loaded as a standalone TensorFlow SavedModel, not via
-    # the training codebase). Replaced RTMPose (via rtmlib) because RTMPose
-    # is 2D-only, leaving FusionEngine's camera yaw/pitch angle computation
-    # permanently starved of input; MeTRAbs natively outputs per-person 3D
-    # world-space coordinates (mm), and an independent 16-framework
-    # benchmark study found it the single highest-accuracy performer
-    # overall. MIT licensed — both code and pretrained weights — unlike
-    # YOLO-Pose (AGPL-3.0) and NLF (noncommercial-research-only weights).
-    # Plain `tensorflow` on PyPI is CPU-only by default and pulls no CUDA
-    # packages (unlike plain `torch`) — confirmed via a clean install.
+    # MediaPipe (PoseLandmarker only) — multi-person pose landmark
+    # estimation for GestureWorker. `light-gesture` branch only — the main
+    # branch uses MeTRAbs instead (TensorFlow-based; see
+    # wikis/Gesture-Worker.md for the full comparison and why this branch
+    # exists). HandLandmarker was tried alongside it and then deliberately
+    # removed again — see wikis/Gesture-Worker.md's "Hand landmarks —
+    # tried, removed". Small (~5-6MB) .task model file, downloaded lazily
+    # at first use (see workers/gesture_worker.py's _ensure_model) rather
+    # than baked in at Docker build time the way MeTRAbs's model was.
     #
-    # MeTRAbs's TensorFlow runtime is too heavy to run inside the main
-    # dashboard process alongside everything else — crashed a 15GB-RAM dev
-    # laptop twice before this was understood. It now runs in an isolated
-    # subprocess, per-job, that fully exits when done (see
-    # workers/gesture_subprocess.py, core/orchestrator.py) — TensorFlow's
-    # allocator doesn't reliably release memory back to the OS otherwise,
-    # even after deleting the model object. The main dashboard process
-    # never imports tensorflow at all.
-    #
-    # The actual pretrained model file is downloaded separately (see
-    # Dockerfile / workers/gesture_worker.py) and loaded directly with
-    # `tf.saved_model.load()` — no `tensorflow-hub` dependency needed.
-    "tensorflow>=2.16",
-    # For bulk runs only (CLI `analyze bulk` and the dashboard's Bulk
-    # Upload tab): a persistent, local-only HTTP server
-    # (workers/gesture_server.py) that keeps MeTRAbs loaded for a whole
-    # batch instead of paying its ~15-22s load time per video. Single-video
-    # jobs still use the plain spawn-per-job subprocess
-    # (workers/gesture_subprocess.py) — see core/orchestrator.py's
-    # `persistent_gesture` flag.
-    "fastapi>=0.110",
-    "uvicorn>=0.29",
+    # Runs in-process, same as prosody/verbal/camera — no subprocess
+    # isolation (see wikis/Gesture-Worker.md's "Isolation was removed" for
+    # the reasoning and the acknowledged risk that decision reintroduces).
+    # Measured directly, MediaPipe's peak memory here (~1.9GB after real
+    # use, measured before HandLandmarker's removal) is roughly the same
+    # order of magnitude as MeTRAbs's own (~1.8-2.7GB), not a verified
+    # reduction. Model *load* time is a real, measured win though (~4.5s
+    # vs MeTRAbs's ~15-22s).
+    "mediapipe>=0.10",
     "scenedetect>=0.6.3",
     # opencv-contrib-python (not plain opencv-python) — camera_worker.py
     # needs its Haar cascade data (cv2.data.haarcascades), which plain

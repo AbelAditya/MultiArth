@@ -1,190 +1,140 @@
 """
 workers/gesture_worker.py
 --------------------------
-MeTRAbs worker — metric-scale absolute 3D multi-person pose estimation with
-speaker selection.
+MediaPipe worker — multi-person pose estimation with speaker selection.
+This branch (`light-gesture`) deliberately replaces the MeTRAbs setup used
+on the main branch entirely: no TensorFlow, no local GPU concerns, no
+remote-Colab-offload complexity — MediaPipe's models are small (a few MB
+each) and light enough to run locally without the memory/crash history
+that motivated MeTRAbs's remote-offload design in the first place. See
+wikis/Gesture-Worker.md for the fuller "why this branch exists" story.
 
 For each time window it:
   1. Reads frames from the video for that window
-  2. Runs MeTRAbs (multi-person, 19-keypoint "coco_19" skeleton, absolute
-     3D world-space coordinates in mm) on every frame
+  2. Runs MediaPipe Tasks' PoseLandmarker (multi-person, 33-keypoint
+     BlazePose topology) on every frame, in VIDEO running mode (see "VIDEO
+     mode" below)
   3. Selects which detected person is "the subject": most-central-to-frame
-     (by detection-box center) at the first frame of the window (voted
-     once), then nearest-to-last-known-position for the rest of the window
-     — no re-vote until the next window starts. Deliberately no "is this
-     still plausibly the same person" ambiguity guard yet (e.g. a
-     max-distance cutoff) — that's held off until there's enough real
-     multi-person test data to decide whether it's actually needed.
+     at the first frame of a window/since the last scene cut (voted once),
+     then nearest-to-last-known-position for the rest — same selection
+     design MeTRAbs used, ported over almost unchanged (see "Speaker
+     selection" below for what did/didn't carry over).
   4. Computes kinematic features (velocity, amplitude, symmetry, etc.) from
      only the selected person's landmarks — everyone else detected in a
      frame is discarded before a GestureFrame is ever built, so nothing
      downstream (FusionEngine, the dashboard) needs to know multiple people
      were ever in frame.
 
-Runs remotely first, local as a fallback — see "Remote MeTRAbs" below for
-the full design. Whichever path actually runs, this class's aggregation
-logic (_aggregate, _extract_keyframes, kinematic helpers) is identical —
-only "how do we get this window's per-frame selected-person landmarks"
-differs between _process_window_remote and _process_window_local.
+`GestureFrame.left_hand`/`right_hand` are always empty here — MediaPipe's
+HandLandmarker was tried, wired up, and then deliberately removed again:
+nothing downstream (FusionEngine, the dashboard) ever consumed the real
+per-finger data it produced, so it was pure added inference cost (roughly
+doubling per-frame time) for no payoff. The fields are kept on
+`GestureFrame` for shape compatibility with the rest of the pipeline
+(same reason they were always empty on the MeTRAbs branch too), not
+because something still populates them.
 
-Chosen (over RTMPose, MediaPipe, NLF, OpenPose, AlphaPose) after research
-covered in wikis/Gesture-Worker.md — in short: MIT licensed (unlike
-YOLO-Pose/NLF), natively multi-person with absolute 3D output (unlike
-RTMPose, which is 2D-only), and the single highest-accuracy performer in
-an independent 2025 16-framework benchmark study.
+## VIDEO mode
 
-## Remote MeTRAbs, local fallback
+MediaPipe Tasks' `PoseLandmarker` supports a `VIDEO` running mode
+(`detect_for_video(image, timestamp_ms)`, strictly increasing timestamps
+across calls to the same landmarker instance) instead of `IMAGE` mode's
+independent-per-call detection — VIDEO mode lets MediaPipe use its own
+internal tracking between consecutive frames rather than re-running full
+detection from scratch every frame, which is both faster and reduces
+frame-to-frame jitter (a real, measured problem for the per-frame-
+independent alternative — see wikis/Gesture-Worker.md's MeTRAbs-era
+history of `_extract_keyframes`' step=1 vs step=2 for the same underlying
+issue on that branch). The landmarker is created once per job
+(`process_job`, not per-window) specifically so its internal timestamp
+counter and tracking state span the whole video coherently, and is closed
+in a `finally` block at the end of that same method.
 
-`GESTURE_REMOTE_URL` (+ `GESTURE_API_KEY`), if set, points at a
-colab/gesture_server.ipynb instance — MeTRAbs running on a free Colab GPU
-(a T4, typically — meaningfully faster than this project's CPU-only local
-setup, and sidesteps the CUDA-version mismatch and 4GB VRAM that ruled out
-using a local GPU at all). Each *window* (not each frame — see below for
-why) is sent as one batched HTTP request; on any failure (network, timeout,
-bad response), that and every subsequent window in the same job falls back
-to local MeTRAbs instead (`_remote_failed_this_job` — a per-job circuit
-breaker, so a dead tunnel doesn't retry-and-fail on every single window of
-a video, just once).
+## Speaker selection
 
-Per-window, not per-frame or per-video: a per-frame calling pattern was
-considered and rejected outright — a window can have up to 150 frames
-(`core/preprocessing.py`'s `frames_for_window`), and network latency alone
-across that many individual round-trips would likely dwarf actual
-inference time. Whole-video-at-once was also considered — fewer
-round-trips still, and video codecs compress better than a pile of
-independent JPEG frames — but committing to per-window keeps a natural
-path to real per-window progress reporting later (each window's result
-already arrives as its own discrete response) without needing an
-HTTP-streaming redesign, at only a modest cost: dozens of round-trips per
-video instead of one. MeTRAbs's own batched-inference call
-(`detect_poses_batched`, confirmed directly — takes a stacked
-`[N, H, W, 3]` array, returns `boxes`/`poses2d`/`poses3d` as
-`RaggedTensor`s, one raggeed row per frame, each indexable exactly like the
-single-frame `detect_poses` call's per-frame output) means the remote side
-batches its own model call per window too, not a frame-by-frame loop.
+Ported from the MeTRAbs branch with one real difference: MeTRAbs's
+detector gave an explicit per-person bounding box; PoseLandmarker doesn't
+expose one at all (confirmed directly against the installed library — a
+`PoseLandmarkerResult` has `pose_landmarks`, `pose_world_landmarks`, and
+`segmentation_masks`, nothing box-shaped). A raw min/max bounding box over
+all 33 landmarks was considered and rejected — BlazePose, like MeTRAbs,
+always estimates a plausible position for every landmark even when
+occluded or off-screen (e.g. ankles in a close-up shot), and those wildly
+extrapolated points would skew a bbox center away from where the visible
+person actually is. Centering instead on the mean of just the shoulder and
+hip landmarks (indices 11, 12, 23, 24 — BlazePose's own stable torso
+anchors) is a closer analogue to what MeTRAbs's detector box represented.
 
-The vote-once/track-thereafter subject-selection logic runs **on the
-remote side** for the remote path (duplicated from this file into the
-notebook, same trade already accepted for
-`colab/sensevoice_server.ipynb` duplicating `_transcribe_alt` — keep them
-in sync if this logic ever changes) — sending back only the *selected*
-person's landmarks per frame, not everyone detected, keeps response
-payloads down. This is safe statelessly per window: the vote always resets
-fresh at the start of a window (never carried across windows, by design —
-see point 3 above), so no tracking state needs to cross the network
-boundary; each window's request is fully self-contained.
-
-TensorFlow's `import` itself is deferred (inside `_get_model`, not at
-module top-level) specifically so that a successful remote call never
-costs anything TF-related in this process — mirrors
-`VerbalWorker._get_sensevoice`'s lazy `from funasr import AutoModel`
-exactly. Local MeTRAbs (whether because remote isn't configured, or a
-video's remote calls failed) still runs inside an isolated subprocess —
-see `workers/gesture_subprocess.py` / `workers/gesture_server.py` /
-`core/orchestrator.py` — that part is unchanged; this file has no idea
-which one is invoking it.
-
-Two real tradeoffs, both worth knowing about, that apply whichever engine
-actually runs the inference (remote or local — same model, same output
-shape):
-
-  - No per-joint confidence: unlike RTMPose/MediaPipe, MeTRAbs's
-    `detect_poses`(`_batched`) returns only a per-*person* detection-box
-    confidence — no per-keypoint score, occlusion flag, or uncertainty at
-    all (confirmed against the model directly, not just docs). It always
-    estimates a plausible position for all 19 joints per detected person,
-    including ones that are occluded or entirely outside the frame (e.g.
-    cropped-off legs), extrapolated from its learned body-shape prior. In
-    place of a real confidence value, every landmark here gets a
-    pseudo-visibility of 1.0 if its 2D projection lands inside the actual
-    frame bounds, else 0.0 — good enough for the existing
-    visibility-threshold logic downstream (shot classification,
-    wrist-motion filtering), but it's an in-frame check, not a real
-    confidence estimate.
-  - Speed/footprint (local path only): uses `metrabs_mob3s_y4t` —
-    MobileNetV3-Small backbone *and* YOLOv4-tiny as the person detector,
-    not full YOLOv4. The detector dominates total model size far more than
-    the pose backbone does (confirmed: `mob3s_y4` vs `mob3l_y4`, a
-    backbone jump, changes the download by <5%; swapping to the
-    `t`-suffixed detector shrinks it 8x, 248MB -> 31MB). Real tradeoff,
-    per MeTRAbs's own published numbers: worse multi-person detection
-    accuracy (MuPoTS PCK 76.8 vs 81.8) than full YOLOv4 — acceptable here
-    since this pipeline only needs the detector to reliably find *the*
-    subject, not exhaustively catalog everyone in frame. The remote
-    Colab notebook uses this exact same checkpoint, for consistent output
-    between the two paths — a bigger checkpoint would be a legitimate
-    separate upgrade to consider later, given the remote path has real
-    GPU headroom the local path never did.
+Everything downstream of "which person is the subject" — vote-once at a
+window/scene-cut boundary, nearest-to-`ref_pos` tracking otherwise, the
+max-jump ambiguity guard, scene-cut-aware resets via this worker's own
+independent PySceneDetect pass — is unchanged from the MeTRAbs branch.
+Background-subtraction-based foreground filtering was tried and reverted
+there (see wikis/Gesture-Worker.md) before this branch existed; that
+finding isn't model-specific, so it wasn't tried again here.
 
 ## Frame resolution
 
 Frames are downscaled (`_resize_scale`, aspect-preserving, longer edge
-capped at `_MAX_DIM` = 960px) before they're held or sent anywhere, in both
-`_process_window_local` and `_process_window_remote`. This isn't a lossy
-shortcut traded for memory — MeTRAbs's own architecture makes the source
-frame's full resolution mostly unusable in the first place:
-
-  - The pose network itself is a **crop model**: it never sees the full
-    frame at all. It only ever runs on a small, fixed-size square crop
-    around each detected person's bounding box — 256px for the
-    MobileNetV3-Small checkpoint this project uses, regardless of the
-    source frame's resolution (confirmed against MeTRAbs's own
-    `docs/MODELS_6_DATASETS.md`). A 4K frame and a 960px frame produce the
-    *same* crop once a person's box is found — the extra source pixels get
-    downsampled away at crop time either way.
-  - The person detector (YOLOv4-tiny) is, like the whole YOLO family
-    generically, expected to run at a small fixed internal input size —
-    not confirmed against MeTRAbs's own docs specifically (they don't
-    document the bundled detector's internals), but standard for the
-    architecture.
-
-Real memory numbers this fixes: `core/preprocessing.py`'s
+capped at `_MAX_DIM` = 960px) before being held or sent anywhere — carried
+over from the MeTRAbs branch, and re-verified rather than assumed to still
+apply: BlazePose's landmark model is *also* a detector+crop architecture,
+running on a fixed 256x256 crop per detected person regardless of the
+source frame's resolution (confirmed via MediaPipe's own published
+architecture description), so the same "full source resolution buys
+nothing the landmark model can use" reasoning holds. This also still
+matters for the same memory reason it did before: `core/preprocessing.py`'s
 `frames_for_window` holds up to 150 full-resolution frames per window in
-one list — at 1080p that's ~930MB, at 4K ~3.7GB, held raw before any
-inference even starts. This was confirmed as the direct cause of a real
-crash: the kernel's OOM killer killed the persistent `gesture_server`
-process at 7.7GB RSS mid-bulk-run (`journalctl` traced it to
-`workers.gesture_server`'s own pid, matching a growth curve that stepped up
-per video and never came back down — see `wikis/Gesture-Worker.md`'s "A
-memory-growth dead end" section for the fuller history of memory issues
-here). Downscaling cuts that per-window peak by roughly (960 / longer
-source edge)² — for 1080p, about 3x; for 4K, about 8x.
+one list regardless of which model consumes them — at 1080p that's
+~930MB, at 4K ~3.7GB, held raw before any inference starts. That
+memory-safety motivation is independent of MeTRAbs vs. MediaPipe.
 
-Every 2D pixel coordinate MeTRAbs returns (`boxes`, `poses2d`/`pose_2d`) is
-in the *resized* image's pixel space, so both paths immediately rescale it
-back to the source video's original dimensions (dividing by `scale`)
-before it reaches any of the aggregation code below (`_box_center`,
-`_build_frame`, `_aggregate`, the velocity/displacement math) — none of
-that code changed or needs to know downscaling happens at all. `poses3d`
-(metric world-space mm) is *not* rescaled — MeTRAbs derives it from the
-assumed FOV and the image's own dimensions at inference time, so it's
-resolution-independent by construction, unlike the 2D image-space output.
+Coordinates come back from the landmarker already normalised to [0, 1]
+(not raw pixels, unlike MeTRAbs's output) — downscaling doesn't need any
+rescale-back step the way MeTRAbs's pixel-space output did; a normalised
+coordinate means the same thing regardless of what resolution produced it.
+Pixel-space `Landmark.x/y` (matching the rest of this file's existing
+convention — `_aggregate`'s velocity/displacement math expects pixels, not
+normalised fractions) are reconstructed by multiplying against the
+*original* meta.width/meta.height once, immediately after detection.
 
-The remote path sends the *resized* dimensions as `width`/`height` in the
-request, not the original video's — `colab/gesture_server.ipynb`'s own
-normalisation (`_box_center`, in-frame visibility bounds) only ever uses
-whatever `width`/`height` the client sends, so this required no notebook
-change at all.
+## Per-landmark confidence — a real improvement over MeTRAbs
 
-Each raw frame is also released (`raw_frames[i] = None`) the moment it's
-been consumed (resized + fed to the model, or resized + JPEG-encoded),
-instead of the whole window's raw frames staying referenced until the
-whole window finishes — on the remote path in particular, this avoids
-holding a complete raw copy *and* a complete encoded copy of the same
-window simultaneously, which the original implementation did.
+MeTRAbs had no per-joint confidence at all (only a per-person detection-box
+score), so this file used to fake a pseudo-visibility (1.0 if a landmark's
+2D projection landed inside the frame, else 0.0). MediaPipe genuinely
+reports both `visibility` and `presence` per landmark; `Landmark.visibility`
+here is populated directly from MediaPipe's own `visibility` field — an
+actual confidence estimate, not an in-frame-bounds proxy.
+
+## World coordinates — a real downgrade versus MeTRAbs, worth being honest about
+
+MeTRAbs's `pose_world` was genuinely absolute, camera-relative metric 3D,
+in millimetres (derived from an assumed FOV and the detected person's
+real-world scale). MediaPipe's `pose_world_landmarks` are metric-*ish*
+(meters) but hip-midpoint-relative, not absolute camera-space depth —
+confirmed directly (sample values sit in roughly [-1, 1], consistent with
+hip-relative meters, not absolute distance-from-camera). Populated here as
+`pose_world` **in meters, unconverted** — deliberately not rescaled to mm
+to match MeTRAbs's old convention, since these aren't the same kind of
+quantity to begin with (hip-relative vs. absolute) and forcing them onto
+the same unit invited exactly the false-equivalence this section is
+warning about. Anything downstream that assumed true absolute depth
+(there wasn't any on the MeTRAbs branch — FusionEngine's camera-angle math
+uses 2D `pose`/`pose_keyframes`, not `pose_world`, and only ever takes
+differences between landmarks, so it's unit-agnostic) should not assume
+that's still true here, and should not assume mm either.
 """
 
 from __future__ import annotations
 
-import base64
 import math
-import os
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
-import requests
 from loguru import logger
 from scenedetect import ContentDetector, SceneManager, open_video
 
@@ -192,38 +142,42 @@ from core.feature_store import FeatureStore
 from core.models import GestureFeatures, GestureFrame, Landmark, PoseKeyframe, TimeWindow
 from core.preprocessing import VideoMeta, frames_for_window
 
-# MeTRAbs "coco_19" skeleton joint order — verified directly against the
-# model's own `per_skeleton_joint_names['coco_19']` output (there's no
-# authoritative public spec for this ordering other than the model itself):
-#   0 neck, 1 nose, 2 pelvis, 3 l_shoulder, 4 l_elbow, 5 l_wrist, 6 l_hip,
-#   7 l_knee, 8 l_ankle, 9 r_shoulder, 10 r_elbow, 11 r_wrist, 12 r_hip,
-#   13 r_knee, 14 r_ankle, 15 l_eye, 16 l_ear, 17 r_eye, 18 r_ear
-# This has real structure MediaPipe/COCO-17 didn't give us in one topology:
-# both a neck AND a pelvis point, useful as stable torso anchors.
-_SKELETON = "coco_19"
-_NUM_LANDMARKS = 19
-_LEFT_WRIST = 5
-_RIGHT_WRIST = 11
-_LEFT_HIP = 6
-_RIGHT_HIP = 12
+# MediaPipe's BlazePose 33-point topology — standard, documented ordering
+# (https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker):
+#   0 nose, 1-3 left eye (inner/center/outer), 4-6 right eye (inner/center/
+#   outer), 7 left ear, 8 right ear, 9 mouth (left), 10 mouth (right),
+#   11 left shoulder, 12 right shoulder, 13 left elbow, 14 right elbow,
+#   15 left wrist, 16 right wrist, 17 left pinky, 18 right pinky,
+#   19 left index, 20 right index, 21 left thumb, 22 right thumb,
+#   23 left hip, 24 right hip, 25 left knee, 26 right knee, 27 left ankle,
+#   28 right ankle, 29 left heel, 30 right heel, 31 left foot index,
+#   32 right foot index.
+# "Left"/"right" are the subject's own, not camera-relative (mirrored from
+# the viewer's perspective when facing the camera) — same convention
+# MeTRAbs used.
+_NUM_LANDMARKS = 33
+_LEFT_WRIST = 15
+_RIGHT_WRIST = 16
+_LEFT_HIP = 23
+_RIGHT_HIP = 24
+# Stable torso anchors used for the speaker-selection centrality/tracking
+# math in place of a detector box PoseLandmarker doesn't provide — see
+# module docstring's "Speaker selection".
+_TORSO_LANDMARKS = (11, 12, 23, 24)
 
-_MODEL_DIR = Path(__file__).resolve().parent.parent / "models" / "metrabs_mob3s_y4t"
-_MODEL_URL = "https://omnomnom.vision.rwth-aachen.de/data/metrabs/metrabs_mob3s_y4t.zip"
+_MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
+_POSE_MODEL_PATH = _MODELS_DIR / "pose_landmarker_lite.task"
+_POSE_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+    "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+)
+
+# How many people to look for at once — a practical cap (typical talk
+# footage: the speaker plus a handful of visible audience members), not an
+# attempt at exhaustive detection. Not empirically tuned.
+_NUM_POSES = 5
 
 _FRAME_CENTER = (0.5, 0.5)
-_DEFAULT_FOV_DEGREES = 55.0  # MeTRAbs's own default; used when no camera
-# intrinsics are known, which is always true here (arbitrary source videos).
-
-# See module docstring's "Remote MeTRAbs, local fallback" section.
-_REMOTE_URL_ENV = "GESTURE_REMOTE_URL"
-_REMOTE_API_KEY_ENV = "GESTURE_API_KEY"
-_REMOTE_TIMEOUT_S = 120  # one window's worth of frames (up to 150), batched
-_JPEG_QUALITY = 85
-
-# Frames are downscaled (aspect-preserving) to at most this on the longer
-# edge before they're ever held or sent — see module docstring's "Frame
-# resolution" section for why this loses ~nothing MeTRAbs can actually use.
-_MAX_DIM = 960
 
 # Same ContentDetector default CameraWorker uses (core/camera_worker.py) —
 # not shared/imported from there deliberately, see _detect_scene_cuts.
@@ -233,21 +187,13 @@ _SCENE_CUT_THRESHOLD = 27.0
 # [0,1] frame-fraction distance) from the last known position, it's treated
 # as implausible — track loss, not a real continuation — and a fresh
 # centrality vote runs instead of trusting it. Starting value, not
-# empirically tuned yet.
+# empirically tuned.
 _MAX_TRACK_JUMP = 0.3
 
-# Background-subtraction-based foreground filtering was tried here and
-# reverted — measured directly against real footage, a real continuously-
-# present, actively-gesturing speaker's own bounding box scored a mean
-# foreground ratio of just 0.088 (some frames as low as 0.000), because a
-# speaker mostly stands still (torso/legs/head largely stationary, only
-# hands/arms moving) and MOG2 can't distinguish that from genuine static
-# background within a single 5s window. It would have rejected the real
-# subject far more often than it caught anything static/false. Revisit
-# alongside per-candidate motion-scoring (deferred) rather than as a
-# separate mechanism — same underlying signal, better suited to relative
-# comparison between candidates than absolute background/foreground
-# classification of one.
+# Frames are downscaled (aspect-preserving) to at most this on the longer
+# edge before they're ever held or sent — see module docstring's "Frame
+# resolution" section.
+_MAX_DIM = 960
 
 
 def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -258,43 +204,52 @@ def _resize_scale(width: int, height: int, max_dim: int = _MAX_DIM) -> float:
     """<=1.0 factor to shrink (width, height) so its longer edge is at most
     max_dim; 1.0 (no-op) if it's already smaller."""
     longest = max(width, height)
-    return min(1.0, max_dim/longest)
+    return min(1.0, max_dim / longest)
+
+
+def _ensure_model(path: Path, url: str, name: str) -> None:
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    logger.info(f"[gesture] Downloading {name} model to {path}...")
+    urllib.request.urlretrieve(url, str(path))
 
 
 class GestureWorker:
     def __init__(self, store: FeatureStore):
         self.store = store
-        self._model = None  # lazy — see _get_model; never touched at all if remote succeeds
-        self._remote_url = os.environ.get(_REMOTE_URL_ENV) or None
-        self._remote_api_key = os.environ.get(_REMOTE_API_KEY_ENV) or None
-        self._remote_failed_this_job = False
-        if self._remote_url:
-            logger.info(f"[gesture] Will try remote MeTRAbs first, at {self._remote_url}")
+        self._pose_landmarker = None  # per-job, see process_job
 
     def close(self) -> None:
-        pass  # no persistent per-video resource to release; the subprocess
-        # this worker runs in (see module docstring) is what actually
-        # reclaims TensorFlow's memory, by exiting entirely after the job —
-        # only relevant when the local fallback actually ran at all.
+        # Primary cleanup is process_job's own try/finally — this only
+        # matters if a job crashed badly enough to skip that, leaving
+        # these set on an otherwise-idle worker instance (persistent
+        # bulk-mode server, reused across many jobs).
+        self._close_landmarker()
 
-    def _get_model(self):
-        """Lazily loads the local MeTRAbs SavedModel — see module docstring
-        for why both the model load AND the `tensorflow` import itself are
-        deferred to here rather than module/instance-construction time."""
-        if self._model is not None:
-            return self._model
-        import tensorflow as tf  # deferred — see module docstring
+    def _close_landmarker(self) -> None:
+        if self._pose_landmarker is not None:
+            self._pose_landmarker.close()
+            self._pose_landmarker = None
 
-        if not _MODEL_DIR.exists():
-            raise FileNotFoundError(
-                f"MeTRAbs model not found at {_MODEL_DIR}. Download it with:\n"
-                f"  curl -L -o /tmp/metrabs.zip {_MODEL_URL}\n"
-                f"  unzip /tmp/metrabs.zip -d {_MODEL_DIR.parent}\n"
-                "(the Dockerfile does this automatically at build time)"
+    def _open_landmarker(self) -> None:
+        """Creates a fresh PoseLandmarker instance for this job — see
+        module docstring's "VIDEO mode" for why per-job, not
+        per-worker-instance or per-window."""
+        import mediapipe as mp
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision
+
+        _ensure_model(_POSE_MODEL_PATH, _POSE_MODEL_URL, "pose_landmarker_lite")
+
+        self._pose_landmarker = vision.PoseLandmarker.create_from_options(
+            vision.PoseLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=str(_POSE_MODEL_PATH)),
+                running_mode=vision.RunningMode.VIDEO,
+                num_poses=_NUM_POSES,
             )
-        logger.info("[gesture] Loading local MeTRAbs model...")
-        self._model = tf.saved_model.load(str(_MODEL_DIR))
-        return self._model
+        )
+        self._mp = mp  # stashed for mp.Image/mp.ImageFormat use in the per-frame loop
 
     def process_job(
         self,
@@ -302,23 +257,22 @@ class GestureWorker:
         meta: VideoMeta,
         windows: list[tuple[float, float]],
     ) -> None:
-        # Fresh chance to try remote for every video, even if a previous
-        # job's remote calls failed (the failure might have been transient,
-        # or the notebook might have been restarted since).
-        self._remote_failed_this_job = False
-
         logger.info(f"[gesture] Starting job {job_id} — {len(windows)} windows")
         cuts = self._detect_scene_cuts(meta.path)
         logger.info(f"[gesture] Found {len(cuts)} scene cuts (own independent pass)")
 
-        for idx, (start, end) in enumerate(windows):
-            try:
-                window_cuts = [c for c in cuts if start <= c < end]
-                features = self._process_window(meta, start, end, window_cuts)
-                self.store.put_gesture(job_id, idx, features)
-                logger.debug(f"[gesture] window {idx} done")
-            except Exception as exc:
-                logger.error(f"[gesture] Window {idx} failed: {exc}")
+        self._open_landmarker()
+        try:
+            for idx, (start, end) in enumerate(windows):
+                try:
+                    window_cuts = [c for c in cuts if start <= c < end]
+                    features = self._process_window(meta, start, end, window_cuts)
+                    self.store.put_gesture(job_id, idx, features)
+                    logger.debug(f"[gesture] window {idx} done")
+                except Exception as exc:
+                    logger.error(f"[gesture] Window {idx} failed: {exc}")
+        finally:
+            self._close_landmarker()
         logger.info(f"[gesture] Job {job_id} complete")
 
     # ------------------------------------------------------------------
@@ -331,13 +285,11 @@ class GestureWorker:
         This worker's own PySceneDetect pass — deliberately independent
         from CameraWorker's own identical pass (core/camera_worker.py),
         not wired to it. Orchestrator._run_parallel dispatches gesture and
-        camera concurrently with no ordering guarantee between them, and
-        gesture runs in its own subprocess in both isolated (per-video) and
-        persistent-server (bulk) modes — see module docstring — so sharing
-        one worker's cut list with the other would mean either serializing
-        dispatch order or shipping cut data across a process boundary.
-        Running the same detection pass twice is a real, accepted cost for
-        keeping the two workers' concurrency untouched.
+        camera concurrently with no ordering guarantee between them, so
+        sharing one worker's cut list with the other would mean
+        serializing dispatch order. Running the same detection pass twice
+        is a real, accepted cost for keeping the two workers' concurrency
+        untouched.
 
         Returns just the cut timestamps (seconds) — gesture only needs
         "did a cut happen here" for ref_pos resets, not a full SceneCut
@@ -353,36 +305,30 @@ class GestureWorker:
     def _process_window(
         self, meta: VideoMeta, start_s: float, end_s: float, window_cuts: list[float]
     ) -> GestureFeatures:
+        """
+        Windows must be processed in non-decreasing start_s order across
+        the whole job — confirmed directly (not assumed): VIDEO mode's
+        detect_for_video raises ValueError("Input timestamp must be
+        monotonically increasing") if fed an earlier timestamp than a
+        previous call on the same landmarker instance. process_job's own
+        loop over `windows` already guarantees this (core/preprocessing.py's
+        compute_windows builds them in chronological order), so this isn't
+        a constraint callers need to actively manage today — worth knowing
+        if that ever changes (e.g. parallelizing windows within a job, or
+        reprocessing/retrying an earlier window after a later one already
+        ran).
+        """
         raw_frames = frames_for_window(meta.path, start_s, end_s, meta.fps)
-
-        gesture_frames: Optional[list[GestureFrame]] = None
-        if self._remote_url and not self._remote_failed_this_job:
-            try:
-                gesture_frames = self._process_window_remote(raw_frames, meta, window_cuts)
-                logger.info("RUNNING POSE ESTIMATION REMOTELY")
-            except Exception as exc:
-                logger.warning(
-                    f"[gesture] Remote MeTRAbs call failed ({exc}) — falling back to "
-                    "local MeTRAbs for the rest of this job"
-                )
-                self._remote_failed_this_job = True
-
-        if gesture_frames is None:
-            gesture_frames = self._process_window_local(raw_frames, meta, window_cuts)
-
+        gesture_frames = self._process_frames(raw_frames, meta, window_cuts)
         return self._aggregate(start_s, end_s, gesture_frames, meta.width, meta.height)
 
-    def _process_window_local(
+    def _process_frames(
         self,
         raw_frames: list[tuple[float, np.ndarray]],
         meta: VideoMeta,
         window_cuts: list[float],
     ) -> list[GestureFrame]:
-        import tensorflow as tf  # deferred — see module docstring; cheap
-        # after the first call (module import is cached), whether that was
-        # via _get_model or a previous call to this method.
-
-        model = self._get_model()
+        mp = self._mp
         gesture_frames: list[GestureFrame] = []
         # None until the first frame with any detection in this window (or
         # since the last scene cut within it) — that frame runs the
@@ -392,17 +338,7 @@ class GestureWorker:
         ref_pos: Optional[tuple[float, float]] = None
         next_cut_idx = 0
 
-        # See module docstring's "Frame resolution" section — MeTRAbs's
-        # detector and pose network only ever produce useful signal at a
-        # small, fixed internal resolution, so feeding it the source frame
-        # at full size costs memory/compute for nothing. Detection is run
-        # on the shrunk frame; every 2D pixel coordinate that comes back
-        # from it (boxes, poses2d — but *not* poses3d, which is metric
-        # world-space and resolution-independent) is scaled back up to
-        # meta.width/meta.height immediately below, so every caller past
-        # this point still sees the same original-frame pixel space it
-        # always has — _box_center, _build_frame, _aggregate, the velocity/
-        # displacement math, all unchanged.
+        # See module docstring's "Frame resolution" section.
         scale = _resize_scale(meta.width, meta.height)
         resized_wh = (round(meta.width * scale), round(meta.height * scale))
 
@@ -410,8 +346,9 @@ class GestureWorker:
             ts, bgr = raw_frames[frame_idx]
             raw_frames[frame_idx] = None  # release this frame's raw buffer as
             # we go, rather than keeping the whole window's raw frames alive
-            # for the entire loop — see module docstring's "Frame resolution"
-            # section for why this and downscaling matter together.
+            # for the entire loop — see module docstring's "Frame
+            # resolution" section for why this and downscaling matter
+            # together (carried over from the MeTRAbs branch).
 
             # A cut landing anywhere at-or-before this frame's timestamp
             # invalidates whatever we were tracking — the next frame is a
@@ -424,28 +361,18 @@ class GestureWorker:
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             if scale < 1.0:
                 rgb = cv2.resize(rgb, resized_wh, interpolation=cv2.INTER_AREA)
-            image = tf.constant(rgb, dtype=tf.uint8)
-            pred = model.detect_poses(
-                image, skeleton=_SKELETON, default_fov_degrees=_DEFAULT_FOV_DEGREES
-            )
-            boxes = pred["boxes"].numpy()
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            timestamp_ms = int(round(ts * 1000))
 
-            if len(boxes) == 0:
+            pose_result = self._pose_landmarker.detect_for_video(mp_image, timestamp_ms)
+            people = pose_result.pose_landmarks
+            people_world = pose_result.pose_world_landmarks
+
+            if not people:
                 gesture_frames.append(self._empty_frame(frame_idx, ts))
                 continue
 
-            poses2d = pred["poses2d"].numpy()
-            poses3d = pred["poses3d"].numpy()
-            if scale < 1.0:
-                # .astype (not an in-place /=) since boxes/poses2d's actual
-                # dtype from the model isn't guaranteed float — dividing an
-                # int-dtype array in place would raise.
-                boxes = boxes.astype(np.float64)
-                boxes[:, :4] /= scale
-                poses2d = poses2d.astype(np.float64)
-                poses2d[..., :2] /= scale
-
-            centers = [self._box_center(b, meta.width, meta.height) for b in boxes]
+            centers = [self._torso_center(p) for p in people]
             if ref_pos is None:
                 chosen = min(range(len(centers)), key=lambda i: _dist(centers[i], _FRAME_CENTER))
             else:
@@ -458,129 +385,47 @@ class GestureWorker:
             ref_pos = centers[chosen]
 
             gf = self._build_frame(
-                frame_idx, ts, poses2d[chosen], poses3d[chosen], meta.width, meta.height
+                frame_idx, ts, people[chosen], people_world[chosen] if people_world else [],
+                meta.width, meta.height,
             )
             gesture_frames.append(gf)
 
         return gesture_frames
 
-    def _process_window_remote(
-        self,
-        raw_frames: list[tuple[float, np.ndarray]],
-        meta: VideoMeta,
-        window_cuts: list[float],
-    ) -> list[GestureFrame]:
-        """
-        Sends this window's frames to colab/gesture_server.ipynb as one
-        batched request and returns the same list[GestureFrame] shape
-        `_process_window_local` produces — see module docstring's "Remote
-        MeTRAbs, local fallback" for the full design and why per-window
-        (not per-frame or per-video).
-
-        window_cuts is sent along in the request body so the server can
-        apply the same scene-cut ref_pos reset _process_window_local does —
-        the server has no way to compute this itself (it only ever
-        receives one window's worth of already-extracted frames, never the
-        source video file, and PySceneDetect needs sequential whole-video
-        access to work at all). The max-jump ambiguity guard, by contrast,
-        only needs this window's own frames, so it runs server-side
-        directly, duplicated the same way the vote/track selection logic
-        already was.
-
-        Frames are downscaled before encoding (see module docstring's
-        "Frame resolution" section) — the *resized* dimensions are what get
-        sent as `width`/`height`, since the server normalises entirely in
-        terms of whatever image it actually received and never needs to
-        know the original video's resolution. `pose_2d` comes back in that
-        same resized pixel space, so it's the one thing rescaled back to
-        meta.width/meta.height below; `pose_3d` is metric world-space and
-        resolution-independent, so it's used as-is.
-
-        Each raw frame's buffer is released (`raw_frames[i] = None`) the
-        moment it's been encoded into the payload, so the window's raw
-        frames and their encoded copies are never both fully alive at once
-        — before this, the whole raw_frames list stayed alive for the
-        entire request, on top of the payload being built alongside it.
-        """
-        scale = _resize_scale(meta.width, meta.height)
-        resized_wh = (round(meta.width * scale), round(meta.height * scale))
-
-        frames_payload = []
-        for frame_idx in range(len(raw_frames)):
-            ts, bgr = raw_frames[frame_idx]
-            raw_frames[frame_idx] = None
-            if scale < 1.0:
-                bgr = cv2.resize(bgr, resized_wh, interpolation=cv2.INTER_AREA)
-            ok, jpeg = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY])
-            if not ok:
-                continue
-            frames_payload.append({
-                "frame_idx": frame_idx,
-                "ts": ts,
-                "jpeg_b64": base64.b64encode(jpeg.tobytes()).decode("ascii"),
-            })
-
-        response = requests.post(
-            self._remote_url,
-            json={
-                "width": resized_wh[0], "height": resized_wh[1],
-                "frames": frames_payload, "cuts": window_cuts,
-            },
-            headers={"X-API-Key": self._remote_api_key or ""},
-            timeout=_REMOTE_TIMEOUT_S,
-        )
-        response.raise_for_status()
-        payload = response.json()
-
-        gesture_frames: list[GestureFrame] = []
-        for entry in payload["frames"]:
-            if entry["pose_2d"] is None:
-                gesture_frames.append(self._empty_frame(entry["frame_idx"], entry["ts"]))
-                continue
-            pose = [
-                Landmark(x=xy[0] / scale, y=xy[1] / scale, z=0.0, visibility=vis)
-                for xy, vis in zip(entry["pose_2d"], entry["visibility"])
-            ]
-            pose_world = [
-                Landmark(x=xyz[0], y=xyz[1], z=xyz[2], visibility=vis)
-                for xyz, vis in zip(entry["pose_3d"], entry["visibility"])
-            ]
-            gesture_frames.append(GestureFrame(
-                frame_idx=entry["frame_idx"],
-                timestamp_s=entry["ts"],
-                pose=pose,
-                left_hand=[],
-                right_hand=[],
-                pose_world=pose_world,
-            ))
-        return gesture_frames
-
     @staticmethod
-    def _box_center(box: np.ndarray, width: int, height: int) -> tuple[float, float]:
-        """Detection box is [x, y, w, h, confidence] in pixel coords."""
-        x, y, w, h = box[0], box[1], box[2], box[3]
-        return ((x + w / 2.0) / width, (y + h / 2.0) / height)
+    def _torso_center(landmarks) -> tuple[float, float]:
+        """Mean of the shoulder/hip landmarks (already-normalised [0,1]
+        coords) as a stable person-center proxy — see module docstring's
+        "Speaker selection" for why not a full-landmark bounding box."""
+        xs = [landmarks[i].x for i in _TORSO_LANDMARKS]
+        ys = [landmarks[i].y for i in _TORSO_LANDMARKS]
+        return (sum(xs) / len(xs), sum(ys) / len(ys))
 
     @staticmethod
     def _build_frame(
         frame_idx: int,
         ts: float,
-        xy2d: np.ndarray,
-        xyz3d: np.ndarray,
+        pose_landmarks,
+        pose_world_landmarks,
         width: int,
         height: int,
     ) -> GestureFrame:
-        # No native per-joint confidence (see module docstring) — a joint
-        # counts as "visible" here if its 2D projection actually lands
-        # inside the frame, not extrapolated off-screen from occlusion.
-        pose = []
-        pose_world = []
-        for i in range(_NUM_LANDMARKS):
-            x2, y2 = float(xy2d[i][0]), float(xy2d[i][1])
-            vis = 1.0 if (0.0 <= x2 < width and 0.0 <= y2 < height) else 0.0
-            pose.append(Landmark(x=x2, y=y2, z=0.0, visibility=vis))
-            x3, y3, z3 = float(xyz3d[i][0]), float(xyz3d[i][1]), float(xyz3d[i][2])
-            pose_world.append(Landmark(x=x3, y=y3, z=z3, visibility=vis))
+        pose = [
+            Landmark(x=lm.x * width, y=lm.y * height, z=lm.z, visibility=lm.visibility)
+            for lm in pose_landmarks
+        ]
+        # Left in meters, unconverted — see module docstring's "World
+        # coordinates" for why this is a hip-relative proxy, not true
+        # absolute depth the way MeTRAbs's (millimetre) pose_world was, and
+        # why it's deliberately not rescaled to force a shared unit.
+        pose_world = [
+            Landmark(x=lm.x, y=lm.y, z=lm.z, visibility=lm.visibility)
+            for lm in pose_world_landmarks
+        ] if pose_world_landmarks else []
+
+        # left_hand/right_hand are always empty — no hand model runs here
+        # (removed; see module docstring). Kept on GestureFrame for shape
+        # compatibility with the rest of the pipeline.
         return GestureFrame(
             frame_idx=frame_idx,
             timestamp_s=ts,
@@ -607,10 +452,12 @@ class GestureWorker:
     ) -> GestureFeatures:
         window = TimeWindow(start_s=start_s, end_s=end_s)
 
-        # Require the full 19-keypoint set so all landmark index accesses
-        # below are safe. MeTRAbs always returns all 19 for a detected
-        # person (see module docstring), so in practice this is equivalent
-        # to "was anyone detected at all this frame".
+        # Require the full 33-keypoint set so all landmark index accesses
+        # below are safe. BlazePose always returns all 33 for a detected
+        # person (extrapolated for occluded/off-screen ones, same as
+        # MeTRAbs did — see module docstring's "Speaker selection"), so in
+        # practice this is equivalent to "was anyone detected at all this
+        # frame".
         pose_present = [f for f in frames if len(f.pose) >= _NUM_LANDMARKS]
         pose_present_ratio = len(pose_present) / max(len(frames), 1)
 
@@ -676,22 +523,13 @@ class GestureWorker:
     ) -> list[PoseKeyframe]:
         """
         Return every `step`-th frame as a PoseKeyframe with normalised coords.
-        frames here is already pose_present (real detections only), and for
-        content analyzed at full native-frame density (frames_for_window's
-        own step==1, true whenever native_fps * window_size_s <= max_frames
-        — e.g. any video at or below ~30fps with the default 5s window),
-        step controls how many of those already-computed real detections
-        actually become keyframes.
-
-        step=1 (one keyframe per real detection) was tried first and
-        reverted — MeTRAbs has no built-in temporal smoothing between
-        frames (each frame's landmarks are estimated independently), so at
-        full density the overlay visibly picked up that per-frame jitter,
-        reported as the rendered skeleton "jumping around a lot" rather
-        than tracking smoothly. step=2 widens the gap between consecutive
-        *displayed* keyframes enough that real motion dominates over that
-        per-frame noise, while still keeping meaningfully more of the
-        already-computed predictions than the original step=3 did.
+        frames here is already pose_present (real detections only). step=2
+        (not 1) — carried over from the MeTRAbs branch's own finding that
+        full per-frame density visibly picked up per-frame jitter with no
+        temporal smoothing between displayed samples; VIDEO mode's own
+        internal tracking (see module docstring) may make step=1 viable
+        here even though it wasn't there, but that hasn't been tested, so
+        step=2 is kept as the known-good starting point.
         y is pre-flipped (stored as 1 − raw_y) so the JS viewer doesn't need
         to re-flip it.
         """

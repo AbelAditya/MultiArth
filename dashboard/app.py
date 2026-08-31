@@ -813,7 +813,7 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
 
         # ── GESTURE ──────────────────────────────────────────────────────
         html.Div(style=SECTION_STYLE, children=[
-            section_header("Pose Estimation", C["gesture"], "MeTRAbs · Kinematic features"),
+            section_header("Pose Estimation", C["gesture"], "MediaPipe · Kinematic features"),
 
             html.Div(style={
                 "marginBottom": "28px", "paddingBottom": "24px",
@@ -1118,9 +1118,11 @@ def _run_bulk_manifest(entries: list[dict], force: bool) -> None:
     try:
         bulk_orch = BulkOrchestrator(
             feature_store=store, repo=repo,
-            # Keep MeTRAbs loaded across the whole manifest instead of
-            # reloading it per video — see core/orchestrator.py.
-            orchestrator_kwargs={"persistent_gesture": True},
+            # No persistent_gesture flag needed on this branch — see
+            # core/orchestrator.py; BulkOrchestrator already reuses one
+            # Orchestrator instance for the whole manifest, keeping every
+            # lazy worker (gesture included, now) warm across every video.
+            orchestrator_kwargs={},
         )
         summary = bulk_orch.run(entries, force=force, progress_cb=_progress_cb)
     except Exception as exc:
@@ -1638,30 +1640,50 @@ clientside_callback(
         if (window._poseRafRunning) return window.dash_clientside.no_update;
         window._poseRafRunning = true;
 
-        // MeTRAbs "coco_19" keypoint topology (see workers/gesture_worker.py)
-        // — not MediaPipe's old 33-point one, not RTMPose's COCO-17 either:
-        // 0 neck, 1 nose, 2 pelvis, 3/4 l shoulder/elbow, 5 l wrist,
-        // 6/7/8 l hip/knee/ankle, 9/10 r shoulder/elbow, 11 r wrist,
-        // 12/13/14 r hip/knee/ankle, 15/16 l eye/ear, 17/18 r eye/ear.
-        // No separate finger/hand-tip or foot/toe landmarks, so "hands"
-        // below is just the wrist points (arms already covers them too).
-        // Edges below are copied verbatim from the model's own
-        // per_skeleton_joint_edges['coco_19'], not hand-derived.
+        // MediaPipe BlazePose 33-point topology (see
+        // workers/gesture_worker.py's module docstring) — NOT MeTRAbs's old
+        // coco_19 (19 points, different indices entirely; this file used to
+        // be hardcoded for that and silently drew the wrong edges/highlights
+        // once GestureFrame.pose switched to BlazePose's indices):
+        // 0 nose, 1-3 left eye (inner/center/outer), 4-6 right eye
+        // (inner/center/outer), 7 left ear, 8 right ear, 9-10 mouth
+        // (left/right), 11/12 shoulders, 13/14 elbows, 15/16 wrists,
+        // 17/18 pinky tips, 19/20 index tips, 21/22 thumb tips, 23/24 hips,
+        // 25/26 knees, 27/28 ankles, 29/30 heels, 31/32 foot index.
+        // "Left"/"right" are the subject's own, mirrored from the viewer's
+        // perspective when facing the camera.
+        //
+        // These are the *pose* model's own approximate fingertip points
+        // (17-22) — GestureFrame.left_hand/right_hand exist on the model
+        // but are always empty (HandLandmarker was tried and removed
+        // again; see gesture_worker.py's module docstring), so this pose
+        // skeleton is the only hand-adjacent data there is to draw.
+        // Each segment is a *list of groups* (each group its own list of
+        // landmark indices), not a flat list — an edge only lights up if
+        // both endpoints fall in the *same* group, not just the same
+        // segment (see the lit check below). "arms" needs two groups
+        // (left/right) specifically so the [11,12] shoulder-shoulder edge
+        // — anatomically part of the torso, not an arm bone, but present
+        // in official POSE_CONNECTIONS below — doesn't light up under the
+        // "arms" highlight just because both its endpoints happen to be
+        // *some* arm landmark. Every other segment only needs one group.
         var SEG_LMS = {
-            head:  [1,15,17,16,18],
-            arms:  [3,9,4,10,5,11],
-            hands: [5,11],
-            torso: [3,9,6,12,0,2],
-            gaze:  [15,17]
+            head:  [[0,1,2,3,4,5,6,7,8,9,10]],
+            arms:  [[11,13,15], [12,14,16]],
+            hands: [[15,16,17,18,19,20,21,22]],
+            torso: [[11,12,23,24]],
+            gaze:  [[1,2,3,4,5,6]]
         };
         var SEG_COLORS = {
             head:  '#4A90D9', arms:  '#F0A500',
             hands: '#C84B31', torso: '#28a745', gaze: '#D63384'
         };
         var CONNECTIONS = [
-            [8,7],[16,15],[4,3],[4,5],[15,1],
-            [6,7],[6,2],[3,0],[0,1],[0,2],[0,9],
-            [1,17],[2,12],[14,13],[18,17],[10,9],[10,11],[12,13]
+            [0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],[9,10],
+            [11,12],[11,13],[13,15],[15,17],[15,19],[15,21],[17,19],
+            [12,14],[14,16],[16,18],[16,20],[16,22],[18,20],
+            [11,23],[12,24],[23,24],[23,25],[24,26],[25,27],[26,28],
+            [27,29],[28,30],[29,31],[30,32],[27,31],[28,32]
         ];
 
         function drawLoop() {
@@ -1733,7 +1755,7 @@ clientside_callback(
 
             var f = frames[lo];
             var px = f.px, py = f.py, pv = f.pv, nKp = px.length;
-            if (nKp < 19) return;  // coco_19 keypoint count (was 17 under RTMPose, 33 under MediaPipe)
+            if (nKp < 33) return;  // BlazePose keypoint count (was 19 under MeTRAbs's coco_19)
 
             var cx_arr = new Float32Array(nKp), cy_arr = new Float32Array(nKp);
             for (var m = 0; m < nKp; m++) {
@@ -1742,9 +1764,19 @@ clientside_callback(
             }
 
             var activeSegs = state.segment;
-            var segColor = {};
+            var segColor = {};  // landmark idx -> highlight color
+            var segGroup = {};  // landmark idx -> "segname-groupindex", for the
+            // same-group check below — two landmarks can share a color (same
+            // segment) without counting as connectable (different group).
             activeSegs.forEach(function(seg) {
-                if (SEG_LMS[seg]) SEG_LMS[seg].forEach(function(i) { segColor[i] = SEG_COLORS[seg]; });
+                var groups = SEG_LMS[seg];
+                if (!groups) return;
+                groups.forEach(function(group, gi) {
+                    group.forEach(function(i) {
+                        segColor[i] = SEG_COLORS[seg];
+                        segGroup[i] = seg + '-' + gi;
+                    });
+                });
             });
             var anyActive = activeSegs.length > 0;
             var normalEdge = anyActive ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.60)';
@@ -1753,11 +1785,12 @@ clientside_callback(
                 var i = CONNECTIONS[e][0], j = CONNECTIONS[e][1];
                 if (i >= nKp || j >= nKp || pv[i] < 0.15 || pv[j] < 0.15) continue;
                 var ci = segColor[i], cj = segColor[j];
-                var lit = ci !== undefined && cj !== undefined;
+                // Same group, not just same segment — see SEG_LMS comment.
+                var lit = ci !== undefined && cj !== undefined && segGroup[i] === segGroup[j];
                 ctx.beginPath();
                 ctx.moveTo(cx_arr[i], cy_arr[i]);
                 ctx.lineTo(cx_arr[j], cy_arr[j]);
-                ctx.strokeStyle = lit ? (ci || cj) : normalEdge;
+                ctx.strokeStyle = lit ? ci : normalEdge;
                 ctx.lineWidth   = lit ? 2.5 : 1.5;
                 ctx.stroke();
             }

@@ -167,9 +167,11 @@ def bulk(ctx, manifest_path, force, mongo_uri, mongo_db, window, whisper_model, 
             "window_size_s": window,
             "whisper_model": whisper_model,
             "whisper_device": device,
-            # Keep MeTRAbs loaded across the whole manifest instead of
-            # reloading it per video — see core/orchestrator.py.
-            "persistent_gesture": True,
+            # No persistent_gesture flag needed on this branch — gesture is
+            # just another lazy in-process worker now (see
+            # core/orchestrator.py), so BulkOrchestrator reusing one
+            # Orchestrator instance for the whole manifest already keeps it
+            # warm across every video, same as prosody/verbal/camera.
         },
     )
     on_progress, close_progress = _make_bulk_progress_reporter()

@@ -4,6 +4,10 @@ Source: [`workers/camera_worker.py`](../workers/camera_worker.py)
 Dashboard section: **Camera**
 Feature model: [`CameraFeatures`](../core/models.py) (in `core/models.py`)
 
+> **Branch note (`light-gesture`):** shot classification and camera-angle
+> computation (point 2 below) are powered by MediaPipe's pose landmarks on
+> this branch, not MeTRAbs's — see [Gesture-Worker.md](Gesture-Worker.md).
+
 ## What it does
 
 `CameraWorker` analyses editorial/camera behaviour: scene cuts and
@@ -29,7 +33,7 @@ framing/zoom over time.
    - `dominant_shot_type` is left as `ShotType.UNKNOWN` here — actual shot
      classification (extreme close-up → very long) as well as
      `horizontal_angle`/`vertical_angle` (shoulder yaw / face pitch) are
-     computed later in the `FusionEngine` using MeTRAbs pose keypoints
+     computed later in the `FusionEngine` using MediaPipe pose keypoints
      from the Gesture worker, which give finer-grained framing information
      than face detection alone.
 
