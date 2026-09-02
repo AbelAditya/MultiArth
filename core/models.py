@@ -144,8 +144,8 @@ class VerbalFeatures(BaseModel):
 
 class HorizontalAngle(str, Enum):
     UNKNOWN  = "unknown"
-    FRONTAL  = "frontal"   # |yaw| < 30° — subject faces roughly toward camera
-    OBLIQUE  = "oblique"   # |yaw| ≥ 30° — body turned away from camera
+    FRONTAL  = "frontal"   # |yaw| < 10° — subject faces roughly toward camera
+    OBLIQUE  = "oblique"   # |yaw| ≥ 10° — body turned away from camera
 
 
 class VerticalAngle(str, Enum):

@@ -230,7 +230,7 @@ class FusionEngine:
             if yaw is not None:
                 fused.camera.mean_shoulder_yaw_deg = yaw
                 fused.camera.horizontal_angle = (
-                    HorizontalAngle.FRONTAL if abs(yaw) < 30 else HorizontalAngle.OBLIQUE
+                    HorizontalAngle.FRONTAL if abs(yaw) < 10 else HorizontalAngle.OBLIQUE
                 )
             if pitch is not None:
                 fused.camera.mean_face_pitch_deg = pitch
