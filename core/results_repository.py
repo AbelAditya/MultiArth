@@ -110,7 +110,14 @@ class ResultsRepository:
         videos, _, _ = self._collections(collection)
         doc = job.model_dump(mode="json")
         doc["_id"] = job.job_id
-        doc["video_filename"] = os.path.basename(job.video_path)
+        # Prefer the manifest's human label — for a Drive-sourced entry
+        # (no local `path` given), job.video_path is core/bulk_orchestrator
+        # .py's _resolve_path destination, named after the Drive file ID
+        # (deliberately, for a stable re-download path — see that
+        # function's own docstring), not anything human-readable. Falling
+        # back to the real basename keeps the CLI's manually-staged-path
+        # workflow unchanged, where the basename already *is* meaningful.
+        doc["video_filename"] = f"{label}.mp4" if label else os.path.basename(job.video_path)
         doc["drive_url"] = drive_url
         doc["label"] = label
         doc["dedupe_key"] = dedupe_key
@@ -164,6 +171,19 @@ class ResultsRepository:
         videos, _, _ = self._collections(collection)
         doc = videos.find_one({"dedupe_key": dedupe_key}, {"_id": 1})
         return doc["_id"] if doc else None
+
+    def delete_job_data(self, collection: str, job_id: str) -> None:
+        """Removes every stored document for one job — video doc, fused
+        windows, artifacts. Used when a `--force`/bulk-force reprocess of
+        an already-shipped video should *overwrite* its previous run
+        rather than accumulate alongside it under a different job_id
+        (every run mints a fresh one) — see core/bulk_orchestrator.py's
+        _ship, which looks up the previous run via find_by_dedupe_key and
+        calls this before saving the new one."""
+        videos, fused_windows, artifacts = self._collections(collection)
+        videos.delete_one({"_id": job_id})
+        fused_windows.delete_many({"job_id": job_id})
+        artifacts.delete_one({"_id": job_id})
 
     # ------------------------------------------------------------------
     # Read (dashboard Browse Corpus)

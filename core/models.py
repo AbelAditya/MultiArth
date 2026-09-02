@@ -66,6 +66,25 @@ class PoseKeyframe(BaseModel):
     world_z: Optional[list[float]] = None  # 33 metric world z-coords, meters (away from camera positive)
 
 
+class GalleryEntry(BaseModel):
+    """
+    One human-confirmed 'this is the speaker' exemplar, built interactively
+    during bulk upload (dashboard-only — see wikis/Gesture-Worker.md's
+    speaker re-identification section; single-file upload never has a
+    gallery and always uses the heuristic-only selection path).
+
+    Stored in Redis under the same job_id as everything else for that job
+    (core/feature_store.py's put_gallery_entry/get_gallery), and cleaned up
+    by the existing job:{job_id}:* wildcard delete_job sweep — a gallery is
+    per-video scratch data, not a durable artifact, so it never reaches
+    MongoDB.
+    """
+    embedding: list[float]     # 512-d OSNet embedding, L2-normalised
+    timestamp_s: float
+    scene_idx: int             # which detected scene this exemplar came from
+    thumbnail_jpeg_b64: str    # small crop, for the confirmation UI to show what's already in the gallery
+
+
 class GestureFeatures(BaseModel):
     """Aggregated gesture features over a time window."""
     window: TimeWindow

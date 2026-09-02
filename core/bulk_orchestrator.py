@@ -192,9 +192,16 @@ class BulkOrchestrator:
 
         _emit({"type": "start"})
 
+        # A pre-assigned job_id (dashboard-only — set during interactive
+        # speaker-gallery confirmation, see core/gallery_builder.py) makes
+        # sure GestureWorker finds that same video's gallery in Redis when
+        # it actually processes this entry — the CLI's `analyze bulk`
+        # never sets this, so it always mints a fresh one as before.
+        preassigned_job_id = entry.get("job_id")
+
         succeeded = False
         try:
-            job_id = self._analyze_with_progress(orchestrator, path, _emit)
+            job_id = self._analyze_with_progress(orchestrator, path, _emit, preassigned_job_id)
 
             status = self.store.get_status(job_id)
             if status != JobStatus.DONE:
@@ -229,14 +236,23 @@ class BulkOrchestrator:
 
     # ------------------------------------------------------------------
 
-    def _analyze_with_progress(self, orchestrator: Orchestrator, path: str, emit: Callable[[dict], None]) -> str:
+    def _analyze_with_progress(
+        self, orchestrator: Orchestrator, path: str, emit: Callable[[dict], None],
+        preassigned_job_id: Optional[str] = None,
+    ) -> str:
         """
         Runs orchestrator.analyze() in a background thread (pre-assigning a
         job_id, as Orchestrator.analyze() supports) so this thread can poll
         Redis for per-modality window counts and emit "tick" progress events
         while the video is being processed.
+
+        preassigned_job_id lets a caller reuse a job_id minted earlier —
+        the dashboard's interactive speaker-gallery flow needs this, so
+        GestureWorker finds that same job_id's gallery in Redis when this
+        entry actually gets processed (see core/gallery_builder.py). None
+        (the CLI path, always) mints a fresh one exactly as before.
         """
-        job_id = str(uuid.uuid4())[:8]
+        job_id = preassigned_job_id or str(uuid.uuid4())[:8]
         result: dict = {}
 
         def _target():
@@ -270,6 +286,20 @@ class BulkOrchestrator:
         job = self.store.get_job(job_id)
         windows = self.store.get_all_fused(job_id)
         duration_s = max((w.window.end_s for w in windows), default=None)
+
+        # A reprocessed video (--force / bulk-force, an existing
+        # dedupe_key match) mints a fresh job_id every run — without this,
+        # the previous run's video/fused-window/artifact docs would just
+        # sit there under their own old job_id forever, orphaned rather
+        # than overwritten, doubling up in Browse Corpus. Looked up once,
+        # not per retry attempt below — idempotent either way if a retry
+        # does re-run this (nothing left to find the second time).
+        existing_job_id = self.repo.find_by_dedupe_key(collection, dedupe_key)
+        if existing_job_id and existing_job_id != job_id:
+            logger.info(
+                f"[bulk] Reprocessing {path} — removing previous run's data (job {existing_job_id})"
+            )
+            self.repo.delete_job_data(collection, existing_job_id)
 
         last_exc = None
         for attempt in range(1, _SHIP_ATTEMPTS + 1):

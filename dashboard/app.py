@@ -10,6 +10,7 @@ Clicking any chart seeks the video to that timestamp.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import os
 import re
 import tempfile
@@ -17,6 +18,7 @@ import threading
 import uuid as _uuid_module
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import dash
 import dash_bootstrap_components as dbc
@@ -35,12 +37,20 @@ from core.logging_setup import setup_file_logging
 setup_file_logging("dashboard")
 
 from core import corpus_analysis
-from core.bulk_orchestrator import BulkOrchestrator, load_manifest
+from core.bulk_orchestrator import BulkOrchestrator, _resolve_path, load_manifest
 from core.drive_download import download_drive_file
 from core.feature_store import FeatureStore
+from core.gallery_builder import (
+    PLATEAU_STREAK, GalleryBuildState, build_landmarker, detect_candidates,
+    embed_candidate_from_b64, init_state, next_candidate_timestamp,
+    record_confirmation, should_stop,
+)
 from core.models import FusedWindow, HorizontalAngle, VerticalAngle
 from core.orchestrator import Orchestrator
+from core.preprocessing import probe_video
 from core.results_repository import ResultsRepository
+from workers._reid import load_reid_model
+from workers.gesture_worker import GestureWorker
 
 # ─────────────────────────────────────────────────────────────────────────────
 # App + video serving
@@ -85,6 +95,28 @@ _VIDEO_PATH: dict = {"path": None}
 # the poll callback reads it from Dash's own request-handling thread.
 _BULK_LOCK = threading.Lock()
 _BULK_STATE: dict = {"running": False, "last_event": None, "summary": None}
+
+# Speaker-gallery confirmation (Bulk Upload only — see
+# core/gallery_builder.py, workers/gesture_worker.py's "Speaker
+# re-identification"). The IMAGE-mode landmarker and OSNet model are each
+# loaded once, lazily, and reused across every video's gallery-confirmation
+# in a session — safe as module-level state under gunicorn's single-worker
+# config (see Dockerfile), same assumption _BULK_STATE above already makes.
+_GALLERY_LANDMARKER = None
+_GALLERY_REID_MODEL = None
+
+
+def _ensure_gallery_models():
+    global _GALLERY_LANDMARKER, _GALLERY_REID_MODEL
+    if _GALLERY_REID_MODEL is None:
+        _GALLERY_REID_MODEL = load_reid_model()
+    if _GALLERY_LANDMARKER is None:
+        _GALLERY_LANDMARKER = build_landmarker()
+    return _GALLERY_LANDMARKER, _GALLERY_REID_MODEL
+
+
+def _bulk_work_dir() -> str:
+    return os.environ.get("WORK_DIR", "/tmp/mannerism")
 
 # Browse Corpus videos live on Drive, not locally — but a same-origin
 # <video> tag (needed for the pose overlay's currentTime/videoWidth access,
@@ -623,10 +655,68 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                     },
                 ),
 
+                # dcc.Loading shows its spinner whenever a running callback
+                # targets an Output inside it — covers both the manifest
+                # -upload callback's now-real work (resolve/download,
+                # probe, scene-cut detection, load OSNet+landmarker, draw
+                # the first candidate — all synchronous, several seconds
+                # the first time) and each gallery click's own embed
+                # -and-draw-next-candidate work, neither of which had any
+                # visual feedback before — see core/gallery_builder.py.
+                dcc.Loading(type="dot", color=C["muted"], children=[
                 html.Div(id="bulk-manifest-summary", style={
                     "fontFamily": "DM Mono, monospace", "fontSize": "11px",
                     "color": C["muted"], "marginBottom": "12px",
                 }),
+
+                # ── Speaker gallery confirmation ────────────────────────
+                # Front-loaded: every manifest video's gallery is built
+                # interactively here before "Start" (below) becomes
+                # available — see core/gallery_builder.py,
+                # workers/gesture_worker.py's "Speaker re-identification".
+                # Dashboard bulk-upload only; single-file upload never
+                # shows this and always uses the heuristic-only path.
+                html.Div(id="gallery-build-panel", style={
+                    "display": "none", "marginBottom": "16px",
+                    "border": f"1px solid {C['border']}", "borderRadius": "8px",
+                    "padding": "14px", "backgroundColor": C["bg"],
+                }, children=[
+                    html.P("SPEAKER GALLERY", style=LABEL_STYLE),
+                    html.Div(id="gallery-build-status", style={
+                        "fontFamily": "DM Mono, monospace", "fontSize": "11px",
+                        "color": C["text"], "marginBottom": "10px",
+                    }),
+                    html.Img(id="gallery-build-frame", style={
+                        "maxWidth": "100%", "maxHeight": "320px", "display": "block",
+                        "borderRadius": "6px", "marginBottom": "10px",
+                        "border": f"1px solid {C['border']}",
+                    }),
+                    html.P(
+                        "Click whichever crop below is the speaker — or skip if "
+                        "they're not visible in this frame.",
+                        style={"fontFamily": "DM Mono, monospace", "fontSize": "10px",
+                               "color": C["muted"], "marginBottom": "8px"},
+                    ),
+                    html.Div(id="gallery-candidate-row", style={
+                        "display": "flex", "gap": "8px", "flexWrap": "wrap",
+                        "marginBottom": "12px",
+                    }),
+                    html.Div(style={"display": "flex", "gap": "10px"}, children=[
+                        dbc.Button("No speaker visible — skip", id="gallery-skip-btn",
+                                   size="sm", outline=True, color="secondary",
+                                   style={"fontFamily": "DM Mono, monospace", "fontSize": "11px"}),
+                        dbc.Button("I'm done with this video", id="gallery-done-btn",
+                                   size="sm", outline=True, color="secondary",
+                                   style={"fontFamily": "DM Mono, monospace", "fontSize": "11px"}),
+                    ]),
+                ]),
+                ]),  # end dcc.Loading — deliberately stops here, before
+                # bulk-start-btn: that button's `disabled` prop is also an
+                # Output of poll_bulk_progress, which fires every 1.5s via
+                # bulk-poll-interval for the *entire* bulk run, not just
+                # gallery-building — including it inside dcc.Loading made
+                # the spinner flash on every poll tick throughout
+                # processing, not just during actual gallery setup.
 
                 html.Div(style={"display": "flex", "gap": "10px", "alignItems": "center",
                                  "marginBottom": "16px"}, children=[
@@ -919,6 +1009,9 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
     dcc.Store(id="data-source", data="redis"),
     dcc.Store(id="browse-collection", data=None),
     dcc.Store(id="bulk-manifest-entries", data=None),
+    dcc.Store(id="gallery-manifest-idx", data=None),
+    dcc.Store(id="gallery-build-state", data=None),
+    dcc.Store(id="gallery-candidates", data=None),
     dcc.Store(id="active-drive-url", data=None),
     dcc.Store(id="active-collection", data=None),
     dcc.Store(id="pose-segment", data=[]),
@@ -1135,17 +1228,190 @@ def _run_bulk_manifest(entries: list[dict], force: bool) -> None:
         _BULK_STATE["running"] = False
 
 
+
+# ── Speaker gallery confirmation (Bulk Upload only) ─────────────────────
+# Front-loaded: every manifest video gets its gallery built interactively
+# here, one at a time, before "Start" (the actual, unattended
+# BulkOrchestrator.run() pass) becomes available — see
+# core/gallery_builder.py and workers/gesture_worker.py's "Speaker
+# re-identification" for the design this implements.
+
+_GALLERY_DRAW_RETRIES = 5  # give up on this video's current attempt after
+# this many consecutive empty draws (e.g. a long stretch of slides with
+# nobody visible) rather than looping forever — the UI just shows nothing
+# found and lets the researcher skip or mark the video done manually.
+
+
+def _gallery_panel_style(visible: bool) -> dict:
+    return {
+        "display": "block" if visible else "none", "marginBottom": "16px",
+        "border": f"1px solid {C['border']}", "borderRadius": "8px",
+        "padding": "14px", "backgroundColor": C["bg"],
+    }
+
+
+def _frame_src(frame_jpeg_b64: Optional[str]) -> Optional[str]:
+    """Data-URI-prefixes a frame's base64 JPEG for use as an <img src> —
+    unlike _render_candidate_row's thumbnails, the raw base64 string was
+    being handed to gallery-build-frame's src directly with no `data:
+    image/jpeg;base64,` prefix, which a browser can't interpret as an
+    image at all (renders as a broken-image icon)."""
+    return f"data:image/jpeg;base64,{frame_jpeg_b64}" if frame_jpeg_b64 else None
+
+
+def _candidates_store_payload(frame_data: dict) -> dict:
+    """What goes into the gallery-candidates Store — bundles the drawn
+    frame's timestamp alongside its candidate crops, since the click
+    handler needs both (the timestamp to record the confirmation against)
+    and Dash Stores don't share state across callback invocations any
+    other way."""
+    return {"ts": frame_data["ts"], "candidates": frame_data["candidates"]}
+
+
+def _render_candidate_row(candidates: list[dict]):
+    return [
+        html.Button(
+            html.Img(src=f"data:image/jpeg;base64,{c['crop_jpeg_b64']}", style={
+                "height": "140px", "borderRadius": "4px", "display": "block",
+            }),
+            id={"type": "gallery-candidate-btn", "index": i},
+            n_clicks=0,
+            style={
+                "padding": "0", "border": f"2px solid {C['border']}",
+                "borderRadius": "6px", "backgroundColor": "transparent", "cursor": "pointer",
+            },
+        )
+        for i, c in enumerate(candidates)
+    ]
+
+
+def _draw_until_nonempty(landmarker, reid_model, path: str, state: GalleryBuildState, fps: float) -> dict:
+    """Keeps drawing candidate frames (round-robin by scene — see
+    core/gallery_builder.py) until one has at least one detected person,
+    or gives up after _GALLERY_DRAW_RETRIES empty draws."""
+    ts = 0.0
+    for _ in range(_GALLERY_DRAW_RETRIES):
+        ts = next_candidate_timestamp(state)
+        result = detect_candidates(reid_model, landmarker, path, ts, fps)
+        if result["candidates"]:
+            result["ts"] = ts
+            return result
+    return {"frame_jpeg_b64": None, "candidates": [], "ts": ts}
+
+
+def _setup_gallery_for_entry(entries: list[dict], idx: int) -> Optional[dict]:
+    """
+    Prepares interactive gallery-building for entries[idx]: resolves and
+    (if only a drive_url is given) downloads the video, probes it, runs
+    scene-cut detection, mints a job_id, and draws the first candidate
+    frame. Returns None once idx has run past the end of entries — the
+    caller takes that as "every gallery is done, reveal Start".
+
+    Mutates entries[idx] in place to attach the minted job_id — the exact
+    id BulkOrchestrator later reuses via its own preassigned-job_id
+    handling (see core/bulk_orchestrator.py's _analyze_with_progress), so
+    GestureWorker finds this video's gallery in Redis when it actually
+    processes this entry.
+
+    A video that can't be prepared at all (missing with no drive_url,
+    download failure, probe failure) is skipped straight to the next
+    entry rather than blocking the whole front-loaded phase — the actual
+    bulk run will hit and report the same failure for it later.
+    """
+    if idx >= len(entries):
+        return None
+
+    entry = entries[idx]
+    path = _resolve_path(entry, _bulk_work_dir())
+
+    if not os.path.exists(path):
+        drive_url = entry.get("drive_url")
+        if not drive_url:
+            logger.warning(f"[dashboard] Gallery phase: {path} not found, no drive_url — skipping")
+            return _setup_gallery_for_entry(entries, idx + 1)
+        try:
+            download_drive_file(drive_url, path)
+        except Exception as exc:
+            logger.error(f"[dashboard] Gallery phase: download failed for {drive_url}: {exc}")
+            return _setup_gallery_for_entry(entries, idx + 1)
+
+    try:
+        meta = probe_video(path, audio_path="")
+        cuts = GestureWorker._detect_scene_cuts(path)
+    except Exception as exc:
+        logger.error(f"[dashboard] Gallery phase: could not prepare {path}: {exc}")
+        return _setup_gallery_for_entry(entries, idx + 1)
+
+    job_id = str(_uuid_module.uuid4())[:8]
+    entry["job_id"] = job_id
+    state = init_state(job_id, path, cuts, meta.duration_s, meta.fps)
+
+    landmarker, reid_model = _ensure_gallery_models()
+    frame_data = _draw_until_nonempty(landmarker, reid_model, path, state, meta.fps)
+
+    label = entry.get("label") or os.path.basename(path)
+    return {"entries": entries, "idx": idx, "state": state, "frame_data": frame_data, "label": label}
+
+
+def _gallery_status_text(setup: dict) -> str:
+    state: GalleryBuildState = setup["state"]
+    n = len(setup["entries"])
+    return (
+        f'Video {setup["idx"] + 1} of {n}: {setup["label"]} — '
+        f'gallery: {state.entries_confirmed} confirmed · streak {state.streak}/{PLATEAU_STREAK}'
+    )
+
+
+def _advance_gallery(entries: list[dict], next_idx: int):
+    """
+    Moves on to the next manifest entry needing a gallery, or — once
+    every entry has been through this — reveals "Start" and hides the
+    gallery panel. Returns a 9-tuple in exactly the Output order
+    handle_gallery_interaction declares below — (entries, bulk-start-btn
+    disabled, gallery-manifest-idx, gallery-build-state, gallery-build
+    -panel style, gallery-build-status, gallery-build-frame src,
+    gallery-candidate-row children, gallery-candidates data) — since
+    several of that callback's branches return this tuple directly rather
+    than through handle_manifest_upload's own reordering/summary-insertion
+    step, this order has to be the single source of truth for both.
+    """
+    setup = _setup_gallery_for_entry(entries, next_idx)
+    if setup is None:
+        # Every video's gallery is built (or skipped) — the actual bulk
+        # run can begin.
+        return (
+            entries, False, None, None,
+            _gallery_panel_style(False), "", None, [], None,
+        )
+
+    return (
+        setup["entries"], True, setup["idx"], dataclasses.asdict(setup["state"]),
+        _gallery_panel_style(True), _gallery_status_text(setup),
+        _frame_src(setup["frame_data"]["frame_jpeg_b64"]),
+        _render_candidate_row(setup["frame_data"]["candidates"]),
+        _candidates_store_payload(setup["frame_data"]),
+    )
+
+
 @callback(
     Output("bulk-manifest-entries", "data"),
     Output("bulk-manifest-summary", "children"),
     Output("bulk-start-btn", "disabled"),
+    Output("gallery-manifest-idx", "data"),
+    Output("gallery-build-state", "data"),
+    Output("gallery-build-panel", "style"),
+    Output("gallery-build-status", "children"),
+    Output("gallery-build-frame", "src"),
+    Output("gallery-candidate-row", "children"),
+    Output("gallery-candidates", "data"),
     Input("manifest-upload", "contents"),
     State("manifest-upload", "filename"),
     prevent_initial_call=True,
 )
 def handle_manifest_upload(contents, filename):
+    no_change = (dash.no_update,) * 10
     if not contents:
-        return dash.no_update, dash.no_update, dash.no_update
+        return no_change
 
     _, b64 = contents.split(",", 1)
     suffix = Path(filename).suffix.lower() or ".yml"
@@ -1156,7 +1422,10 @@ def handle_manifest_upload(contents, filename):
             tmp_path = fh.name
         entries = load_manifest(tmp_path)
     except Exception as exc:
-        return None, f'Could not parse "{filename}": {exc}', True
+        return (
+            None, f'Could not parse "{filename}": {exc}', True,
+            None, None, _gallery_panel_style(False), "", None, [], None,
+        )
     finally:
         if tmp_path:
             try:
@@ -1166,7 +1435,102 @@ def handle_manifest_upload(contents, filename):
 
     collections = sorted({e["collection"] for e in entries})
     summary = f'Loaded {len(entries)} entries from "{filename}" — collections: {", ".join(collections)}'
-    return entries, summary, False
+
+    (
+        entries, start_disabled, gallery_idx, gallery_state, panel_style,
+        status_text, frame_src, candidate_row, candidates_data,
+    ) = _advance_gallery(entries, 0)
+
+    return (
+        entries, summary, start_disabled,
+        gallery_idx, gallery_state, panel_style, status_text,
+        frame_src, candidate_row, candidates_data,
+    )
+
+
+@callback(
+    Output("bulk-manifest-entries", "data", allow_duplicate=True),
+    Output("bulk-start-btn", "disabled", allow_duplicate=True),
+    Output("gallery-manifest-idx", "data", allow_duplicate=True),
+    Output("gallery-build-state", "data", allow_duplicate=True),
+    Output("gallery-build-panel", "style", allow_duplicate=True),
+    Output("gallery-build-status", "children", allow_duplicate=True),
+    Output("gallery-build-frame", "src", allow_duplicate=True),
+    Output("gallery-candidate-row", "children", allow_duplicate=True),
+    Output("gallery-candidates", "data", allow_duplicate=True),
+    Input({"type": "gallery-candidate-btn", "index": ALL}, "n_clicks"),
+    Input("gallery-skip-btn", "n_clicks"),
+    Input("gallery-done-btn", "n_clicks"),
+    State("bulk-manifest-entries", "data"),
+    State("gallery-manifest-idx", "data"),
+    State("gallery-build-state", "data"),
+    State("gallery-candidates", "data"),
+    prevent_initial_call=True,
+)
+def handle_gallery_interaction(_candidate_clicks, _skip_clicks, _done_clicks,
+                                entries, idx, state_data, candidates_data):
+    ctx = dash.callback_context
+    if not ctx.triggered_id or entries is None or idx is None or state_data is None:
+        return (dash.no_update,) * 9
+
+    triggered = ctx.triggered_id
+
+    # "I'm done with this video" — manual override, independent of the
+    # plateau/cap algorithmic stop (see wikis/Gesture-Worker.md).
+    if triggered == "gallery-done-btn":
+        result = _advance_gallery(entries, idx + 1)
+        return result
+
+    state = GalleryBuildState(**state_data)
+    path = state.video_path
+    landmarker, reid_model = _ensure_gallery_models()
+
+    # "No speaker visible — skip" — draws a fresh candidate for the same
+    # video without touching the gallery or the plateau streak at all.
+    if triggered == "gallery-skip-btn":
+        frame_data = _draw_until_nonempty(landmarker, reid_model, path, state, state.fps)
+        setup = {"entries": entries, "idx": idx, "state": state, "frame_data": frame_data,
+                 "label": entries[idx].get("label") or os.path.basename(path)}
+        return (
+            entries, True, idx, dataclasses.asdict(state),
+            _gallery_panel_style(True), _gallery_status_text(setup),
+            _frame_src(frame_data["frame_jpeg_b64"]), _render_candidate_row(frame_data["candidates"]),
+            _candidates_store_payload(frame_data),
+        )
+
+    # A candidate thumbnail was clicked — triggered is the pattern-matched
+    # id dict {"type": "gallery-candidate-btn", "index": i}. candidates_data
+    # bundles the timestamp that frame was drawn at alongside its crops
+    # (see _candidates_store_payload) — needed to record the confirmation
+    # against the right moment in the video.
+    clicked_idx = triggered["index"]
+    candidates = (candidates_data or {}).get("candidates") or []
+    if clicked_idx >= len(candidates):
+        return (dash.no_update,) * 9
+    crop_b64 = candidates[clicked_idx]["crop_jpeg_b64"]
+    ts = candidates_data["ts"]
+
+    embedding = embed_candidate_from_b64(reid_model, crop_b64)
+    record_confirmation(store, state, embedding, ts, crop_b64)
+
+    stop_reason = should_stop(state)
+    if stop_reason:
+        state.stop_reason = stop_reason
+        logger.info(
+            f"[dashboard] Gallery for job {state.job_id} stopped ({stop_reason}) "
+            f"with {state.entries_confirmed} entries"
+        )
+        return _advance_gallery(entries, idx + 1)
+
+    frame_data = _draw_until_nonempty(landmarker, reid_model, path, state, state.fps)
+    setup = {"entries": entries, "idx": idx, "state": state, "frame_data": frame_data,
+             "label": entries[idx].get("label") or os.path.basename(path)}
+    return (
+        entries, True, idx, dataclasses.asdict(state),
+        _gallery_panel_style(True), _gallery_status_text(setup),
+        _frame_src(frame_data["frame_jpeg_b64"]), _render_candidate_row(frame_data["candidates"]),
+        _candidates_store_payload(frame_data),
+    )
 
 
 @callback(

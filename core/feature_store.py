@@ -13,8 +13,17 @@ Key schema
   job:{job_id}:camera:{w}      STRING  CameraFeatures JSON
   job:{job_id}:fused:{w}       STRING  FusedWindow JSON
   job:{job_id}:meta            STRING  AnalysisJob JSON
+  job:{job_id}:gallery:count   STRING  next gallery entry index (INCR counter)
+  job:{job_id}:gallery:{n}     STRING  GalleryEntry JSON (n = entry index)
 
 All keys are set with a 24-hour TTL by default.
+
+Gallery entries (speaker re-identification, dashboard bulk-upload only —
+see wikis/Gesture-Worker.md) are scratch data like everything else here:
+built interactively while a video's gallery is being confirmed, read once
+by GestureWorker at the start of that job, and swept away by the existing
+job:{job_id}:* wildcard in delete_job — no separate cleanup path needed,
+and nothing gallery-related ever reaches MongoDB.
 
 Per-window progress/log events go straight to loguru instead of Redis —
 they're transient console output, not a scratch artifact anything reads back.
@@ -34,6 +43,7 @@ from .models import (
     AnalysisJob,
     CameraFeatures,
     FusedWindow,
+    GalleryEntry,
     GestureFeatures,
     JobStatus,
     ProsodyFeatures,
@@ -187,6 +197,34 @@ class FeatureStore:
 
     def count_windows(self, job_id: str, modality: str) -> int:
         return len(self.r.keys(f"job:{job_id}:{modality}:*"))
+
+    # ------------------------------------------------------------------
+    # Speaker gallery (dashboard bulk-upload only — see module docstring)
+    # ------------------------------------------------------------------
+
+    def add_gallery_entry(self, job_id: str, entry: GalleryEntry) -> int:
+        """Appends one confirmed exemplar; returns its assigned index.
+        INCR gives each concurrent confirmation click its own slot safely
+        even though a single confirmation flow is expected in practice."""
+        idx = self.r.incr(f"job:{job_id}:gallery:count") - 1
+        self.r.set(f"job:{job_id}:gallery:{idx}", entry.model_dump_json(), ex=_TTL)
+        return idx
+
+    def get_gallery(self, job_id: str) -> list[GalleryEntry]:
+        """Empty list = no gallery for this job — GestureWorker treats that
+        as "use the heuristic-only path", not an error (see
+        workers/gesture_worker.py)."""
+        pattern = f"job:{job_id}:gallery:"
+        keys = [
+            k for k in self.r.keys(pattern + "*")
+            if k[len(pattern):].isdigit()  # exclude the ":count" counter key
+        ]
+        entries = []
+        for key in sorted(keys, key=lambda k: int(k.split(":")[-1])):
+            raw = self.r.get(key)
+            if raw:
+                entries.append(GalleryEntry.model_validate_json(raw))
+        return entries
 
     def delete_job(self, job_id: str) -> None:
         """Remove every Redis key for a job, freeing its scratch data early
