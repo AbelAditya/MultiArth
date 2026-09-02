@@ -60,12 +60,18 @@ _MAX_SLOTS_PER_SCENE = 6    # bounds how much one very long scene can
 # dominate a lap's schedule — without this, a single long shot next to
 # several short cutaways would crowd out ever giving the short ones a
 # fair turn within a realistic number of total confirmations.
-_MAX_FRAME_RETRY = 8        # per-slot retries against a frame index
-# already shown (state.drawn_frames) before falling back to accepting the
-# repeat — a genuine last resort, not the routine path. See
-# next_candidate_timestamp's docstring for the confirmed-real bug this
-# replaces: a scene under 0.2s used to return the exact same timestamp
-# every single time it recurred across laps.
+_MAX_FRAME_RETRY = 8        # retries against a frame index already shown
+# (state.drawn_frames) before falling back to accepting the repeat — a
+# genuine last resort, not the routine path. See _draw_fresh_frame's
+# docstring for the confirmed-real bug this replaces: a scene under 0.2s
+# used to return the exact same timestamp every single time it recurred
+# across laps.
+_MAX_SLOT_DETECTION_RETRY = 4  # how many different timestamps to try
+# WITHIN one schedule slot's own sub-interval, looking for one where a
+# person is actually detected, before giving up on that specific slot —
+# see draw_next_candidate's docstring for the confirmed-real bug this
+# fixes: retrying by drawing a whole new schedule slot (a different
+# scene's guaranteed turn) instead of retrying the same one.
 
 
 @dataclass
@@ -158,29 +164,63 @@ def init_state(
     )
 
 
-def next_candidate_timestamp(state: GalleryBuildState) -> float:
+def _draw_fresh_frame(interval_start: float, interval_end: float, fps: float, seen: list[int]) -> tuple[float, int]:
     """
-    Pulls the next (scene, sub-interval) slot off the duration-weighted,
-    stratified schedule (rebuilding a fresh lap once exhausted — see
-    _build_schedule), draws a random timestamp within that sub-interval,
-    and retries within it if the resulting frame index has already been
-    shown to the researcher (tracked per-scene in state.drawn_frames,
-    marked regardless of whether that earlier draw was confirmed or
-    skipped — the point is never re-showing the same image, not just
-    never re-confirming it).
+    Draws a random timestamp within [interval_start, interval_end) whose
+    frame index hasn't been shown before (per `seen`), retrying up to
+    _MAX_FRAME_RETRY times before falling back to accepting a repeat.
 
-    This replaces a confirmed real bug: the previous flat round-robin
-    picked a pure-random timestamp with no memory of past draws at all,
-    so any scene under 0.2s returned its own start timestamp — the exact
-    same frame — every single time it recurred across laps (verified
-    directly, not assumed; see wikis/Gesture-Worker.md's re-ID section).
-    Longer scenes had a smaller but real chance of the same thing via
-    frame-index rounding once enough laps accumulated.
+    This is the fix for a confirmed real bug: the original flat
+    round-robin picked a pure-random timestamp with no memory of past
+    draws at all, so any scene under 0.2s returned its own start
+    timestamp — the exact same frame — every single time it recurred
+    across laps (verified directly, not assumed). Returns (ts, frame_idx)
+    — the caller marks frame_idx into `seen` itself, once it knows
+    whether this frame is being kept or discarded (see
+    draw_next_candidate).
+    """
+    frame_idx = round(interval_start * fps)
+    for _ in range(_MAX_FRAME_RETRY):
+        if interval_end - interval_start < 1.0 / fps:
+            ts = interval_start
+        else:
+            ts = random.uniform(interval_start, interval_end)
+        frame_idx = round(ts * fps)
+        if frame_idx not in seen:
+            return ts, frame_idx
+    # Exhausted — every retry landed on an already-seen frame. Accept the
+    # repeat rather than looping forever; a last resort, not the routine
+    # path.
+    return frame_idx / fps, frame_idx
 
-    Falls back to accepting a repeat only once a sub-interval is
-    genuinely exhausted of distinct frames (a very short scene at a low
-    frame rate, or a research video's degenerate one-frame stinger) — a
-    last resort, not the routine path.
+
+def draw_next_candidate(reid_model, landmarker, state: GalleryBuildState) -> dict:
+    """
+    Pops exactly one (scene, sub-interval) slot off the duration
+    -weighted, stratified schedule (rebuilding a fresh lap once
+    exhausted — see _build_schedule) and *commits* to attempting it: up
+    to _MAX_SLOT_DETECTION_RETRY different (frame-deduped, via
+    _draw_fresh_frame) timestamps within that slot's own sub-interval are
+    tried, looking for one where PoseLandmarker actually detects at least
+    one person, before giving up on this specific slot. Returns a dict
+    shaped like detect_candidates' own return value plus "ts", or an
+    empty one if every local retry came up empty.
+
+    This is the fix for a confirmed real bug: the previous design (a
+    plain next_candidate_timestamp that only ever picked a timestamp, with
+    "nobody detected" retried by the *caller* calling it again) advanced
+    the schedule cursor on every single retry — so a "nobody detected"
+    retry didn't retry the *same* scene, it silently consumed a
+    *different* scene's guaranteed slot instead, in whichever order the
+    schedule happened to list them. A short scene whose one-and-only slot
+    landed on an undetectable frame (occluded, off-camera, a cutaway)
+    could lose that slot entirely without ever actually being shown to
+    the researcher — confirmed directly against real test footage, not
+    assumed — even though the schedule itself was built specifically to
+    guarantee that scene a turn. The caller (dashboard/app.py's
+    _draw_until_nonempty) is responsible for calling this again, which
+    now correctly advances to the genuinely next *scheduled* slot only
+    once this one's own local retries are truly exhausted.
     """
     bounds = _scene_bounds(state.scene_cuts, state.duration_s)
     if state.schedule_cursor >= len(state.schedule):
@@ -192,27 +232,19 @@ def next_candidate_timestamp(state: GalleryBuildState) -> float:
 
     n_slots = _n_slots_for_scene(bounds[scene_idx][1] - bounds[scene_idx][0])
     interval_start, interval_end = _sub_interval_bounds(bounds[scene_idx], n_slots, slot_idx)
-
     seen = state.drawn_frames[scene_idx]
-    frame_idx = None
-    candidate_frame = round(interval_start * state.fps)  # always defined,
-    # even if the loop below never runs (interval shorter than 1 frame)
-    for _ in range(_MAX_FRAME_RETRY):
-        if interval_end - interval_start < 1.0 / state.fps:
-            ts = interval_start
-        else:
-            ts = random.uniform(interval_start, interval_end)
-        candidate_frame = round(ts * state.fps)
-        if candidate_frame not in seen:
-            frame_idx = candidate_frame
-            break
-    if frame_idx is None:
-        # Exhausted — every retry landed on an already-seen frame. Accept
-        # the repeat rather than looping forever; see docstring above.
-        frame_idx = candidate_frame
 
-    seen.append(frame_idx)
-    return frame_idx / state.fps
+    ts = interval_start
+    for _ in range(_MAX_SLOT_DETECTION_RETRY):
+        ts, frame_idx = _draw_fresh_frame(interval_start, interval_end, state.fps, seen)
+        seen.append(frame_idx)  # mark tried regardless of outcome, so a
+        # later retry (within this slot or a future lap) doesn't waste an
+        # attempt re-landing on a frame already confirmed empty.
+        result = detect_candidates(reid_model, landmarker, state.video_path, ts, state.fps)
+        if result["candidates"]:
+            result["ts"] = ts
+            return result
+    return {"frame_jpeg_b64": None, "candidates": [], "ts": ts}
 
 
 def _scene_idx_for_timestamp(state: GalleryBuildState, ts: float) -> int:
@@ -282,7 +314,7 @@ def build_landmarker():
     from mediapipe.tasks.python import vision
     from workers.gesture_worker import _ensure_model, _NUM_POSES, _POSE_MODEL_PATH, _POSE_MODEL_URL
 
-    _ensure_model(_POSE_MODEL_PATH, _POSE_MODEL_URL, "pose_landmarker_lite")
+    _ensure_model(_POSE_MODEL_PATH, _POSE_MODEL_URL, "pose_landmarker_full")
     return vision.PoseLandmarker.create_from_options(
         vision.PoseLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=str(_POSE_MODEL_PATH)),

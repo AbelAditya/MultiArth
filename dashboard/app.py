@@ -41,8 +41,8 @@ from core.bulk_orchestrator import BulkOrchestrator, _resolve_path, load_manifes
 from core.drive_download import download_drive_file
 from core.feature_store import FeatureStore
 from core.gallery_builder import (
-    PLATEAU_STREAK, GalleryBuildState, build_landmarker, detect_candidates,
-    embed_candidate_from_b64, init_state, next_candidate_timestamp,
+    PLATEAU_STREAK, GalleryBuildState, build_landmarker, draw_next_candidate,
+    embed_candidate_from_b64, init_state,
     record_confirmation, should_stop,
 )
 from core.models import FusedWindow, HorizontalAngle, VerticalAngle
@@ -1292,7 +1292,6 @@ def handle_live_gallery_interaction(_candidate_clicks, _skip_clicks, _done_click
 
     triggered = ctx.triggered_id
     state = GalleryBuildState(**state_data)
-    path = state.video_path
 
     # "I'm done — start analysis" — manual override, independent of the
     # plateau/cap algorithmic stop (see wikis/Gesture-Worker.md). A click
@@ -1308,7 +1307,7 @@ def handle_live_gallery_interaction(_candidate_clicks, _skip_clicks, _done_click
     # "No speaker visible — skip" — draws a fresh candidate without
     # touching the gallery or the plateau streak at all.
     if triggered == "live-gallery-skip-btn":
-        frame_data = _draw_until_nonempty(landmarker, reid_model, path, state, state.fps)
+        frame_data = _draw_until_nonempty(landmarker, reid_model, state)
         return (
             dash.no_update, dash.no_update, dash.no_update,
             _gallery_panel_style(True), _live_gallery_status_text(state),
@@ -1337,7 +1336,7 @@ def handle_live_gallery_interaction(_candidate_clicks, _skip_clicks, _done_click
         )
         return _start_live_analysis(state)
 
-    frame_data = _draw_until_nonempty(landmarker, reid_model, path, state, state.fps)
+    frame_data = _draw_until_nonempty(landmarker, reid_model, state)
     return (
         dash.no_update, dash.no_update, dash.no_update,
         _gallery_panel_style(True), _live_gallery_status_text(state),
@@ -1447,18 +1446,19 @@ def _render_candidate_row(candidates: list[dict], btn_type: str = "gallery-candi
     ]
 
 
-def _draw_until_nonempty(landmarker, reid_model, path: str, state: GalleryBuildState, fps: float) -> dict:
-    """Keeps drawing candidate frames (round-robin by scene — see
-    core/gallery_builder.py) until one has at least one detected person,
-    or gives up after _GALLERY_DRAW_RETRIES empty draws."""
-    ts = 0.0
+def _draw_until_nonempty(landmarker, reid_model, state: GalleryBuildState) -> dict:
+    """Keeps advancing to successive *schedule slots* (see
+    core/gallery_builder.py's draw_next_candidate — each call there
+    already retries several different timestamps within one slot before
+    giving up on it) until one produces at least one detected candidate,
+    or gives up after _GALLERY_DRAW_RETRIES consecutive empty slots.
+    state already carries video_path/fps, so nothing else needs passing."""
+    result = {"frame_jpeg_b64": None, "candidates": [], "ts": 0.0}
     for _ in range(_GALLERY_DRAW_RETRIES):
-        ts = next_candidate_timestamp(state)
-        result = detect_candidates(reid_model, landmarker, path, ts, fps)
+        result = draw_next_candidate(reid_model, landmarker, state)
         if result["candidates"]:
-            result["ts"] = ts
             return result
-    return {"frame_jpeg_b64": None, "candidates": [], "ts": ts}
+    return result
 
 
 def _setup_gallery_for_entry(entries: list[dict], idx: int) -> Optional[dict]:
@@ -1509,7 +1509,7 @@ def _setup_gallery_for_entry(entries: list[dict], idx: int) -> Optional[dict]:
     state = init_state(job_id, path, cuts, meta.duration_s, meta.fps)
 
     landmarker, reid_model = _ensure_gallery_models()
-    frame_data = _draw_until_nonempty(landmarker, reid_model, path, state, meta.fps)
+    frame_data = _draw_until_nonempty(landmarker, reid_model, state)
 
     label = entry.get("label") or os.path.basename(path)
     return {"entries": entries, "idx": idx, "state": state, "frame_data": frame_data, "label": label}
@@ -1528,7 +1528,7 @@ def _gallery_status_text(setup: dict) -> str:
 # Same underlying mechanics as the Bulk Upload flow above (this reuses
 # _draw_until_nonempty, _render_candidate_row, _frame_src,
 # _candidates_store_payload, _ensure_gallery_models, _gallery_panel_style,
-# and core/gallery_builder.py's init_state/next_candidate_timestamp/
+# and core/gallery_builder.py's init_state/draw_next_candidate/
 # record_confirmation/should_stop directly, unmodified) but for exactly
 # one video with no manifest/"next entry" concept — see
 # handle_upload/handle_live_gallery_interaction below. Kept as separate
@@ -1558,7 +1558,7 @@ def _setup_live_gallery(video_path: str) -> dict:
 
     state = init_state(job_id, video_path, cuts, meta.duration_s, meta.fps)
     landmarker, reid_model = _ensure_gallery_models()
-    frame_data = _draw_until_nonempty(landmarker, reid_model, video_path, state, meta.fps)
+    frame_data = _draw_until_nonempty(landmarker, reid_model, state)
     return {"job_id": job_id, "failed": False, "state": state, "frame_data": frame_data}
 
 
@@ -1701,13 +1701,12 @@ def handle_gallery_interaction(_candidate_clicks, _skip_clicks, _done_clicks,
         return result
 
     state = GalleryBuildState(**state_data)
-    path = state.video_path
     landmarker, reid_model = _ensure_gallery_models()
 
     # "No speaker visible — skip" — draws a fresh candidate for the same
     # video without touching the gallery or the plateau streak at all.
     if triggered == "gallery-skip-btn":
-        frame_data = _draw_until_nonempty(landmarker, reid_model, path, state, state.fps)
+        frame_data = _draw_until_nonempty(landmarker, reid_model, state)
         setup = {"entries": entries, "idx": idx, "state": state, "frame_data": frame_data,
                  "label": entries[idx].get("label") or os.path.basename(path)}
         return (
@@ -1741,7 +1740,7 @@ def handle_gallery_interaction(_candidate_clicks, _skip_clicks, _done_clicks,
         )
         return _advance_gallery(entries, idx + 1)
 
-    frame_data = _draw_until_nonempty(landmarker, reid_model, path, state, state.fps)
+    frame_data = _draw_until_nonempty(landmarker, reid_model, state)
     setup = {"entries": entries, "idx": idx, "state": state, "frame_data": frame_data,
              "label": entries[idx].get("label") or os.path.basename(path)}
     return (
