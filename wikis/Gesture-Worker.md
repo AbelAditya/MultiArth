@@ -70,7 +70,7 @@ across calls to the same landmarker instance) instead of `IMAGE` mode's
 independent-per-call detection. VIDEO mode lets MediaPipe track between
 consecutive frames rather than re-running full detection every time —
 faster, and reduces frame-to-frame jitter (the same underlying problem
-`_extract_keyframes`' `step=2` — see below — works around from the other
+`_extract_keyframes`' `step=3` — see below — works around from the other
 direction).
 
 The landmarker is created **once per job** (`process_job`, not once per
@@ -144,31 +144,59 @@ feature, or a dashboard overlay actually wired to per-finger data) is
 ever built — the matching logic above worked and can be resurrected from
 git history rather than re-derived from scratch.
 
-## Frame resolution
+## Frame resolution — downscaling removed, a deliberate, acknowledged risk
 
-Frames are still downscaled (`_resize_scale`, aspect-preserving, longer
-edge capped at `_MAX_DIM` = 960px) before being held or sent anywhere —
-carried over from the main branch, and *re-verified* rather than assumed
-to still apply: BlazePose's landmark model is also a detector+crop
-architecture, running on a fixed 256x256 crop per detected person
-regardless of source resolution (confirmed against MediaPipe's own
-published architecture description), so the same "full source resolution
-buys nothing the landmark model can use" reasoning holds. This also still
-matters for the same memory reason it did on main:
-`core/preprocessing.py`'s `frames_for_window` holds up to 150
-full-resolution frames per window in one list regardless of which model
-consumes them — at 1080p that's ~930MB, at 4K ~3.7GB, held raw before any
-inference starts. That memory-safety motivation is independent of MeTRAbs
-vs. MediaPipe.
+Frames are **no longer downscaled** before detection. `_resize_scale`/
+`_MAX_DIM` (aspect-preserving, longer edge capped at 960px — carried over
+unmodified from the MeTRAbs branch when this branch was first built) were
+removed by explicit choice, after this branch was found to produce visibly
+less stable/accurate pose output than this project's own original,
+pre-MeTRAbs MediaPipe implementation — which ran at full native
+resolution, no downscaling at all. The reasoning that originally motivated
+downscaling — BlazePose's *landmark* model only ever sees a fixed 256x256
+crop per detected person regardless of source resolution — is still true,
+but it only ever covered half the pipeline: the separate *person
+-detection* step that decides where that crop goes does see the frame at
+whatever resolution it's given, and a lower-resolution input plausibly
+costs real precision there. Downscaling had been trading that away for a
+memory-safety guarantee, never benchmarked against the alternative until
+this comparison against the original MediaPipe branch surfaced it as a
+likely cause.
 
-One real simplification: MediaPipe's coordinates come back already
-normalised to [0, 1] (unlike MeTRAbs's raw pixel output), so there's no
-rescale-back-to-original-resolution step needed the way MeTRAbs's
-pixel-space output required — a normalised coordinate means the same
-thing regardless of what resolution produced it. Pixel-space
-`Landmark.x/y` (matching `_aggregate`'s existing velocity/displacement
-math, which expects pixels) are reconstructed by multiplying against the
-*original* `meta.width`/`meta.height` once, immediately after detection.
+Worth being direct about what this reintroduces: `core/preprocessing.py`'s
+`frames_for_window` holds up to 150 full-resolution frames per window in
+one list regardless of which model consumes them — at 1080p that's
+~930MB, at 4K ~3.7GB, held raw before any inference starts. This is the
+exact memory profile directly confirmed (via `journalctl`/OOM-killer
+forensics) to have caused a real crash on the MeTRAbs branch, and
+downscaling was the fix for it. That risk is real again now, unmitigated
+— a live, accepted tradeoff made in exchange for accuracy, not a closed
+question, and worth revisiting if this branch sees a crash resembling
+that one.
+
+One thing that doesn't change: MediaPipe's coordinates still come back
+already normalised to [0, 1] (unlike MeTRAbs's raw pixel output), so
+there's still no rescale-back-to-original-resolution step needed —
+removing downscaling changes nothing about how coordinates are handled,
+it just means `meta.width`/`meta.height` (used to reconstruct pixel-space
+`Landmark.x/y` for `_aggregate`'s velocity/displacement math) now always
+reflect the frame's true original dimensions rather than a downscaled
+stand-in.
+
+## Model tier — switched from "lite" to "full"
+
+`pose_landmarker_lite.task` was the original choice on this branch (a
+handful of MB, chosen for speed with no accuracy comparison ever run
+against it — see the retired wiki text this replaces). Switched to
+`pose_landmarker_full.task` (~9.4MB, still small) after being identified
+as a likely cause of the same stability/accuracy regression above:
+Tasks API's lite/full/heavy tiering is the direct descendant of the
+project's original, pre-MeTRAbs MediaPipe branch's own explicit
+`model_complexity=1` (Holistic Solutions API's 0/1/2 = lite/full/heavy) —
+confirmed directly from that commit's own code, not assumed. This branch
+had drifted onto the smallest tier without that being a deliberate
+accuracy decision; switching to `full` restores the same tier the
+original branch actually used.
 
 ## Bulk runs
 
@@ -266,12 +294,14 @@ that claim.
   (`core/preprocessing.py`'s `compute_windows` builds windows in
   chronological order), so this isn't something callers need to actively
   manage today — worth knowing if that ever changes.
-- `_extract_keyframes` keeps `step=2` (not `1`), carried over from the
+- `_extract_keyframes` keeps `step=3` (not `1`), carried over from the
   main branch's own finding that full per-frame density visibly picked up
   per-frame jitter with no temporal smoothing between displayed samples.
-  VIDEO mode's own internal tracking may make `step=1` viable here even
-  though it wasn't on main, but that hasn't been tested — `step=2` is kept
-  as the known-good starting point.
+  VIDEO mode's own internal tracking may make a smaller step viable here
+  even though it wasn't on main, but that hasn't been tested. Bumped from
+  `step=2` to `step=3` by explicit choice, not a new finding — not
+  re-benchmarked against `2`, just carried forward as the current
+  known-good value.
 
 ## Package documentation
 

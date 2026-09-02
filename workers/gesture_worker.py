@@ -117,30 +117,43 @@ It's never loaded at all for a job with no gallery — the heuristic-only
 path pays zero cost for this feature, same reasoning as HandLandmarker's
 removal above: no cost for capability that job isn't using.
 
-## Frame resolution
+## Frame resolution — downscaling removed, a deliberate, acknowledged risk
 
-Frames are downscaled (`_resize_scale`, aspect-preserving, longer edge
-capped at `_MAX_DIM` = 960px) before being held or sent anywhere — carried
-over from the MeTRAbs branch, and re-verified rather than assumed to still
-apply: BlazePose's landmark model is *also* a detector+crop architecture,
-running on a fixed 256x256 crop per detected person regardless of the
-source frame's resolution (confirmed via MediaPipe's own published
-architecture description), so the same "full source resolution buys
-nothing the landmark model can use" reasoning holds. This also still
-matters for the same memory reason it did before: `core/preprocessing.py`'s
-`frames_for_window` holds up to 150 full-resolution frames per window in
-one list regardless of which model consumes them — at 1080p that's
-~930MB, at 4K ~3.7GB, held raw before any inference starts. That
-memory-safety motivation is independent of MeTRAbs vs. MediaPipe.
+Frames are no longer downscaled before detection — `_resize_scale`/`_MAX_DIM`
+(aspect-preserving, longer edge capped at 960px, carried over unmodified
+from the MeTRAbs branch) were removed by explicit choice, after this
+branch was found to produce visibly less stable/accurate pose output than
+the project's own original, pre-MeTRAbs MediaPipe implementation (which
+ran at full native resolution, no downscaling at all — see
+wikis/Gesture-Worker.md). The reasoning that motivated downscaling in the
+first place — BlazePose's *landmark* model only ever sees a fixed 256x256
+crop per detected person regardless of source resolution — is still true,
+but doesn't account for the separate *person-detection* step that decides
+where that crop goes in the first place, which does see the frame at
+whatever resolution it's given; a lower-resolution input plausibly costs
+real precision there, which downscaling had been trading away for a
+memory-safety guarantee without ever being benchmarked against the
+alternative.
+
+Worth being direct about what removing it actually reintroduces:
+`core/preprocessing.py`'s `frames_for_window` holds up to 150
+full-resolution frames per window in one list, regardless of which model
+consumes them — at 1080p that's ~930MB, at 4K ~3.7GB, held raw before any
+inference starts. This is the exact memory profile that was directly
+confirmed (via `journalctl`/OOM-killer forensics) to have caused a real
+crash on the MeTRAbs branch, and downscaling was the fix. That risk is
+real again now, unmitigated — a live, accepted tradeoff made in exchange
+for accuracy, not a closed question, and worth revisiting if this branch
+sees a crash resembling that one.
 
 Coordinates come back from the landmarker already normalised to [0, 1]
-(not raw pixels, unlike MeTRAbs's output) — downscaling doesn't need any
-rescale-back step the way MeTRAbs's pixel-space output did; a normalised
-coordinate means the same thing regardless of what resolution produced it.
-Pixel-space `Landmark.x/y` (matching the rest of this file's existing
-convention — `_aggregate`'s velocity/displacement math expects pixels, not
-normalised fractions) are reconstructed by multiplying against the
-*original* meta.width/meta.height once, immediately after detection.
+(not raw pixels, unlike MeTRAbs's output) — this was already resolution
+-independent before, so removing the downscale step changes nothing about
+how coordinates are handled. Pixel-space `Landmark.x/y` (matching the rest
+of this file's existing convention — `_aggregate`'s velocity/displacement
+math expects pixels, not normalised fractions) are still reconstructed by
+multiplying against meta.width/meta.height, now always the frame's true
+original dimensions rather than a downscaled stand-in.
 
 ## Per-landmark confidence — a real improvement over MeTRAbs
 
@@ -211,10 +224,17 @@ _RIGHT_HIP = 24
 _TORSO_LANDMARKS = (11, 12, 23, 24)
 
 _MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
-_POSE_MODEL_PATH = _MODELS_DIR / "pose_landmarker_lite.task"
+# "full", not "lite" — matches the legacy pre-MeTRAbs MediaPipe branch's own
+# Holistic config (`model_complexity=1`, Solutions API's 0/1/2 = lite/full/
+# heavy tiering), which this branch had drifted away from onto Tasks API's
+# smallest tier with no accuracy comparison ever run against it. Switched
+# back deliberately after the "lite" choice was identified as a likely
+# cause of this branch producing visibly less stable/accurate pose output
+# than that legacy version — see wikis/Gesture-Worker.md.
+_POSE_MODEL_PATH = _MODELS_DIR / "pose_landmarker_full.task"
 _POSE_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
-    "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+    "pose_landmarker_full/float16/latest/pose_landmarker_full.task"
 )
 
 # How many people to look for at once — a practical cap (typical talk
@@ -235,11 +255,6 @@ _SCENE_CUT_THRESHOLD = 27.0
 # re-enters Searching instead (see module docstring's "Speaker
 # re-identification"). Starting value, not empirically tuned.
 _MAX_TRACK_JUMP = 0.3
-
-# Frames are downscaled (aspect-preserving) to at most this on the longer
-# edge before they're ever held or sent — see module docstring's "Frame
-# resolution" section.
-_MAX_DIM = 960
 
 # --- Speaker re-identification (gallery-based) — see module docstring ---
 # Model loading, crop extraction, and embedding math itself all live in
@@ -265,13 +280,6 @@ _GALLERY_MATCH_THRESHOLD = 0.85
 
 def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
-
-
-def _resize_scale(width: int, height: int, max_dim: int = _MAX_DIM) -> float:
-    """<=1.0 factor to shrink (width, height) so its longer edge is at most
-    max_dim; 1.0 (no-op) if it's already smaller."""
-    longest = max(width, height)
-    return min(1.0, max_dim / longest)
 
 
 def _ensure_model(path: Path, url: str, name: str) -> None:
@@ -314,7 +322,7 @@ class GestureWorker:
         from mediapipe.tasks import python as mp_python
         from mediapipe.tasks.python import vision
 
-        _ensure_model(_POSE_MODEL_PATH, _POSE_MODEL_URL, "pose_landmarker_lite")
+        _ensure_model(_POSE_MODEL_PATH, _POSE_MODEL_URL, "pose_landmarker_full")
 
         self._pose_landmarker = vision.PoseLandmarker.create_from_options(
             vision.PoseLandmarkerOptions(
@@ -450,17 +458,14 @@ class GestureWorker:
         ref_pos: Optional[tuple[float, float]] = None
         next_cut_idx = 0
 
-        # See module docstring's "Frame resolution" section.
-        scale = _resize_scale(meta.width, meta.height)
-        resized_wh = (round(meta.width * scale), round(meta.height * scale))
-
         for frame_idx in range(len(raw_frames)):
             ts, bgr = raw_frames[frame_idx]
             raw_frames[frame_idx] = None  # release this frame's raw buffer as
             # we go, rather than keeping the whole window's raw frames alive
             # for the entire loop — see module docstring's "Frame
-            # resolution" section for why this and downscaling matter
-            # together (carried over from the MeTRAbs branch).
+            # resolution" section: this alone doesn't bound peak memory the
+            # way downscaling used to, it's just not holding onto frames any
+            # longer than each one is actually needed for.
 
             # A cut landing anywhere at-or-before this frame's timestamp
             # invalidates whatever we were tracking — the next frame is a
@@ -471,8 +476,6 @@ class GestureWorker:
                 next_cut_idx += 1
 
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            if scale < 1.0:
-                rgb = cv2.resize(rgb, resized_wh, interpolation=cv2.INTER_AREA)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             timestamp_ms = int(round(ts * 1000))
 
@@ -678,17 +681,19 @@ class GestureWorker:
         frames: list[GestureFrame],
         width: int,
         height: int,
-        step: int = 2,
+        step: int = 3,
     ) -> list[PoseKeyframe]:
         """
         Return every `step`-th frame as a PoseKeyframe with normalised coords.
-        frames here is already pose_present (real detections only). step=2
-        (not 1) — carried over from the MeTRAbs branch's own finding that
-        full per-frame density visibly picked up per-frame jitter with no
-        temporal smoothing between displayed samples; VIDEO mode's own
-        internal tracking (see module docstring) may make step=1 viable
-        here even though it wasn't there, but that hasn't been tested, so
-        step=2 is kept as the known-good starting point.
+        frames here is already pose_present (real detections only). step=3
+        — carried over from the MeTRAbs branch's own finding that full
+        per-frame density (step=1) visibly picked up per-frame jitter with
+        no temporal smoothing between displayed samples; VIDEO mode's own
+        internal tracking (see module docstring) may make a smaller step
+        viable here even though it wasn't on that branch, but that hasn't
+        been tested. Bumped from step=2 to step=3 by explicit choice, not a
+        new finding — not re-benchmarked against 2, just carried forward
+        as the current known-good value.
         y is pre-flipped (stored as 1 − raw_y) so the JS viewer doesn't need
         to re-flip it.
         """

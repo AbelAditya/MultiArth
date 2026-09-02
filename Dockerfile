@@ -105,8 +105,8 @@ EOF
 # something deferred until later the way this project's other lazy-loaded
 # models are.
 RUN mkdir -p models && \
-    curl -sL -o models/pose_landmarker_lite.task \
-      https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task && \
+    curl -sL -o models/pose_landmarker_full.task \
+      https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task && \
     curl -sL -o models/osnet_x0_25_msmt17.pth \
       https://huggingface.co/kaiyangzhou/osnet/resolve/main/osnet_x0_25_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip_jitter.pth
 
