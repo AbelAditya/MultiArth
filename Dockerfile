@@ -33,10 +33,24 @@ FROM python:3.11-slim AS runtime
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 # System deps: ffmpeg for audio extraction, OpenCV runtime libs, curl to
-# fetch the MediaPipe models below (no unzip needed — .task files, not zips)
+# fetch the models below (no unzip needed — .task/.pth files, not zips).
+# libegl1/libgles2 specifically for MediaPipe: its native
+# tasks/c/libmediapipe.so dynamically links against libEGL.so.1 and
+# libGLESv2.so.2 unconditionally, even for CPU-only PoseLandmarker use —
+# confirmed directly via `ldd` against the real installed .so inside a
+# python:3.11-slim container matching this image, which failed to load at
+# all (ctypes.CDLL OSError) with just libgl1. This whole branch's
+# MediaPipe pipeline was only ever verified on the host machine's own
+# desktop Linux environment (which already has full GL/EGL libraries
+# installed), never inside an actual built-and-run container until this
+# gap surfaced — so this wasn't something the gallery-building feature
+# introduced, just the first thing that actually exercised
+# PoseLandmarker.create_from_options inside a real container.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libgl1 \
+    libegl1 \
+    libgles2 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
