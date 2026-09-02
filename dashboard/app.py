@@ -603,6 +603,49 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                         "backgroundColor": C["bg"],
                     },
                 ),
+                # ── Speaker gallery confirmation (Live Analysis) ────────
+                # Same flow as Bulk Upload's (core/gallery_builder.py,
+                # workers/gesture_worker.py's "Speaker re-identification"),
+                # just for exactly one video instead of a manifest — see
+                # handle_upload/handle_live_gallery_interaction below.
+                # Analysis itself doesn't start until this finishes.
+                dcc.Loading(type="dot", color=C["muted"], children=[
+                html.Div(id="live-gallery-build-panel", style={
+                    "display": "none", "marginBottom": "16px",
+                    "border": f"1px solid {C['border']}", "borderRadius": "8px",
+                    "padding": "14px", "backgroundColor": C["bg"],
+                }, children=[
+                    html.P("SPEAKER GALLERY", style=LABEL_STYLE),
+                    html.Div(id="live-gallery-build-status", style={
+                        "fontFamily": "DM Mono, monospace", "fontSize": "11px",
+                        "color": C["text"], "marginBottom": "10px",
+                    }),
+                    html.Img(id="live-gallery-build-frame", style={
+                        "maxWidth": "100%", "maxHeight": "320px", "display": "block",
+                        "borderRadius": "6px", "marginBottom": "10px",
+                        "border": f"1px solid {C['border']}",
+                    }),
+                    html.P(
+                        "Click whichever crop below is the speaker — or skip if "
+                        "they're not visible in this frame.",
+                        style={"fontFamily": "DM Mono, monospace", "fontSize": "10px",
+                               "color": C["muted"], "marginBottom": "8px"},
+                    ),
+                    html.Div(id="live-gallery-candidate-row", style={
+                        "display": "flex", "gap": "8px", "flexWrap": "wrap",
+                        "marginBottom": "12px",
+                    }),
+                    html.Div(style={"display": "flex", "gap": "10px"}, children=[
+                        dbc.Button("No speaker visible — skip", id="live-gallery-skip-btn",
+                                   size="sm", outline=True, color="secondary",
+                                   style={"fontFamily": "DM Mono, monospace", "fontSize": "11px"}),
+                        dbc.Button("I'm done — start analysis", id="live-gallery-done-btn",
+                                   size="sm", color="primary",
+                                   style={"fontFamily": "DM Mono, monospace", "fontSize": "11px"}),
+                    ]),
+                ]),
+                ]),  # end dcc.Loading
+
                 html.Div(id="analysis-status"),
             ]),
         ]),
@@ -1012,6 +1055,8 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
     dcc.Store(id="gallery-manifest-idx", data=None),
     dcc.Store(id="gallery-build-state", data=None),
     dcc.Store(id="gallery-candidates", data=None),
+    dcc.Store(id="live-gallery-build-state", data=None),
+    dcc.Store(id="live-gallery-candidates", data=None),
     dcc.Store(id="active-drive-url", data=None),
     dcc.Store(id="active-collection", data=None),
     dcc.Store(id="pose-segment", data=[]),
@@ -1160,13 +1205,20 @@ def _cleanup_previous_upload() -> None:
     Output("data-source", "data"),
     Output("active-drive-url", "data"),
     Output("active-collection", "data"),
+    Output("live-gallery-build-panel", "style"),
+    Output("live-gallery-build-status", "children"),
+    Output("live-gallery-build-frame", "src"),
+    Output("live-gallery-candidate-row", "children"),
+    Output("live-gallery-candidates", "data"),
+    Output("live-gallery-build-state", "data"),
     Input("video-upload", "contents"),
     State("video-upload", "filename"),
     prevent_initial_call=True,
 )
 def handle_upload(contents, filename):
+    no_change = (dash.no_update,) * 14
     if not contents:
-        return dash.no_update, True, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return no_change
 
     _cleanup_previous_upload()
 
@@ -1177,17 +1229,121 @@ def handle_upload(contents, filename):
         fh.write(base64.b64decode(b64))
 
     _VIDEO_PATH["path"] = video_path
-
-    job_id = str(_uuid_module.uuid4())[:8]
-    threading.Thread(
-        target=_orch.analyze,
-        args=(video_path,),
-        kwargs={"job_id": job_id},
-        daemon=True,
-    ).start()
-
     video_src = f"/video?t={os.path.getmtime(video_path)}"
-    return job_id, False, video_src, _analysis_progress("running", f"Analysing {filename}…"), True, "redis", None, None
+
+    # Analysis itself doesn't start yet — first the speaker gallery gets
+    # built interactively (see _setup_live_gallery /
+    # handle_live_gallery_interaction), mirroring Bulk Upload's
+    # front-loaded gallery phase for exactly one video. GestureWorker
+    # picks up whatever gallery ends up in Redis under this same job_id
+    # automatically — no orchestrator/worker changes needed for this.
+    setup = _setup_live_gallery(video_path)
+    job_id = setup["job_id"]
+
+    if setup["failed"]:
+        # Couldn't prepare a gallery at all (probe/scene-detect failure)
+        # — fall back to analyzing with no gallery, exactly like this
+        # upload path always worked before this feature existed.
+        # GestureWorker treats "no gallery for this job_id" as "use
+        # heuristics", automatically.
+        threading.Thread(
+            target=_orch.analyze, args=(video_path,),
+            kwargs={"job_id": job_id}, daemon=True,
+        ).start()
+        return (
+            job_id, False, video_src, _analysis_progress("running", f"Analysing {filename}…"),
+            True, "redis", None, None,
+            _gallery_panel_style(False), "", None, [], None, None,
+        )
+
+    state, frame_data = setup["state"], setup["frame_data"]
+    return (
+        job_id, True, video_src,
+        _analysis_progress("running", "Confirm the speaker before analysis starts…"),
+        True, "redis", None, None,
+        _gallery_panel_style(True), _live_gallery_status_text(state),
+        _frame_src(frame_data["frame_jpeg_b64"]), _render_candidate_row(frame_data["candidates"], "live-gallery-candidate-btn"),
+        _candidates_store_payload(frame_data), dataclasses.asdict(state),
+    )
+
+
+@callback(
+    Output("active-job-id", "data", allow_duplicate=True),
+    Output("poll-interval", "disabled", allow_duplicate=True),
+    Output("analysis-status", "children", allow_duplicate=True),
+    Output("live-gallery-build-panel", "style", allow_duplicate=True),
+    Output("live-gallery-build-status", "children", allow_duplicate=True),
+    Output("live-gallery-build-frame", "src", allow_duplicate=True),
+    Output("live-gallery-candidate-row", "children", allow_duplicate=True),
+    Output("live-gallery-candidates", "data", allow_duplicate=True),
+    Output("live-gallery-build-state", "data", allow_duplicate=True),
+    Input({"type": "live-gallery-candidate-btn", "index": ALL}, "n_clicks"),
+    Input("live-gallery-skip-btn", "n_clicks"),
+    Input("live-gallery-done-btn", "n_clicks"),
+    State("live-gallery-build-state", "data"),
+    State("live-gallery-candidates", "data"),
+    prevent_initial_call=True,
+)
+def handle_live_gallery_interaction(_candidate_clicks, _skip_clicks, _done_clicks,
+                                     state_data, candidates_data):
+    ctx = dash.callback_context
+    if not ctx.triggered_id or state_data is None:
+        return (dash.no_update,) * 9
+
+    triggered = ctx.triggered_id
+    state = GalleryBuildState(**state_data)
+    path = state.video_path
+
+    # "I'm done — start analysis" — manual override, independent of the
+    # plateau/cap algorithmic stop (see wikis/Gesture-Worker.md). A click
+    # with zero confirmations so far means an empty Redis gallery for this
+    # job_id — GestureWorker's own "no gallery -> heuristics" fallback
+    # handles that automatically, so this doubles as "skip the gallery
+    # entirely" with no separate button needed for that.
+    if triggered == "live-gallery-done-btn":
+        return _start_live_analysis(state)
+
+    landmarker, reid_model = _ensure_gallery_models()
+
+    # "No speaker visible — skip" — draws a fresh candidate without
+    # touching the gallery or the plateau streak at all.
+    if triggered == "live-gallery-skip-btn":
+        frame_data = _draw_until_nonempty(landmarker, reid_model, path, state, state.fps)
+        return (
+            dash.no_update, dash.no_update, dash.no_update,
+            _gallery_panel_style(True), _live_gallery_status_text(state),
+            _frame_src(frame_data["frame_jpeg_b64"]), _render_candidate_row(frame_data["candidates"], "live-gallery-candidate-btn"),
+            _candidates_store_payload(frame_data), dataclasses.asdict(state),
+        )
+
+    # A candidate thumbnail was clicked — triggered is the pattern-matched
+    # id dict {"type": "live-gallery-candidate-btn", "index": i}.
+    clicked_idx = triggered["index"]
+    candidates = (candidates_data or {}).get("candidates") or []
+    if clicked_idx >= len(candidates):
+        return (dash.no_update,) * 9
+    crop_b64 = candidates[clicked_idx]["crop_jpeg_b64"]
+    ts = candidates_data["ts"]
+
+    embedding = embed_candidate_from_b64(reid_model, crop_b64)
+    record_confirmation(store, state, embedding, ts, crop_b64)
+
+    stop_reason = should_stop(state)
+    if stop_reason:
+        state.stop_reason = stop_reason
+        logger.info(
+            f"[dashboard] Live gallery for job {state.job_id} stopped ({stop_reason}) "
+            f"with {state.entries_confirmed} entries"
+        )
+        return _start_live_analysis(state)
+
+    frame_data = _draw_until_nonempty(landmarker, reid_model, path, state, state.fps)
+    return (
+        dash.no_update, dash.no_update, dash.no_update,
+        _gallery_panel_style(True), _live_gallery_status_text(state),
+        _frame_src(frame_data["frame_jpeg_b64"]), _render_candidate_row(frame_data["candidates"], "live-gallery-candidate-btn"),
+        _candidates_store_payload(frame_data), dataclasses.asdict(state),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1268,13 +1424,19 @@ def _candidates_store_payload(frame_data: dict) -> dict:
     return {"ts": frame_data["ts"], "candidates": frame_data["candidates"]}
 
 
-def _render_candidate_row(candidates: list[dict]):
+def _render_candidate_row(candidates: list[dict], btn_type: str = "gallery-candidate-btn"):
+    """btn_type must match whichever callback's pattern-matched Input is
+    meant to receive these clicks — bulk's handle_gallery_interaction
+    listens for "gallery-candidate-btn", Live Analysis's
+    handle_live_gallery_interaction for "live-gallery-candidate-btn". Two
+    different flows, two different id types, so a click in one panel
+    can't accidentally fire the other's callback."""
     return [
         html.Button(
             html.Img(src=f"data:image/jpeg;base64,{c['crop_jpeg_b64']}", style={
                 "height": "140px", "borderRadius": "4px", "display": "block",
             }),
-            id={"type": "gallery-candidate-btn", "index": i},
+            id={"type": btn_type, "index": i},
             n_clicks=0,
             style={
                 "padding": "0", "border": f"2px solid {C['border']}",
@@ -1359,6 +1521,63 @@ def _gallery_status_text(setup: dict) -> str:
     return (
         f'Video {setup["idx"] + 1} of {n}: {setup["label"]} — '
         f'gallery: {state.entries_confirmed} confirmed · streak {state.streak}/{PLATEAU_STREAK}'
+    )
+
+
+# ── Speaker gallery confirmation (Live Analysis) ────────────────────────
+# Same underlying mechanics as the Bulk Upload flow above (this reuses
+# _draw_until_nonempty, _render_candidate_row, _frame_src,
+# _candidates_store_payload, _ensure_gallery_models, _gallery_panel_style,
+# and core/gallery_builder.py's init_state/next_candidate_timestamp/
+# record_confirmation/should_stop directly, unmodified) but for exactly
+# one video with no manifest/"next entry" concept — see
+# handle_upload/handle_live_gallery_interaction below. Kept as separate
+# functions rather than reusing _setup_gallery_for_entry/_advance_gallery,
+# since those are shaped around a list-of-manifest-entries abstraction
+# (collection, drive_url, "move to the next one") that doesn't apply here.
+
+def _live_gallery_status_text(state: GalleryBuildState) -> str:
+    return f'Gallery: {state.entries_confirmed} confirmed · streak {state.streak}/{PLATEAU_STREAK}'
+
+
+def _setup_live_gallery(video_path: str) -> dict:
+    """Prepares interactive gallery-building for a freshly-uploaded Live
+    Analysis video. Always returns a job_id (minted here, reused by the
+    actual analysis run once the gallery session ends — see
+    _start_live_analysis) — if scene-cut detection or probing itself
+    fails, `failed=True` and the caller falls back to analyzing with no
+    gallery at all (today's original behaviour, before this feature
+    existed), rather than getting stuck with nothing to show."""
+    job_id = str(_uuid_module.uuid4())[:8]
+    try:
+        meta = probe_video(video_path, audio_path="")
+        cuts = GestureWorker._detect_scene_cuts(video_path)
+    except Exception as exc:
+        logger.error(f"[dashboard] Live gallery: could not prepare {video_path}: {exc}")
+        return {"job_id": job_id, "failed": True}
+
+    state = init_state(job_id, video_path, cuts, meta.duration_s, meta.fps)
+    landmarker, reid_model = _ensure_gallery_models()
+    frame_data = _draw_until_nonempty(landmarker, reid_model, video_path, state, meta.fps)
+    return {"job_id": job_id, "failed": False, "state": state, "frame_data": frame_data}
+
+
+def _start_live_analysis(state: GalleryBuildState):
+    """Ends the gallery-confirmation phase and kicks off the real
+    analysis run under the same job_id the gallery was built with — see
+    handle_live_gallery_interaction, whose Output order this 9-tuple
+    matches exactly: (active-job-id, poll-interval.disabled,
+    analysis-status, live-gallery-build-panel.style,
+    live-gallery-build-status, live-gallery-build-frame.src,
+    live-gallery-candidate-row.children, live-gallery-candidates.data,
+    live-gallery-build-state.data)."""
+    threading.Thread(
+        target=_orch.analyze, args=(state.video_path,),
+        kwargs={"job_id": state.job_id}, daemon=True,
+    ).start()
+    return (
+        state.job_id, False, _analysis_progress("running", "Analysing…"),
+        _gallery_panel_style(False), "", None, [], None, None,
     )
 
 
@@ -2446,7 +2665,7 @@ def c_h_angle(data, ct, occ):
         hovertemplate="%{text}  |  %{customdata[0]}°<extra></extra>",
         showlegend=False,
     ))
-    fig.add_hline(y=30, line=dict(color=C["muted"], width=1, dash="dot"))
+    fig.add_hline(y=10, line=dict(color=C["muted"], width=1, dash="dot"))
     layout = {k: v for k, v in PLOT_LAYOUT.items() if k not in ("yaxis",)}
     fig.update_layout(**layout,
         title=dict(text="Horizontal Angle  (shoulder yaw)", font=dict(size=11, color=C["muted"])),
