@@ -62,25 +62,54 @@ lighter setup in every dimension, though — see "Honest tradeoffs vs. the
 main branch" below before assuming "lighter" means "better across the
 board."
 
-## VIDEO mode
+## IMAGE mode (was VIDEO)
 
-`PoseLandmarker` supports a `VIDEO` running mode
+`PoseLandmarker` runs in `IMAGE` mode (`detect(image)`, every call
+independent). It previously ran in `VIDEO` mode
 (`detect_for_video(image, timestamp_ms)`, timestamps strictly increasing
-across calls to the same landmarker instance) instead of `IMAGE` mode's
-independent-per-call detection. VIDEO mode lets MediaPipe track between
-consecutive frames rather than re-running full detection every time —
-faster, and reduces frame-to-frame jitter (the same underlying problem
+across calls to the same landmarker instance), which lets MediaPipe track
+between consecutive frames rather than re-detecting every time — faster,
+and it damps frame-to-frame jitter (the same underlying problem
 `_extract_keyframes`' `step=3` — see below — works around from the other
 direction).
 
-The landmarker is created **once per job** (`process_job`, not once per
-worker instance and not per-window) and closed in a `finally` block at the
-end of that same method — confirmed directly, not assumed, that this
-matters: MediaPipe's monotonic-timestamp requirement applies *within one
-landmarker instance's lifetime*, and each video has its own independent,
-0-based timeline, so one instance genuinely can't validly span two
-different videos, even though the *worker object* itself is reused across
-many videos in a bulk run (see "Bulk runs" below).
+That tracking turned out to be the *cause* of a worse failure. In VIDEO
+mode MediaPipe derives each frame's ROI from the **previous frame's
+landmarks**, re-running the detector only once tracking confidence
+collapses. On this project's footage — a small speaker on a wide, cluttered
+stage — one frame whose ROI over-covers the speaker plus background yields
+a skeleton with legs on the speaker and arms thrown onto background
+structure; the next ROI is then computed from *that* corrupted skeleton, so
+the error feeds itself and latches for a run of frames rather than
+self-correcting. The background needn't look remotely human: BlazePose's
+landmark model is a single-person regressor that always emits all 33
+landmarks over whatever region it is handed, with no part-association step
+that could decline to attach a limb.
+
+IMAGE mode derives every ROI from the image itself, so a bad frame stays
+one bad frame. Measured cost was nil (51.4 ms/frame IMAGE vs 53.6 VIDEO —
+the tracking shortcut was not buying much at `num_poses=5`), but it does
+give up VIDEO's inter-frame damping, and MediaPipe Tasks exposes no
+`smooth_landmarks` equivalent to compensate. If jitter becomes the
+dominant problem, an explicit landmark filter (One-Euro or similar) is the
+route forward, not a return to VIDEO mode.
+
+Switching also removed a real constraint: windows had to be processed in
+non-decreasing `start_s` order for the whole job, because
+`detect_for_video` raises `ValueError("Input timestamp must be
+monotonically increasing")` otherwise. `detect()` takes no timestamp and
+holds no cross-call state, so windows may now be reprocessed out of order,
+retried individually, or parallelised within a job.
+
+The landmarker is still created **once per job** (`process_job`, not once
+per worker instance and not per-window) and closed in a `finally` block at
+the end of that same method. Under VIDEO mode that per-job lifetime was
+*required* — the monotonic-timestamp requirement applies within one
+landmarker instance's lifetime, and each video has its own independent
+0-based timeline, so one instance could not validly span two videos. In
+IMAGE mode it is merely an optimisation (avoiding repeated model loads),
+kept because the worker object itself is reused across many videos in a
+bulk run (see "Bulk runs" below).
 
 ## Speaker selection
 

@@ -27,6 +27,37 @@ RUN uv sync --frozen --no-dev --no-install-project
 # deterministically rather than leaving the outcome to install order.
 RUN uv pip install --reinstall-package opencv-contrib-python "opencv-contrib-python==4.13.0.92"
 
+# ── Stage 1b: YOLO11n-seg ONNX export ────────────────────────────────────────
+# Builds models/yolo11n-seg.onnx for workers/_detector.py. This is a
+# separate stage, not extra steps in `builder`, for one specific reason:
+# it installs `ultralytics` (heavy — pulls torchvision, polars, matplotlib
+# — and AGPL-3.0), and the runtime stage copies /app/.venv from `builder`,
+# not from here. So ultralytics is present only while the export runs and
+# never reaches the shipped image; only the ~12MB .onnx it produces does.
+# Docker stages are independent snapshots, so installing into this stage's
+# copy of the venv cannot affect what `builder` hands to runtime.
+#
+# The model is exported rather than downloaded because Ultralytics
+# publishes only .pt weights (their HuggingFace .onnx path 404s), and
+# third-party pre-exported ONNX files were rejected on provenance grounds
+# — see scripts/export_yolo11n_seg.py.
+FROM builder AS model-export
+# `builder` never puts the venv on PATH (only the runtime stage does), so
+# a bare `python` here would be the system interpreter, which uv did not
+# install into.
+ENV PATH="/app/.venv/bin:$PATH"
+# ultralytics imports cv2 at package import time, and `builder` carries
+# only build-essential + curl — no OpenCV runtime libraries, since nothing
+# in that stage ever imported cv2 before. Without these the export fails
+# at `import ultralytics` with a libGL.so.1 ImportError. Confined to this
+# stage, so the runtime image is unaffected.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/export_yolo11n_seg.py ./scripts/
+RUN uv pip install ultralytics onnx onnxslim && \
+    python scripts/export_yolo11n_seg.py
+
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM python:3.11-slim AS runtime
 
@@ -109,6 +140,15 @@ RUN mkdir -p models && \
       https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task && \
     curl -sL -o models/osnet_x0_25_msmt17.pth \
       https://huggingface.co/kaiyangzhou/osnet/resolve/main/osnet_x0_25_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip_jitter.pth
+
+# The YOLO11n-seg person detector (workers/_detector.py), built in the
+# model-export stage above. Unlike the two models fetched by curl, this one
+# has no lazy-download fallback at runtime — ensure_detector_weights()
+# raises instead, deliberately, since there is no official .onnx URL to
+# fetch from. That makes this COPY load-bearing rather than an
+# optimisation: the dashboard's very first action on a new manifest is
+# gallery construction, which needs the detector immediately.
+COPY --from=model-export /app/models/yolo11n-seg.onnx models/yolo11n-seg.onnx
 
 # Copy application code
 COPY . .

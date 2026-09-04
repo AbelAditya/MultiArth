@@ -14,3 +14,10 @@ colocations.json
 rel_labels.json
 /tmp/
 colab/
+# Model weights are produced inside the image — curl'd (pose, OSNet) or
+# exported in the model-export stage (yolo11n-seg.onnx). Without this, the
+# final `COPY . .` would layer a developer's local models/ on top of those
+# and silently ship whatever happens to be on their disk instead of the
+# pinned versions the Dockerfile builds. Also keeps ~30MB of weights out
+# of the build context.
+models/

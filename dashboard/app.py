@@ -41,7 +41,7 @@ from core.bulk_orchestrator import BulkOrchestrator, _resolve_path, load_manifes
 from core.drive_download import download_drive_file
 from core.feature_store import FeatureStore
 from core.gallery_builder import (
-    PLATEAU_STREAK, GalleryBuildState, build_landmarker, draw_next_candidate,
+    PLATEAU_STREAK, GalleryBuildState, draw_next_candidate,
     embed_candidate_from_b64, init_state,
     record_confirmation, should_stop,
 )
@@ -49,6 +49,7 @@ from core.models import FusedWindow, HorizontalAngle, VerticalAngle
 from core.orchestrator import Orchestrator
 from core.preprocessing import probe_video
 from core.results_repository import ResultsRepository
+from workers._detector import load_detector
 from workers._reid import load_reid_model
 from workers.gesture_worker import GestureWorker
 
@@ -98,21 +99,23 @@ _BULK_STATE: dict = {"running": False, "last_event": None, "summary": None}
 
 # Speaker-gallery confirmation (Bulk Upload only — see
 # core/gallery_builder.py, workers/gesture_worker.py's "Speaker
-# re-identification"). The IMAGE-mode landmarker and OSNet model are each
+# re-identification"). The YOLO11n-seg detector and OSNet model are each
 # loaded once, lazily, and reused across every video's gallery-confirmation
 # in a session — safe as module-level state under gunicorn's single-worker
 # config (see Dockerfile), same assumption _BULK_STATE above already makes.
-_GALLERY_LANDMARKER = None
+# No pose model is loaded here: gallery building needs people and masks,
+# never landmarks (see core/gallery_builder.py's detect_candidates).
+_GALLERY_DETECTOR = None
 _GALLERY_REID_MODEL = None
 
 
 def _ensure_gallery_models():
-    global _GALLERY_LANDMARKER, _GALLERY_REID_MODEL
+    global _GALLERY_DETECTOR, _GALLERY_REID_MODEL
     if _GALLERY_REID_MODEL is None:
         _GALLERY_REID_MODEL = load_reid_model()
-    if _GALLERY_LANDMARKER is None:
-        _GALLERY_LANDMARKER = build_landmarker()
-    return _GALLERY_LANDMARKER, _GALLERY_REID_MODEL
+    if _GALLERY_DETECTOR is None:
+        _GALLERY_DETECTOR = load_detector()
+    return _GALLERY_DETECTOR, _GALLERY_REID_MODEL
 
 
 def _bulk_work_dir() -> str:
@@ -701,7 +704,7 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                 # dcc.Loading shows its spinner whenever a running callback
                 # targets an Output inside it — covers both the manifest
                 # -upload callback's now-real work (resolve/download,
-                # probe, scene-cut detection, load OSNet+landmarker, draw
+                # probe, scene-cut detection, load OSNet+detector, draw
                 # the first candidate — all synchronous, several seconds
                 # the first time) and each gallery click's own embed
                 # -and-draw-next-candidate work, neither of which had any
@@ -1302,12 +1305,12 @@ def handle_live_gallery_interaction(_candidate_clicks, _skip_clicks, _done_click
     if triggered == "live-gallery-done-btn":
         return _start_live_analysis(state)
 
-    landmarker, reid_model = _ensure_gallery_models()
+    detector, reid_model = _ensure_gallery_models()
 
     # "No speaker visible — skip" — draws a fresh candidate without
     # touching the gallery or the plateau streak at all.
     if triggered == "live-gallery-skip-btn":
-        frame_data = _draw_until_nonempty(landmarker, reid_model, state)
+        frame_data = _draw_until_nonempty(detector, reid_model, state)
         return (
             dash.no_update, dash.no_update, dash.no_update,
             _gallery_panel_style(True), _live_gallery_status_text(state),
@@ -1336,7 +1339,7 @@ def handle_live_gallery_interaction(_candidate_clicks, _skip_clicks, _done_click
         )
         return _start_live_analysis(state)
 
-    frame_data = _draw_until_nonempty(landmarker, reid_model, state)
+    frame_data = _draw_until_nonempty(detector, reid_model, state)
     return (
         dash.no_update, dash.no_update, dash.no_update,
         _gallery_panel_style(True), _live_gallery_status_text(state),
@@ -1446,7 +1449,7 @@ def _render_candidate_row(candidates: list[dict], btn_type: str = "gallery-candi
     ]
 
 
-def _draw_until_nonempty(landmarker, reid_model, state: GalleryBuildState) -> dict:
+def _draw_until_nonempty(detector, reid_model, state: GalleryBuildState) -> dict:
     """Keeps advancing to successive *schedule slots* (see
     core/gallery_builder.py's draw_next_candidate — each call there
     already retries several different timestamps within one slot before
@@ -1455,7 +1458,7 @@ def _draw_until_nonempty(landmarker, reid_model, state: GalleryBuildState) -> di
     state already carries video_path/fps, so nothing else needs passing."""
     result = {"frame_jpeg_b64": None, "candidates": [], "ts": 0.0}
     for _ in range(_GALLERY_DRAW_RETRIES):
-        result = draw_next_candidate(reid_model, landmarker, state)
+        result = draw_next_candidate(reid_model, detector, state)
         if result["candidates"]:
             return result
     return result
@@ -1508,8 +1511,8 @@ def _setup_gallery_for_entry(entries: list[dict], idx: int) -> Optional[dict]:
     entry["job_id"] = job_id
     state = init_state(job_id, path, cuts, meta.duration_s, meta.fps)
 
-    landmarker, reid_model = _ensure_gallery_models()
-    frame_data = _draw_until_nonempty(landmarker, reid_model, state)
+    detector, reid_model = _ensure_gallery_models()
+    frame_data = _draw_until_nonempty(detector, reid_model, state)
 
     label = entry.get("label") or os.path.basename(path)
     return {"entries": entries, "idx": idx, "state": state, "frame_data": frame_data, "label": label}
@@ -1557,8 +1560,8 @@ def _setup_live_gallery(video_path: str) -> dict:
         return {"job_id": job_id, "failed": True}
 
     state = init_state(job_id, video_path, cuts, meta.duration_s, meta.fps)
-    landmarker, reid_model = _ensure_gallery_models()
-    frame_data = _draw_until_nonempty(landmarker, reid_model, state)
+    detector, reid_model = _ensure_gallery_models()
+    frame_data = _draw_until_nonempty(detector, reid_model, state)
     return {"job_id": job_id, "failed": False, "state": state, "frame_data": frame_data}
 
 
@@ -1701,12 +1704,12 @@ def handle_gallery_interaction(_candidate_clicks, _skip_clicks, _done_clicks,
         return result
 
     state = GalleryBuildState(**state_data)
-    landmarker, reid_model = _ensure_gallery_models()
+    detector, reid_model = _ensure_gallery_models()
 
     # "No speaker visible — skip" — draws a fresh candidate for the same
     # video without touching the gallery or the plateau streak at all.
     if triggered == "gallery-skip-btn":
-        frame_data = _draw_until_nonempty(landmarker, reid_model, state)
+        frame_data = _draw_until_nonempty(detector, reid_model, state)
         setup = {"entries": entries, "idx": idx, "state": state, "frame_data": frame_data,
                  "label": entries[idx].get("label") or os.path.basename(path)}
         return (
@@ -1740,7 +1743,7 @@ def handle_gallery_interaction(_candidate_clicks, _skip_clicks, _done_clicks,
         )
         return _advance_gallery(entries, idx + 1)
 
-    frame_data = _draw_until_nonempty(landmarker, reid_model, state)
+    frame_data = _draw_until_nonempty(detector, reid_model, state)
     setup = {"entries": entries, "idx": idx, "state": state, "frame_data": frame_data,
              "label": entries[idx].get("label") or os.path.basename(path)}
     return (

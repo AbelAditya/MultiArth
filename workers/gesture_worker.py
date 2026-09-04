@@ -1,7 +1,8 @@
 """
 workers/gesture_worker.py
 --------------------------
-MediaPipe worker — multi-person pose estimation with speaker selection.
+Gesture worker — YOLO11n-seg person detection feeding single-person
+MediaPipe pose estimation, with speaker selection in between.
 This branch (`light-gesture`) deliberately replaces the MeTRAbs setup used
 on the main branch entirely: no TensorFlow, no local GPU concerns, no
 remote-Colab-offload complexity — MediaPipe's models are small (a few MB
@@ -11,19 +12,67 @@ wikis/Gesture-Worker.md for the fuller "why this branch exists" story.
 
 For each time window it:
   1. Reads frames from the video for that window
-  2. Runs MediaPipe Tasks' PoseLandmarker (multi-person, 33-keypoint
-     BlazePose topology) on every frame, in VIDEO running mode (see "VIDEO
-     mode" below)
-  3. Selects which detected person is "the subject": most-central-to-frame
-     at the first frame of a window/since the last scene cut (voted once),
-     then nearest-to-last-known-position for the rest — same selection
-     design MeTRAbs used, ported over almost unchanged (see "Speaker
-     selection" below for what did/didn't carry over).
-  4. Computes kinematic features (velocity, amplitude, symmetry, etc.) from
+  2. Runs the YOLO11n-seg person detector (workers/_detector.py) on every
+     frame, getting a box + segmentation mask per person
+  3. Selects which detection is "the subject": by gallery re-identification
+     if the job has a speaker gallery, otherwise by the heuristics
+     (most-central-to-frame, voted once per window/scene-cut, then
+     nearest-to-last-known-position) ported from the MeTRAbs branch
+  4. Runs MediaPipe Tasks' PoseLandmarker (single-person, 33-keypoint
+     BlazePose topology, IMAGE running mode) on **only that one
+     detection's crop**, and maps the landmarks back into frame
+     coordinates
+  5. Computes kinematic features (velocity, amplitude, symmetry, etc.) from
      only the selected person's landmarks — everyone else detected in a
      frame is discarded before a GestureFrame is ever built, so nothing
      downstream (FusionEngine, the dashboard) needs to know multiple people
      were ever in frame.
+
+## Detector-first pipeline
+
+Steps 2-4 above used to be a single call: multi-person PoseLandmarker on
+the whole frame, then pick one of the poses it returned. Detection is now
+a separate, earlier stage, and pose runs afterwards on one crop.
+
+The reason is that MediaPipe's *detector* (BlazePose) was the weak link,
+not its landmark model. It is trained overwhelmingly on close-range,
+single-dominant-person imagery, and this project's footage is the
+opposite: a small speaker on a wide stage with a seated audience. Two
+concrete failures followed. First, `num_poses` was a hard cap on
+candidates, so when the audience filled those slots the speaker was absent
+from the results entirely and *no* downstream selection — heuristic or
+gallery — could recover them. Second, an over-large ROI produced skeletons
+fitted across the speaker plus background structure. See
+workers/_detector.py's module docstring for the fuller diagnosis.
+
+Consequences worth knowing:
+
+  - Selection now runs on detector output (boxes and masks), before any
+    pose inference. `_box_center` replaces the old `_torso_center`, since
+    there are no landmarks yet at selection time.
+  - Pose runs **once per frame**, not once per candidate. Note this was
+    not a speed win: measured, `num_poses=5` and `num_poses=1` cost the
+    same on single-speaker footage, because MediaPipe only runs the
+    landmark model for people it actually finds. The saving comes from the
+    crop being smaller than the frame (~29ms vs ~70ms), and it does not
+    offset the detector's own ~120ms — the pipeline is roughly 2x slower
+    than before, accepted deliberately in exchange for the accuracy.
+  - Segmentation masks come from the detector, so the pose model no longer
+    computes them. This also removed a real inconsistency: gallery
+    exemplars were always built from the dashboard's own detections, so
+    embedding runtime candidates from MediaPipe-derived masks meant the
+    two sides of every cosine comparison had been cropped by different
+    models.
+  - A detection whose crop MediaPipe declines to fit a pose to yields an
+    empty frame, not a guess. This is not rare for physically small
+    subjects: measured across 152 detections on real footage, MediaPipe
+    found a pose for only ~15/25 of the smallest ones (<15k mask pixels).
+    Neither expanding the crop box nor upscaling it fixed this (both
+    tested across margins 1.0-1.4 and minimum sides 192-384; differences
+    were within noise, and expansion was slightly *worse* while adding
+    back the background the detector exists to exclude). So the crop is
+    tight and unscaled, and the remaining gap is a genuine limitation of
+    BlazePose on small subjects rather than something tuning fixes.
 
 `GestureFrame.left_hand`/`right_hand` are always empty here — MediaPipe's
 HandLandmarker was tried, wired up, and then deliberately removed again:
@@ -34,36 +83,77 @@ doubling per-frame time) for no payoff. The fields are kept on
 (same reason they were always empty on the MeTRAbs branch too), not
 because something still populates them.
 
-## VIDEO mode
+## IMAGE mode
 
-MediaPipe Tasks' `PoseLandmarker` supports a `VIDEO` running mode
+This worker runs `PoseLandmarker` in `IMAGE` mode (`detect(image)`, each
+call fully independent), having previously used `VIDEO` mode
 (`detect_for_video(image, timestamp_ms)`, strictly increasing timestamps
-across calls to the same landmarker instance) instead of `IMAGE` mode's
-independent-per-call detection — VIDEO mode lets MediaPipe use its own
-internal tracking between consecutive frames rather than re-running full
-detection from scratch every frame, which is both faster and reduces
-frame-to-frame jitter (a real, measured problem for the per-frame-
-independent alternative — see wikis/Gesture-Worker.md's MeTRAbs-era
-history of `_extract_keyframes`' step=1 vs step=2 for the same underlying
-issue on that branch). The landmarker is created once per job
-(`process_job`, not per-window) specifically so its internal timestamp
-counter and tracking state span the whole video coherently, and is closed
-in a `finally` block at the end of that same method.
+across calls to the same landmarker instance).
+
+VIDEO mode's appeal was that MediaPipe tracks between consecutive frames
+rather than re-detecting from scratch, which is faster and damps
+frame-to-frame jitter (a real, measured problem for per-frame-independent
+detection — see wikis/Gesture-Worker.md's MeTRAbs-era history of
+`_extract_keyframes`' step=1 vs step=2 for the same underlying issue on
+that branch).
+
+It was dropped because that tracking is exactly what makes a bad fit
+*stick*. In VIDEO mode MediaPipe derives each frame's ROI from the
+*previous frame's landmarks*, re-running the detector only once tracking
+confidence collapses. On this project's footage (a small speaker on a wide
+stage, cluttered background) a single frame whose ROI over-covers the
+speaker plus background produces a skeleton with, typically, legs on the
+real speaker and arms thrown onto background structure — and because the
+next ROI is computed from *that* corrupted skeleton, the ROI genuinely
+does now cover the background, so the error feeds itself and latches for a
+run of frames instead of self-correcting. Note the background needn't look
+remotely human for this: it only has to fall inside the ROI, since
+BlazePose's landmark model is a single-person regressor that always emits
+all 33 landmarks over whatever region it's given (there is no part-
+association step that could decline to attach an arm).
+
+IMAGE mode derives every ROI from the image itself, so a bad frame stays
+one bad frame. The accepted costs are real and go the other way: it is
+slower (full detection every frame, no tracking shortcut) and gives up
+VIDEO mode's inter-frame damping, so per-frame jitter is expected to rise
+— and MediaPipe Tasks exposes no `smooth_landmarks`-equivalent option to
+compensate (confirmed directly against `PoseLandmarkerOptions`' own
+fields; the legacy Solutions API's explicit `smooth_landmarks=True` has no
+counterpart here). If jitter proves worse than the latching it fixes, an
+explicit landmark filter (One-Euro or similar) is the route back, not a
+return to VIDEO mode.
+
+`min_tracking_confidence` is inert in IMAGE mode (there is no tracking
+state for it to gate) — left at its default rather than removed, so
+flipping `running_mode` back for a comparison needs no other edit.
+
+The landmarker is still created once per job (`process_job`, not
+per-window) and closed in a `finally` block there. That per-job lifetime
+was originally required — VIDEO mode's internal timestamp counter had to
+span the video coherently — and is now merely an optimisation, since an
+IMAGE-mode landmarker is stateless across calls. Kept as-is because
+re-creating it per window would pay model-load cost for nothing.
 
 ## Speaker selection
 
-Ported from the MeTRAbs branch with one real difference: MeTRAbs's
-detector gave an explicit per-person bounding box; PoseLandmarker doesn't
-expose one at all (confirmed directly against the installed library — a
-`PoseLandmarkerResult` has `pose_landmarks`, `pose_world_landmarks`, and
-`segmentation_masks`, nothing box-shaped). A raw min/max bounding box over
-all 33 landmarks was considered and rejected — BlazePose, like MeTRAbs,
-always estimates a plausible position for every landmark even when
-occluded or off-screen (e.g. ankles in a close-up shot), and those wildly
-extrapolated points would skew a bbox center away from where the visible
-person actually is. Centering instead on the mean of just the shoulder and
-hip landmarks (indices 11, 12, 23, 24 — BlazePose's own stable torso
-anchors) is a closer analogue to what MeTRAbs's detector box represented.
+Selection is by detection-box centre (`_box_center`), which closes a gap
+that existed for the whole MediaPipe era of this branch. MeTRAbs's
+detector gave an explicit per-person bounding box; PoseLandmarker exposes
+none at all (confirmed directly — a `PoseLandmarkerResult` has
+`pose_landmarks`, `pose_world_landmarks` and `segmentation_masks`, nothing
+box-shaped), so this worker approximated one from landmarks. A raw min/max
+box over all 33 landmarks was rejected, because BlazePose always estimates
+a plausible position for every landmark even when occluded or off-screen
+(e.g. ankles in a close-up), and those extrapolated points skew a box
+centre away from the visible person; the mean of the shoulder/hip
+landmarks was used instead as a stabler proxy.
+
+The detector now supplies a real box directly, so neither workaround is
+needed — and a detector box has no extrapolation failure mode at all. One
+practical caveat: a box centre sits at the body's midpoint, whereas the
+torso-mean sat higher, at shoulder/hip level. `_MAX_TRACK_JUMP` is
+measured against that quantity and was tuned for the old one, so it is on
+the retune list.
 
 Everything downstream of "which person is the subject" — vote-once at a
 window/scene-cut boundary, nearest-to-`ref_pos` tracking otherwise, the
@@ -79,8 +169,12 @@ heuristics above are not used *at all*, not even as a fallback. Instead
 this worker runs one of two states per frame:
 
   - **Locked** — `ref_pos` is set, from an earlier confirmed gallery match.
-    Continuation is cheap: nearest-to-`ref_pos` among this frame's
-    detected candidates, identical to the heuristic path's tracking.
+    The nearest candidate to `ref_pos` is proposed, then **verified against
+    the gallery before being accepted** (`_score_candidate`, one embedding
+    rather than the whole frame's worth). Proximity is a cheap prior here,
+    never the authority; failing verification drops the lock and falls
+    through to a full Searching match on the same frame. See "Lock
+    verification" below for why.
   - **Searching** — no current lock (a window just started, a scene cut
     just happened, or `_MAX_TRACK_JUMP` was exceeded — all three trigger
     the same recovery here, never a centrality vote). Every detected
@@ -98,6 +192,44 @@ embedding cost on every one of them until a real match resumes. Once
 locked, cost drops back to the cheap steady state. Deliberate tradeoff —
 an empty frame is a better answer than a confidently wrong guess.
 
+## Lock verification
+
+The Locked state used to accept the nearest candidate to `ref_pos` on
+proximity alone, consulting the gallery only when the jump exceeded
+`_MAX_TRACK_JUMP`. That was a real hole, and it produced a confirmed bug
+on TED-style footage with a person visible on a projection screen behind
+the speaker:
+
+  1. The lock is legitimately earned — the real speaker matches the
+     gallery, `ref_pos` is set to her.
+  2. She is briefly not detected (measured at 23% of frames in one scene,
+     where she is small and scores 0.25-0.43 with the detector).
+  3. The on-screen person is the only remaining candidate. It sits just
+     inside `_MAX_TRACK_JUMP` of her last position, so it is adopted
+     **without any identity check**, inheriting a lock it never earned.
+  4. It is a *static projection*, so it never moves again. The jump guard
+     never re-fires, the gallery is never re-consulted, and it holds the
+     track for the rest of the scene. Measured: 204 of 222 frames.
+
+Note the gallery was never fooled — that impostor scores 0.45-0.53 against
+a speaker gallery and is rejected every time it is actually asked. It
+simply stopped being asked. The failure was structural, not a threshold
+being too loose, which is why tightening `_MAX_TRACK_JUMP` is not a fix:
+at 0.25 this specific impostor happens to fall 0.012 outside the guard and
+is caught, but nothing about that generalises to the next video.
+
+The flaw predates the YOLO detector and was latent for the whole MediaPipe
+era of this branch: the old multi-person PoseLandmarker found *zero*
+candidates in that scene (confirmed — 0 across 8 sampled frames, versus 14
+for the detector), so there was never an impostor to hijack the track. A
+better detector did not introduce the bug, it supplied the conditions that
+expose it.
+
+So Locked now verifies the candidate it proposes. Cost is one OSNet
+embedding per Locked frame (~5ms against a ~150ms frame budget), and
+crucially the check no longer depends on motion — a stationary impostor is
+rejected just as readily as a moving one.
+
 `_GALLERY_MATCH_THRESHOLD` currently reuses the same 0.85 value chosen for
 gallery-*building*'s own redundancy check (`gamma`, see the dashboard's
 gallery-confirmation flow) — measured against real same-speaker/
@@ -110,9 +242,9 @@ footage exists to calibrate it independently, same as `_GALLERY_MATCH_TOP_K`.
 
 OSNet (`workers/_osnet.py`, vendored, MIT licensed — see that file's own
 docstring) is loaded lazily, once per `GestureWorker` instance (not
-per-job like the pose landmarker) — unlike `PoseLandmarker`'s VIDEO-mode
-timestamp coupling, it's stateless and has no reason to be reloaded, so it
-stays warm across an entire bulk batch once any job in it needs a gallery.
+per-job like the pose landmarker) — it's stateless and has no reason to be
+reloaded, so it stays warm across an entire bulk batch once any job in it
+needs a gallery.
 It's never loaded at all for a job with no gallery — the heuristic-only
 path pays zero cost for this feature, same reasoning as HandLandmarker's
 removal above: no cost for capability that job isn't using.
@@ -188,7 +320,7 @@ from __future__ import annotations
 import math
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import cv2
 import numpy as np
@@ -198,7 +330,7 @@ from scenedetect import ContentDetector, SceneManager, open_video
 from core.feature_store import FeatureStore
 from core.models import GalleryEntry, GestureFeatures, GestureFrame, Landmark, PoseKeyframe, TimeWindow
 from core.preprocessing import VideoMeta, frames_for_window
-from workers import _reid
+from workers import _detector, _reid
 
 # MediaPipe's BlazePose 33-point topology — standard, documented ordering
 # (https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker):
@@ -218,11 +350,6 @@ _LEFT_WRIST = 15
 _RIGHT_WRIST = 16
 _LEFT_HIP = 23
 _RIGHT_HIP = 24
-# Stable torso anchors used for the speaker-selection centrality/tracking
-# math in place of a detector box PoseLandmarker doesn't provide — see
-# module docstring's "Speaker selection".
-_TORSO_LANDMARKS = (11, 12, 23, 24)
-
 _MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 # "full", not "lite" — matches the legacy pre-MeTRAbs MediaPipe branch's own
 # Holistic config (`model_complexity=1`, Solutions API's 0/1/2 = lite/full/
@@ -236,11 +363,6 @@ _POSE_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
     "pose_landmarker_full/float16/latest/pose_landmarker_full.task"
 )
-
-# How many people to look for at once — a practical cap (typical talk
-# footage: the speaker plus a handful of visible audience members), not an
-# attempt at exhaustive detection. Not empirically tuned.
-_NUM_POSES = 5
 
 _FRAME_CENTER = (0.5, 0.5)
 
@@ -278,6 +400,94 @@ _GALLERY_MATCH_TOP_K = 3
 _GALLERY_MATCH_THRESHOLD = 0.85
 
 
+class _MappedLandmark(NamedTuple):
+    """A landmark whose x/y have been mapped out of crop space into
+    frame-normalised coordinates by _crop_norm_to_frame_norm. Structurally
+    compatible with MediaPipe's own landmark type for _build_frame's
+    purposes (.x/.y/.z/.visibility), but a distinct type so it's obvious at
+    a glance which coordinate frame a given object is in."""
+    x: float
+    y: float
+    z: float
+    visibility: float
+
+
+def _box_center(
+    box: tuple[int, int, int, int], frame_w: int, frame_h: int,
+) -> tuple[float, float]:
+    """Frame-normalised centre of a detection box — the subject-tracking
+    position that `_torso_center` used to supply from pose landmarks.
+
+    Switching to a box centre is what lets pose inference be deferred until
+    after selection (there are no landmarks yet at that point), and it is
+    arguably the better signal anyway: the old torso-mean was a deliberate
+    workaround for BlazePose extrapolating occluded landmarks to implausible
+    positions, and a detector box has no such failure mode. It does shift
+    the quantity `_MAX_TRACK_JUMP` is measured against — a box centre sits
+    at the body's midpoint where the torso-mean sat higher, at
+    shoulder/hip level — so that threshold is on the retune list."""
+    x0, y0, x1, y1 = box
+    return ((x0 + x1) / 2 / frame_w, (y0 + y1) / 2 / frame_h)
+
+
+def _letterbox_crop(
+    rgb: np.ndarray, box: tuple[int, int, int, int],
+) -> tuple[np.ndarray, int, int, int]:
+    """
+    Cuts `box` out of the frame and pads it into a square canvas, without
+    rescaling. Returns (square, side, off_x, off_y) — the three values
+    _crop_norm_to_frame_norm needs to invert this.
+
+    Square, padded, and *not* stretched, for three separate reasons:
+      - MediaPipe's landmark-projection step assumes a square ROI when it
+        isn't handed IMAGE_DIMENSIONS (the "Using NORM_RECT without
+        IMAGE_DIMENSIONS" warning it logs); a square input makes that
+        assumption true rather than approximately true.
+      - Stretching a person changes their apparent proportions, which is
+        off-distribution for a model trained on real photographs.
+      - `pose_world_landmarks` — the basis for every angle in
+        core/fusion_engine.py — is estimated from apparent geometry, so
+        anisotropic scaling would bias yaw/pitch systematically rather
+        than just adding noise.
+
+    No resize happens here: the square is max(box_w, box_h) at native
+    resolution, so a small distant speaker stays exactly as many pixels as
+    the frame gave us. MediaPipe rescales to its own input internally.
+    """
+    x0, y0, x1, y1 = box
+    crop = rgb[y0:y1, x0:x1]
+    bh, bw = crop.shape[:2]
+    side = max(bw, bh)
+    square = np.zeros((side, side, 3), dtype=rgb.dtype)
+    off_x, off_y = (side - bw) // 2, (side - bh) // 2
+    square[off_y:off_y + bh, off_x:off_x + bw] = crop
+    return np.ascontiguousarray(square), side, off_x, off_y
+
+
+def _crop_norm_to_frame_norm(
+    nx: float, ny: float,
+    box: tuple[int, int, int, int], side: int, off_x: int, off_y: int,
+    frame_w: int, frame_h: int,
+) -> tuple[float, float]:
+    """
+    Inverts _letterbox_crop for one landmark: crop-normalised (nx, ny) ->
+    frame-normalised. Kept as a pure function, separate from the frame
+    loop, precisely because this is the class of arithmetic that fails
+    *silently* — an off-by-one or a forgotten padding offset yields
+    landmarks that are wrong but entirely plausible-looking, with nothing
+    raised anywhere. See tests/test_gesture_crop_mapping.py.
+
+    Coordinates are deliberately not clamped to [0, 1]: MediaPipe
+    legitimately extrapolates landmarks outside its input (a speaker whose
+    legs are below the crop), and clamping would silently fold those onto
+    the border as if they had been observed there. `visibility` is what
+    downstream code uses to judge them.
+    """
+    px = box[0] + nx * side - off_x
+    py = box[1] + ny * side - off_y
+    return px / frame_w, py / frame_h
+
+
 def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
 
@@ -295,6 +505,7 @@ class GestureWorker:
         self.store = store
         self._pose_landmarker = None  # per-job, see process_job
         self._reid_model = None  # per-worker-instance, lazy — see _ensure_reid_model
+        self._detector = None    # per-worker-instance, lazy — see _ensure_detector
 
     def close(self) -> None:
         # Primary cleanup is process_job's own try/finally — this only
@@ -310,14 +521,22 @@ class GestureWorker:
             self._pose_landmarker.close()
             self._pose_landmarker = None
 
-    def _open_landmarker(self, use_segmentation: bool = False) -> None:
-        """Creates a fresh PoseLandmarker instance for this job — see
-        module docstring's "VIDEO mode" for why per-job, not
-        per-worker-instance or per-window. use_segmentation enables
-        per-person segmentation masks, needed only for gallery-matching's
-        crops (see "Speaker re-identification") — off by default so a
-        job with no gallery pays nothing extra for a capability it isn't
-        using."""
+    def _open_landmarker(self) -> None:
+        """Creates a fresh single-person PoseLandmarker for this job — see
+        module docstring's "IMAGE mode" for why per-job, not
+        per-worker-instance or per-window.
+
+        `num_poses=1` is fixed, not a tunable: this landmarker is only ever
+        run on an already-isolated single-person crop produced by the
+        detector (see "Detector-first pipeline"), so there is never more
+        than one person in its input to find. It is also MediaPipe's own
+        default for `PoseLandmarkerOptions`.
+
+        Segmentation masks are off unconditionally. They used to be
+        enabled for gallery-matching crops, but masks now come from the
+        detector, which produces them for every candidate in one pass
+        rather than requiring a pose inference per person just to reach
+        the mask riding alongside it."""
         import mediapipe as mp
         from mediapipe.tasks import python as mp_python
         from mediapipe.tasks.python import vision
@@ -327,17 +546,16 @@ class GestureWorker:
         self._pose_landmarker = vision.PoseLandmarker.create_from_options(
             vision.PoseLandmarkerOptions(
                 base_options=mp_python.BaseOptions(model_asset_path=str(_POSE_MODEL_PATH)),
-                running_mode=vision.RunningMode.VIDEO,
-                num_poses=_NUM_POSES,
-                output_segmentation_masks=use_segmentation,
+                running_mode=vision.RunningMode.IMAGE,
+                num_poses=1,
+                output_segmentation_masks=False,
             )
         )
         self._mp = mp  # stashed for mp.Image/mp.ImageFormat use in the per-frame loop
 
     def _ensure_reid_model(self) -> None:
-        """Lazily loads OSNet once per *worker instance*, not per-job —
-        unlike PoseLandmarker it's stateless (no VIDEO-mode timestamp
-        coupling), so it stays warm across an entire bulk batch the same
+        """Lazily loads OSNet once per *worker instance*, not per-job — it
+        stays warm across an entire bulk batch the same
         way BulkOrchestrator already keeps one GestureWorker warm across
         every video. Never called at all for a job with no gallery. See
         workers/_reid.py for the actual loading logic, shared with the
@@ -345,6 +563,18 @@ class GestureWorker:
         if self._reid_model is not None:
             return
         self._reid_model = _reid.load_reid_model()
+
+    def _ensure_detector(self) -> None:
+        """Lazily loads the YOLO11n-seg person detector, per *worker
+        instance* — same lifetime as _ensure_reid_model and for the same
+        reason: it's stateless across calls, so there is nothing per-job
+        to reset, and reloading it per video in a bulk run would pay the
+        session-init cost repeatedly for no benefit. Unlike OSNet this is
+        loaded for every job, gallery or not, since the detector is what
+        finds people at all."""
+        if self._detector is not None:
+            return
+        self._detector = _detector.load_detector()
 
     def process_job(
         self,
@@ -369,7 +599,9 @@ class GestureWorker:
                 "gallery — using gallery-based re-identification, heuristics disabled"
             )
 
-        self._open_landmarker(use_segmentation=gallery is not None)
+        self._open_landmarker()
+        self._ensure_detector()   # unconditional: the detector is now what
+        # finds people at all, for gallery and heuristic jobs alike.
         if gallery is not None:
             self._ensure_reid_model()
         try:
@@ -417,17 +649,18 @@ class GestureWorker:
         gallery: Optional[np.ndarray],
     ) -> GestureFeatures:
         """
-        Windows must be processed in non-decreasing start_s order across
-        the whole job — confirmed directly (not assumed): VIDEO mode's
-        detect_for_video raises ValueError("Input timestamp must be
-        monotonically increasing") if fed an earlier timestamp than a
-        previous call on the same landmarker instance. process_job's own
-        loop over `windows` already guarantees this (core/preprocessing.py's
-        compute_windows builds them in chronological order), so this isn't
-        a constraint callers need to actively manage today — worth knowing
-        if that ever changes (e.g. parallelizing windows within a job, or
-        reprocessing/retrying an earlier window after a later one already
-        ran).
+        Window ordering is unconstrained as of the switch to IMAGE mode.
+        Under VIDEO mode windows had to be processed in non-decreasing
+        start_s order across the whole job — detect_for_video raises
+        ValueError("Input timestamp must be monotonically increasing") if
+        fed an earlier timestamp than a previous call on the same
+        landmarker instance (confirmed directly, not assumed). IMAGE mode's
+        detect() takes no timestamp and holds no cross-call state, so that
+        constraint is simply gone: windows could now be reprocessed out of
+        order, retried individually, or parallelised within a job without
+        touching the landmarker. process_job still feeds them
+        chronologically (core/preprocessing.py's compute_windows builds
+        them that way); nothing depends on it here any more.
 
         gallery is None for a job with no speaker gallery (the heuristic
         -only path); otherwise an (N, 512) array of L2-normalised
@@ -445,7 +678,6 @@ class GestureWorker:
         window_cuts: list[float],
         gallery: Optional[np.ndarray],
     ) -> list[GestureFrame]:
-        mp = self._mp
         gesture_frames: list[GestureFrame] = []
         # None means "no current lock" — for a heuristic-only job (gallery
         # is None) that means the next frame runs a fresh centrality vote;
@@ -476,25 +708,26 @@ class GestureWorker:
                 next_cut_idx += 1
 
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            timestamp_ms = int(round(ts * 1000))
 
-            pose_result = self._pose_landmarker.detect_for_video(mp_image, timestamp_ms)
-            people = pose_result.pose_landmarks
-            people_world = pose_result.pose_world_landmarks
-            masks = pose_result.segmentation_masks if gallery is not None else None
+            # Detection first, pose second — see module docstring's
+            # "Detector-first pipeline". Nothing here runs a pose model
+            # yet: selecting the subject needs positions and (for a
+            # gallery job) mask crops, both of which the detector supplies
+            # directly, so pose inference is deferred until exactly one
+            # candidate has been chosen.
+            detections = _detector.detect_people(self._detector, rgb)
 
-            if not people:
+            if not detections:
                 gesture_frames.append(self._empty_frame(frame_idx, ts))
                 continue
 
-            centers = [self._torso_center(p) for p in people]
+            centers = [_box_center(d.box, meta.width, meta.height) for d in detections]
 
             if ref_pos is None:
                 # Searching (gallery job) / fresh vote (heuristic job) —
                 # see module docstring's "Speaker re-identification".
                 if gallery is not None:
-                    chosen = self._gallery_match(rgb, masks, gallery)
+                    chosen = self._gallery_match(rgb, detections, gallery)
                     if chosen is None:
                         gesture_frames.append(self._empty_frame(frame_idx, ts))
                         continue
@@ -502,15 +735,24 @@ class GestureWorker:
                     chosen = min(range(len(centers)), key=lambda i: _dist(centers[i], _FRAME_CENTER))
             else:
                 chosen = min(range(len(centers)), key=lambda i: _dist(centers[i], ref_pos))
-                if _dist(centers[chosen], ref_pos) > _MAX_TRACK_JUMP:
-                    # Implausible jump — more likely a track switch onto
-                    # someone/something else than real motion. A
-                    # heuristic-only job re-votes by centrality; a gallery
+                # Two independent ways to lose the lock. The jump check is
+                # geometric: an implausible move is more likely a track
+                # switch than real motion. The identity check below is what
+                # makes proximity a *prior* rather than an authority — see
+                # "Lock verification" in the module docstring for the
+                # confirmed bug that motivated it.
+                lost_lock = _dist(centers[chosen], ref_pos) > _MAX_TRACK_JUMP
+                if gallery is not None and not lost_lock:
+                    score = self._score_candidate(rgb, detections[chosen], gallery)
+                    lost_lock = score is None or score < _GALLERY_MATCH_THRESHOLD
+
+                if lost_lock:
+                    # A heuristic-only job re-votes by centrality; a gallery
                     # job drops the lock and re-attempts gallery matching
                     # on this same frame instead — never a centrality
                     # fallback for a gallery job (see module docstring).
                     if gallery is not None:
-                        chosen = self._gallery_match(rgb, masks, gallery)
+                        chosen = self._gallery_match(rgb, detections, gallery)
                         if chosen is None:
                             ref_pos = None  # explicitly Searching for the
                             # next frame too, not still "locked" onto the
@@ -521,16 +763,74 @@ class GestureWorker:
                         chosen = min(range(len(centers)), key=lambda i: _dist(centers[i], _FRAME_CENTER))
             ref_pos = centers[chosen]
 
+            pose = self._pose_on_crop(rgb, detections[chosen].box, meta.width, meta.height)
+            if pose is None:
+                # The detector found a person here but MediaPipe declined to
+                # fit a skeleton to the crop. Real and expected (heavy
+                # occlusion, motion blur, a torso-only sliver at a frame
+                # edge), and not a reason to guess: emit an empty frame,
+                # exactly as a no-detection frame does. ref_pos is
+                # deliberately left set — the detector's own track is still
+                # good, so the next frame should continue from Locked
+                # rather than pay a full gallery re-search over a
+                # momentary pose failure.
+                gesture_frames.append(self._empty_frame(frame_idx, ts))
+                continue
+
+            landmarks, world_landmarks = pose
             gf = self._build_frame(
-                frame_idx, ts, people[chosen], people_world[chosen] if people_world else [],
-                meta.width, meta.height,
+                frame_idx, ts, landmarks, world_landmarks, meta.width, meta.height,
             )
             gesture_frames.append(gf)
 
         return gesture_frames
 
+    def _pose_on_crop(
+        self, rgb: np.ndarray, box: tuple[int, int, int, int],
+        frame_w: int, frame_h: int,
+    ):
+        """
+        Runs the single-person landmarker on one detection's letterboxed
+        crop and maps the result back into frame-normalised coordinates.
+        Returns (landmarks, world_landmarks), or None if no pose was found.
+
+        The returned `landmarks` are plain _MappedLandmark objects rather
+        than MediaPipe's own type: their coordinates have been transformed
+        out of crop space, so handing back MediaPipe's objects unchanged
+        would be actively misleading about what frame of reference they're
+        in. `world_landmarks` pass through untouched — they are
+        hip-origin and person-relative (metres), so cropping does not
+        affect them, which is also why every angle in
+        core/fusion_engine.py is unaffected by this change.
+        """
+        mp = self._mp
+        square, side, off_x, off_y = _letterbox_crop(rgb, box)
+        if square.size == 0:
+            return None
+
+        result = self._pose_landmarker.detect(
+            mp.Image(image_format=mp.ImageFormat.SRGB, data=square)
+        )
+        if not result.pose_landmarks:
+            return None
+
+        mapped = []
+        for lm in result.pose_landmarks[0]:
+            fx, fy = _crop_norm_to_frame_norm(
+                lm.x, lm.y, box, side, off_x, off_y, frame_w, frame_h,
+            )
+            # z is left in MediaPipe's own units, i.e. now scaled relative
+            # to the *crop* rather than the frame. Nothing downstream reads
+            # it (confirmed — _build_frame stores it and no consumer uses
+            # it; all depth/angle work goes through pose_world instead), so
+            # rescaling it would invent a precision this value never had.
+            mapped.append(_MappedLandmark(fx, fy, lm.z, lm.visibility))
+
+        world = result.pose_world_landmarks[0] if result.pose_world_landmarks else []
+        return mapped, world
+
     def _gallery_match(
-        self, rgb: np.ndarray, masks, gallery: np.ndarray,
+        self, rgb: np.ndarray, detections, gallery: np.ndarray,
     ) -> Optional[int]:
         """
         Embeds every detected candidate via its own segmentation-mask
@@ -541,27 +841,37 @@ class GestureWorker:
         guess). See module docstring's "Speaker re-identification"; the
         actual crop/embed/score math lives in workers/_reid.py, shared
         with the dashboard's gallery-building flow.
+
+        Masks come from the detector rather than MediaPipe now. That also
+        closes a subtle mismatch: gallery *exemplars* were always built
+        from the dashboard's own detections, so embedding runtime
+        candidates from a differently-derived mask meant the two sides of
+        every cosine comparison had been cropped by different models. Both
+        sides now go through the same detector and the same
+        crop_via_mask.
         """
         best_idx: Optional[int] = None
         best_score = _GALLERY_MATCH_THRESHOLD
-        for i, mask in enumerate(masks or []):
-            crop = _reid.crop_via_mask(rgb, mask.numpy_view())
-            if crop is None:
-                continue
-            emb = _reid.embed_crop(self._reid_model, crop)
-            score = _reid.top_k_similarity(emb, gallery, _GALLERY_MATCH_TOP_K)
-            if score > best_score:
+        for i, det in enumerate(detections):
+            score = self._score_candidate(rgb, det, gallery)
+            if score is not None and score > best_score:
                 best_idx, best_score = i, score
         return best_idx
 
-    @staticmethod
-    def _torso_center(landmarks) -> tuple[float, float]:
-        """Mean of the shoulder/hip landmarks (already-normalised [0,1]
-        coords) as a stable person-center proxy — see module docstring's
-        "Speaker selection" for why not a full-landmark bounding box."""
-        xs = [landmarks[i].x for i in _TORSO_LANDMARKS]
-        ys = [landmarks[i].y for i in _TORSO_LANDMARKS]
-        return (sum(xs) / len(xs), sum(ys) / len(ys))
+    def _score_candidate(self, rgb: np.ndarray, det, gallery: np.ndarray) -> Optional[float]:
+        """Top-`_GALLERY_MATCH_TOP_K` mean cosine similarity between one
+        detection and the gallery, or None if the detection's mask is too
+        small/degenerate to crop (see workers/_reid.py's MIN_MASK_PIXELS).
+
+        Split out of _gallery_match so the Locked state can verify its
+        single tracked candidate without embedding every other candidate
+        in the frame — one OSNet forward pass per frame instead of one per
+        person."""
+        crop = _reid.crop_via_mask(rgb, det.mask)
+        if crop is None:
+            return None
+        emb = _reid.embed_crop(self._reid_model, crop)
+        return _reid.top_k_similarity(emb, gallery, _GALLERY_MATCH_TOP_K)
 
     @staticmethod
     def _build_frame(
@@ -688,12 +998,14 @@ class GestureWorker:
         frames here is already pose_present (real detections only). step=3
         — carried over from the MeTRAbs branch's own finding that full
         per-frame density (step=1) visibly picked up per-frame jitter with
-        no temporal smoothing between displayed samples; VIDEO mode's own
-        internal tracking (see module docstring) may make a smaller step
-        viable here even though it wasn't on that branch, but that hasn't
-        been tested. Bumped from step=2 to step=3 by explicit choice, not a
-        new finding — not re-benchmarked against 2, just carried forward
-        as the current known-good value.
+        no temporal smoothing between displayed samples. An earlier note
+        here speculated that VIDEO mode's internal tracking might make a
+        smaller step viable; that no longer applies at all now the worker
+        runs in IMAGE mode (see module docstring), which has no inter-frame
+        damping whatsoever — if anything a smaller step is now *less*
+        viable, not more. Bumped from step=2 to step=3 by explicit choice,
+        not a new finding — not re-benchmarked against 2, just carried
+        forward as the current known-good value.
         y is pre-flipped (stored as 1 − raw_y) so the JS viewer doesn't need
         to re-flip it.
         """

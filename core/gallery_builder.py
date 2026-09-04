@@ -10,6 +10,12 @@ here lives in Redis under the same job_id GestureWorker later reads from
 its own, and it's cleaned up by the existing job:{job_id}:* delete_job
 sweep once that job finishes.
 
+Person detection and segmentation come from workers/_detector.py
+(YOLO11n-seg); MediaPipe is not used in this module at all. Gallery
+building only ever needed people-plus-masks, never a landmark, so the pose
+model here was pure overhead — and its person detector was the weak link
+on wide stage shots. See detect_candidates for the fuller reasoning.
+
 This module holds the pure sampling/scoring logic only; the dashboard
 owns all UI state (which video, which frame is currently shown, click
 handling) and calls into this module per confirmation. Kept separate from
@@ -32,6 +38,7 @@ import numpy as np
 from core.feature_store import FeatureStore
 from core.models import GalleryEntry
 from workers import _reid
+from workers._detector import detect_people
 
 # Redundancy threshold (max-similarity — see workers/_reid.py's
 # max_similarity, and workers/gesture_worker.py's module docstring for why
@@ -194,7 +201,7 @@ def _draw_fresh_frame(interval_start: float, interval_end: float, fps: float, se
     return frame_idx / fps, frame_idx
 
 
-def draw_next_candidate(reid_model, landmarker, state: GalleryBuildState) -> dict:
+def draw_next_candidate(reid_model, detector, state: GalleryBuildState) -> dict:
     """
     Pops exactly one (scene, sub-interval) slot off the duration
     -weighted, stratified schedule (rebuilding a fresh lap once
@@ -240,7 +247,7 @@ def draw_next_candidate(reid_model, landmarker, state: GalleryBuildState) -> dic
         seen.append(frame_idx)  # mark tried regardless of outcome, so a
         # later retry (within this slot or a future lap) doesn't waste an
         # attempt re-landing on a frame already confirmed empty.
-        result = detect_candidates(reid_model, landmarker, state.video_path, ts, state.fps)
+        result = detect_candidates(reid_model, detector, state.video_path, ts, state.fps)
         if result["candidates"]:
             result["ts"] = ts
             return result
@@ -256,21 +263,29 @@ def _scene_idx_for_timestamp(state: GalleryBuildState, ts: float) -> int:
 
 
 def detect_candidates(
-    reid_model, landmarker, video_path: str, ts: float, fps: float,
+    reid_model, detector, video_path: str, ts: float, fps: float,
 ) -> dict:
     """
-    Grabs the frame at `ts`, runs the (already-open, IMAGE-mode,
-    segmentation-enabled) landmarker on it, and returns
-    {"frame_jpeg_b64": ..., "candidates": [{"crop_jpeg_b64": ...}, ...]}
-    — the full frame is for UI context (so the researcher can see the
-    broader scene, e.g. who's actually on stage vs. in the audience), the
-    per-candidate crops are what get shown as clickable thumbnails and,
-    for whichever one is clicked, later decoded and embedded (see
-    embed_candidate_from_b64) — nothing here is embedded yet, to avoid
-    paying that cost for candidates nobody selects.
-    """
-    import mediapipe as mp
+    Grabs the frame at `ts`, runs the YOLO11n-seg person detector on it,
+    and returns {"frame_jpeg_b64": ..., "candidates": [{"crop_jpeg_b64":
+    ...}, ...]} — the full frame is for UI context (so the researcher can
+    see the broader scene, e.g. who's actually on stage vs. in the
+    audience), the per-candidate crops are what get shown as clickable
+    thumbnails and, for whichever one is clicked, later decoded and
+    embedded (see embed_candidate_from_b64) — nothing here is embedded
+    yet, to avoid paying that cost for candidates nobody selects.
 
+    MediaPipe is deliberately absent from this module entirely. Gallery
+    building only ever needed *people, segmented* — it never used a single
+    landmark — so running a pose model here was paying for a 33-keypoint
+    skeleton purely to reach the segmentation mask riding alongside it.
+    The detector supplies masks directly, and supplies better ones on
+    exactly the footage this project cares about: MediaPipe's own person
+    detector routinely missed a small speaker on a wide stage, or returned
+    only audience members, which on this path meant the researcher was
+    never even *shown* the speaker as a candidate to confirm. See
+    workers/_detector.py's module docstring.
+    """
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, int(round(ts * fps)))
     ok, bgr = cap.read()
@@ -282,12 +297,10 @@ def detect_candidates(
     frame_jpeg_b64 = base64.b64encode(frame_jpeg.tobytes()).decode("ascii") if ok else None
 
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-    result = landmarker.detect(mp_image)  # IMAGE mode — see build_landmarker
 
     candidates = []
-    for mask in (result.segmentation_masks or []):
-        crop = _reid.crop_via_mask(rgb, mask.numpy_view())
+    for det in detect_people(detector, rgb):
+        crop = _reid.crop_via_mask(rgb, det.mask)
         if crop is None:
             continue
         ok, jpeg = cv2.imencode(
@@ -300,29 +313,6 @@ def detect_candidates(
             "crop_jpeg_b64": base64.b64encode(jpeg.tobytes()).decode("ascii"),
         })
     return {"frame_jpeg_b64": frame_jpeg_b64, "candidates": candidates}
-
-
-def build_landmarker():
-    """A one-off IMAGE-mode PoseLandmarker, segmentation masks on —
-    deliberately separate from GestureWorker's own VIDEO-mode landmarker
-    instance: gallery-building samples arbitrary, possibly out-of-order
-    timestamps as the researcher clicks around, which VIDEO mode's
-    strictly-increasing-timestamp requirement can't accommodate (see
-    workers/gesture_worker.py's module docstring, "VIDEO mode")."""
-    import mediapipe as mp
-    from mediapipe.tasks import python as mp_python
-    from mediapipe.tasks.python import vision
-    from workers.gesture_worker import _ensure_model, _NUM_POSES, _POSE_MODEL_PATH, _POSE_MODEL_URL
-
-    _ensure_model(_POSE_MODEL_PATH, _POSE_MODEL_URL, "pose_landmarker_full")
-    return vision.PoseLandmarker.create_from_options(
-        vision.PoseLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=str(_POSE_MODEL_PATH)),
-            running_mode=vision.RunningMode.IMAGE,
-            num_poses=_NUM_POSES,
-            output_segmentation_masks=True,
-        )
-    )
 
 
 def embed_candidate_from_b64(reid_model, crop_jpeg_b64: str) -> np.ndarray:
