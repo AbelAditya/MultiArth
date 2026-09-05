@@ -111,6 +111,31 @@ def _classify_shot_from_pose(keyframes: list[PoseKeyframe]) -> ShotType:
     return ShotType.EXTREME_CLOSE_UP
 
 
+_YAW_FRONTAL_MAX_DEG = 10.0       # |yaw| below this is FRONTAL
+_YAW_TRANSITIONAL_MAX_DEG = 20.0  # below this (and >= frontal max) is
+# TRANSITIONAL; at or above it, OBLIQUE.
+
+
+def _classify_horizontal_angle(yaw_deg: float) -> HorizontalAngle:
+    """Buckets mean shoulder yaw into the three-way HorizontalAngle scale.
+
+    The middle band exists because a single frontal/oblique split at 10°
+    put a subject who is merely *turning* into the same bucket as one
+    standing fully side-on, which is a meaningful distinction for
+    discourse analysis: a speaker mid-turn is usually still addressing the
+    audience, where a committed side-on stance often is not. Thresholds
+    are analyst-chosen, not empirically derived.
+
+    Symmetric in sign — only |yaw| matters, so a turn to either side is
+    scored identically."""
+    magnitude = abs(yaw_deg)
+    if magnitude < _YAW_FRONTAL_MAX_DEG:
+        return HorizontalAngle.FRONTAL
+    if magnitude < _YAW_TRANSITIONAL_MAX_DEG:
+        return HorizontalAngle.TRANSITIONAL
+    return HorizontalAngle.OBLIQUE
+
+
 def _compute_angles_from_pose(
     keyframes: list[PoseKeyframe],
 ) -> tuple[float | None, float | None]:
@@ -229,9 +254,7 @@ class FusionEngine:
             yaw, pitch = _compute_angles_from_pose(kfs)
             if yaw is not None:
                 fused.camera.mean_shoulder_yaw_deg = yaw
-                fused.camera.horizontal_angle = (
-                    HorizontalAngle.FRONTAL if abs(yaw) < 10 else HorizontalAngle.OBLIQUE
-                )
+                fused.camera.horizontal_angle = _classify_horizontal_angle(yaw)
             if pitch is not None:
                 fused.camera.mean_face_pitch_deg = pitch
                 if pitch > 10:

@@ -45,11 +45,36 @@ The **Camera** section has one KPI card and six charts:
 |---|---|
 | KPI card: **Cuts** | Total number of scene cuts detected across the whole video. |
 | **Shot Type** chart | The dominant framing of each window — extreme close-up through very long shot — based on how much of the frame the subject fills. |
-| **Horizontal Angle** chart | Whether the subject is facing roughly toward the camera (frontal) or turned away (oblique), from shoulder orientation. |
+| **Horizontal Angle** chart | How far the subject is turned away from the camera, from shoulder orientation — frontal, transitional, or oblique (see below). |
 | **Vertical Angle** chart | Whether the camera is positioned above, level with, or below the subject's face (high / eye-level / low angle). |
 | **Scene Cuts** chart | How many cuts fall in each time window. |
 | **Face Area** chart | A rough zoom-level proxy: how much of the frame the largest detected face occupies. |
 | **Zoom Trend** chart | Whether the framing is zooming in or zooming out within each window. |
+
+## Horizontal angle bands
+
+`horizontal_angle` is classified from mean shoulder yaw by
+`_classify_horizontal_angle` in `core/fusion_engine.py`. Only the
+*magnitude* of the yaw matters — a turn to either side scores identically:
+
+| Band | Mean shoulder yaw | Reading |
+|---|---|---|
+| `frontal` | \|yaw\| < 10° | Squarely toward the camera |
+| `transitional` | 10° ≤ \|yaw\| < 20° | Turning — off-axis but still broadly addressing the audience |
+| `oblique` | \|yaw\| ≥ 20° | Committed side-on stance, body turned away |
+
+`transitional` was split out of `oblique`, which previously started at 10°
+and so scored a subject merely *mid-turn* the same as one standing fully
+side-on. That distinction matters for discourse analysis: a speaker turning
+is usually still engaging the audience, whereas a sustained oblique stance
+often marks disengagement or attention directed elsewhere (a slide, another
+participant).
+
+The thresholds are analyst-chosen rather than empirically derived, and are
+the two constants `_YAW_FRONTAL_MAX_DEG` and `_YAW_TRANSITIONAL_MAX_DEG` if
+they need revisiting. The dashboard's Horizontal Angle chart colours the
+three bands as an ordinal ramp (green → olive-gold → amber) rather than
+three unrelated hues, since they express a progression.
 
 ## Implementation notes
 

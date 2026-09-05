@@ -143,9 +143,13 @@ class VerbalFeatures(BaseModel):
 # ---------------------------------------------------------------------------
 
 class HorizontalAngle(str, Enum):
-    UNKNOWN  = "unknown"
-    FRONTAL  = "frontal"   # |yaw| < 10° — subject faces roughly toward camera
-    OBLIQUE  = "oblique"   # |yaw| ≥ 10° — body turned away from camera
+    UNKNOWN      = "unknown"
+    FRONTAL      = "frontal"       # |yaw| < 10° — subject faces roughly toward camera
+    TRANSITIONAL = "transitional"  # 10° ≤ |yaw| < 20° — turning, neither
+    # squarely frontal nor committed to a side. Split out of OBLIQUE (which
+    # previously began at 10°) so a subject mid-turn isn't scored the same
+    # as one fully side-on.
+    OBLIQUE      = "oblique"       # |yaw| ≥ 20° — body turned away from camera
 
 
 class VerticalAngle(str, Enum):

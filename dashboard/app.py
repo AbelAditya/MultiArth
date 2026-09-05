@@ -2635,10 +2635,17 @@ def c_shot(data, ct, occ):
     return add_cursor(fig, ct, occ)
 
 
+# Ordinal, not categorical: frontal -> transitional -> oblique is a
+# progression in how far the subject is turned, so the colours ramp
+# accordingly (green -> olive-gold -> amber) rather than being three
+# unrelated hues. TRANSITIONAL's #9C8F3A is the perceptual midpoint of the
+# two endpoints, nudged yellower to stay clearly distinct from UNKNOWN's
+# near-neutral grey, which shares the same chart.
 H_ANGLE_COLOURS = {
-    HorizontalAngle.FRONTAL: C["prosody"],
-    HorizontalAngle.OBLIQUE: C["cursor"],
-    HorizontalAngle.UNKNOWN: C["muted"],
+    HorizontalAngle.FRONTAL:      C["prosody"],
+    HorizontalAngle.TRANSITIONAL: "#9C8F3A",
+    HorizontalAngle.OBLIQUE:      C["cursor"],
+    HorizontalAngle.UNKNOWN:      C["muted"],
 }
 
 V_ANGLE_COLOURS = {
@@ -2668,6 +2675,7 @@ def c_h_angle(data, ct, occ):
         showlegend=False,
     ))
     fig.add_hline(y=10, line=dict(color=C["muted"], width=1, dash="dot"))
+    fig.add_hline(y=20, line=dict(color=C["muted"], width=1, dash="dot"))
     layout = {k: v for k, v in PLOT_LAYOUT.items() if k not in ("yaxis",)}
     fig.update_layout(**layout,
         title=dict(text="Horizontal Angle  (shoulder yaw)", font=dict(size=11, color=C["muted"])),
