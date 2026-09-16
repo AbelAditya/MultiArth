@@ -44,7 +44,7 @@ REID_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)   # normalisation,
 # Minimum foreground pixels for a segmentation-mask crop to be worth
 # embedding at all — filters out a mask that's mostly noise/too small to
 # be a real detection. Not empirically tuned.
-MIN_MASK_PIXELS = 200
+MIN_MASK_PIXELS = 100
 
 
 def ensure_reid_weights() -> None:
@@ -82,16 +82,114 @@ def load_reid_model():
     return model
 
 
-def crop_via_mask(rgb: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray]:
+def limit_torch_threads(n: int = 1) -> None:
+    """Caps PyTorch's intra-op thread pool, for callers that run OSNet
+    interleaved with other models on the same cores.
+
+    Deliberately *not* called from load_reid_model: `torch.set_num_threads`
+    is process-global, so making it a side effect of loading a model would
+    silently reconfigure every other torch user in the process. It is an
+    explicit opt-in instead, and only workers/gesture_worker.py takes it.
+
+    ## Why one thread is not a sacrifice
+
+    OSNet x0_25 is tiny (~0.2M params on a 128x256 input), and measured in
+    isolation it is no slower single-threaded than it is on six: 13.16ms vs
+    12.98ms, inside run-to-run noise. At twelve it is catastrophically worse
+    (81.9ms) — logical-core oversubscription, not real parallelism.
+
+    What this buys is contention, not throughput. In the real per-frame
+    sequence (detector -> OSNet -> MediaPipe, three libraries each sizing a
+    thread pool for a machine it assumes it owns) the same embedding costs
+    55ms. Disabling the detector's spin-wait brings that to ~48ms; capping
+    torch here takes it to ~26ms. Combined, the two are worth ~28% of the
+    whole per-frame budget.
+
+    ## The one conflict, and why it is accepted
+
+    This is process-global, and Orchestrator._run_parallel runs the four
+    workers as concurrent threads in one process, so it also caps
+    VerbalWorker's SenseVoice (funasr) — which is torch-backed and loaded
+    locally for Chinese audio unless SENSEVOICE_REMOTE_URL routes it to
+    colab/sensevoice_server.ipynb instead. That is a real slowdown for that
+    one path, and it is taken knowingly: gesture is the job's critical path
+    by orders of magnitude (hours against minutes), so verbal finishing
+    later still finishes long before the job does, and the cores SenseVoice
+    stops monopolising are cores gesture gets back.
+    """
+    import torch
+
+    torch.set_num_threads(n)
+
+
+# How far past its own detection box a mask may be searched for. Masks are
+# built by cropping at the detector's 640x640 input resolution and then
+# upsampling to frame resolution (~3x at 1080p), while the box is rounded to
+# integer frame pixels separately — so the two disagree slightly at the
+# edges and a mask can spill a little outside the box it belongs to.
+# Measured across 68 detections on real footage the worst spill was 3px,
+# always right/bottom; 8 leaves room without meaningfully enlarging the
+# search. crop_via_mask does not rely on this being sufficient — see its
+# containment guard.
+_BOX_SEARCH_MARGIN = 8
+
+
+def crop_via_mask(
+    rgb: np.ndarray, mask: np.ndarray,
+    box: Optional[tuple[int, int, int, int]] = None,
+) -> Optional[np.ndarray]:
     """Tight bbox crop with background zeroed out via the person's own
     segmentation mask (not a raw bounding box, which would bleed in
     background/neighbours) — verified directly against real footage, see
     wikis/Gesture-Worker.md's re-ID section. mask comes back as (H, W, 1)
-    from MediaPipe (confirmed directly, not assumed)."""
-    mask = mask.squeeze()
-    h, w = mask.shape
-    mask_bin = mask > 0.5
-    ys, xs = np.where(mask_bin)
+    from MediaPipe (confirmed directly, not assumed).
+
+    `box` is the detection's own bounding box, and is an optimisation only:
+    the mask's extent is found by searching inside it rather than scanning
+    the whole frame. Passing it does not change the result — only how long
+    finding it takes. Omitting it falls back to the full-frame scan, so
+    callers that have no box (or a mask not derived from one) stay correct.
+
+    ## Why the box is worth passing
+
+    The mask is frame-sized, so on 1080p footage the unguided `np.where`
+    scans 2.07M booleans to locate a person occupying perhaps 50k of them —
+    and the detector has already said where they are. Measured, that scan is
+    8.00ms per candidate against 0.13ms for the box-local one, with the
+    returned crop byte-identical across 208 detections on four videos.
+
+    It matters most on the Searching path, where *every* candidate is
+    cropped: a crowded auditorium frame at _MAX_DETECTIONS goes from ~160ms
+    of scanning to ~2.6ms. Locked state crops one candidate, so it saves the
+    one 8ms there.
+    """
+    mask_bin = mask.squeeze() > 0.5
+    h, w = mask_bin.shape
+
+    ys = xs = None
+    if box is not None:
+        bx0, by0 = max(0, box[0] - _BOX_SEARCH_MARGIN), max(0, box[1] - _BOX_SEARCH_MARGIN)
+        bx1, by1 = min(w, box[2] + _BOX_SEARCH_MARGIN), min(h, box[3] + _BOX_SEARCH_MARGIN)
+        wys, wxs = np.where(mask_bin[by0:by1, bx0:bx1])
+        # Containment guard: the shortcut is only valid if the whole mask
+        # lies inside the window. If any mask pixel sits on a window edge
+        # that isn't also a frame edge, the window may have clipped it, and
+        # the extent found here would be wrong rather than merely slower —
+        # so fall through to the full scan. Measured, this never fires on
+        # real footage (0/208), but the failure it guards against is a
+        # silently-shifted crop, which is precisely the kind that would
+        # degrade every similarity comparison downstream without raising.
+        if len(wxs) and not (
+            (wxs.min() == 0 and bx0 > 0)
+            or (wys.min() == 0 and by0 > 0)
+            or (wxs.max() == bx1 - bx0 - 1 and bx1 < w)
+            or (wys.max() == by1 - by0 - 1 and by1 < h)
+        ):
+            ys, xs = wys + by0, wxs + bx0
+
+    if xs is None:
+        ys, xs = np.where(mask_bin)
+
     if len(xs) < MIN_MASK_PIXELS:
         return None
     x0, x1 = max(0, xs.min() - 5), min(w, xs.max() + 5)
@@ -121,11 +219,22 @@ def embed_crop(model, rgb_crop: np.ndarray) -> np.ndarray:
 
 def top_k_similarity(query: np.ndarray, gallery: np.ndarray, k: int) -> float:
     """Mean of the top-k per-exemplar cosine similarities against the
-    gallery — not a plain mean over the whole gallery, which would dilute
-    a genuine match against one look by averaging in the gallery's other,
-    legitimately different-looking exemplars. gallery rows and query are
-    both already L2-normalised, so a plain dot product is cosine
-    similarity."""
+    gallery. gallery rows and query are both already L2-normalised, so a
+    plain dot product is cosine similarity.
+
+    Used by gallery-*building*'s redundancy check
+    (core/gallery_builder.py's record_confirmation): "is this confirmed
+    frame a duplicate of several looks we already hold". Deliberately not
+    what runtime matching uses — see max_similarity below.
+
+    The property that makes it right there and wrong for runtime matching
+    is the same one: because the mean pulls in the gallery's other,
+    legitimately different looks, it systematically under-scores a look the
+    gallery holds only once or twice. For a *duplicate* test that is the
+    desired conservatism; for a *match* test it rejected genuine speakers
+    in thinly-sampled scenes (measured 0.66-0.68 where max gave 0.90-0.97).
+    k is clamped to the gallery size, so a 1- or 2-entry gallery degrades
+    to max / mean-of-2 rather than erroring."""
     sims = gallery @ query
     k = min(k, len(sims))
     top = np.sort(sims)[-k:]
@@ -133,13 +242,19 @@ def top_k_similarity(query: np.ndarray, gallery: np.ndarray, k: int) -> float:
 
 
 def max_similarity(query: np.ndarray, gallery: np.ndarray) -> float:
-    """Single nearest-neighbour similarity — used for gallery-*building*'s
-    own redundancy check (core/gallery_builder.py), a deliberately
-    different question from top_k_similarity's runtime-matching use: "is
-    this a near-duplicate of any single existing look" rather than "does
-    this match the gallery well enough overall". See
-    workers/gesture_worker.py's module docstring for why these two use
-    different pooling."""
+    """Single nearest-neighbour similarity — "does this look like *any*
+    single exemplar we hold".
+
+    Used by runtime matching (workers/gesture_worker.py's
+    _gallery_match): "is this candidate one of our confirmed looks at
+    all". One strong match against a single exemplar is enough, which is
+    what makes a thinly-sampled look still matchable at runtime — the
+    failure mode that top_k_similarity caused here before.
+
+    Gallery *building* deliberately uses top_k_similarity instead, for the
+    different question of whether a new confirmation is redundant. See
+    core/gallery_builder.py's GALLERY_REDUNDANCY_TOP_K for why the two
+    sides differ on purpose."""
     if len(gallery) == 0:
         return 0.0
     return float((gallery @ query).max())

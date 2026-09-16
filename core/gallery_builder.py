@@ -28,6 +28,7 @@ them would make both harder to reason about.
 from __future__ import annotations
 
 import base64
+import math
 import random
 from dataclasses import dataclass, field
 from typing import Optional
@@ -40,18 +41,57 @@ from core.models import GalleryEntry
 from workers import _reid
 from workers._detector import detect_people
 
-# Redundancy threshold (max-similarity — see workers/_reid.py's
-# max_similarity, and workers/gesture_worker.py's module docstring for why
-# this is deliberately NOT the same pooling as runtime matching's top-K
-# mean): "is this confirmed frame basically a duplicate of a look we
-# already have". Measured against real single-person footage (see
+# Redundancy threshold: "is this confirmed frame basically a duplicate of
+# looks we already have". Measured against real single-person footage (see
 # wikis/Gesture-Worker.md's re-ID section for the actual experiment and
 # numbers) — a real starting point, not a fully validated final value.
 GALLERY_REDUNDANCY_GAMMA = 0.85
 
-PLATEAU_STREAK = 20    # consecutive redundant confirmations before stopping
+# Pooling for that redundancy check. Deliberately top-K mean, which is NOT
+# what runtime matching uses (workers/gesture_worker.py's _gallery_match
+# is max-pooled) — the two ask different questions and the difference is
+# intentional here:
+#
+#   runtime  "is this candidate one of our confirmed looks at all?"
+#            -> max: one strong match is enough, so a thinly-sampled look
+#               is still matchable.
+#   building "is this confirmed frame redundant with what we already hold?"
+#            -> top-K: something is only a duplicate if it is close to
+#               *several* held exemplars, not just one.
+#
+# Because top_k <= max always, this makes "redundant" strictly harder to
+# declare than max pooling would, so sessions run longer and galleries end
+# up denser. That is the accepted trade: a chosen bias toward more
+# exemplars per look. Note it also gets stricter as the gallery diversifies
+# — with more distinct looks held, the top-K mean pulls in more dissimilar
+# entries — so the redundancy bar tightens over a session rather than
+# loosening. Watch PLATEAU_WINDOW's ratio against real sessions; if the
+# sliding-window stop stops firing, this pooling choice is the first thing
+# to revisit.
+GALLERY_REDUNDANCY_TOP_K = 3
+
+# --- Stopping rule: sliding window, not a consecutive streak ------------
+# Stop once at least PLATEAU_REDUNDANT_RATIO of the last PLATEAU_WINDOW
+# confirmations were redundant — i.e. when the *rate* of new discoveries
+# has fallen, rather than when there has been an unbroken redundant run.
+#
+# The consecutive-streak rule this replaces did not fire in practice.
+# Measured on a real 48s/7-scene video: 36 confirmations, 30 of them
+# redundant, yet the longest unbroken redundant run reached only 17 of the
+# 20 required — a single "new" verdict late in the session reset it — so
+# the session ran to GALLERY_MAX_SIZE instead. That is not bad luck, it is
+# structural: _build_schedule interleaves scenes round-robin, so
+# consecutive confirmations deliberately come from *different* scenes,
+# which is exactly when a genuinely new look is most likely. The sampling
+# strategy actively defeats a consecutive-run criterion.
+#
+# Stopping earlier is also safer than it used to be: runtime matching is
+# max-pooled now (workers/gesture_worker.py's _gallery_match), so a look
+# needs only one exemplar to be matchable at runtime rather than three.
+PLATEAU_WINDOW = 20           # confirmations considered
+PLATEAU_REDUNDANT_RATIO = 0.8  # share of them that must be redundant
 GALLERY_MIN_SIZE = 3  # floor — keep asking at least this many times regardless
-GALLERY_MAX_SIZE = 40  # hard cap, regardless of streak — a UX ceiling, not
+GALLERY_MAX_SIZE = 70  # hard cap, regardless of streak — a UX ceiling, not
 # an algorithmic one (every confirmation costs the researcher's actual
 # attention — see wikis/Gesture-Worker.md).
 
@@ -104,7 +144,10 @@ class GalleryBuildState:
     # string keys after the dcc.Store round-trip (confirmed — Python's own
     # json module does this), breaking int-keyed lookups. A list sidesteps
     # that entirely.
-    streak: int = 0
+    recent_verdicts: list = field(default_factory=list)  # 1 = redundant,
+    # 0 = new, most recent last, trimmed to PLATEAU_WINDOW. A list of ints
+    # rather than bools or a deque so it survives the dcc.Store JSON
+    # round-trip unchanged (same reasoning as drawn_frames above).
     entries_confirmed: int = 0
     stop_reason: Optional[str] = None    # "plateau" | "cap" | "manual" | None
 
@@ -300,7 +343,7 @@ def detect_candidates(
 
     candidates = []
     for det in detect_people(detector, rgb):
-        crop = _reid.crop_via_mask(rgb, det.mask)
+        crop = _reid.crop_via_mask(rgb, det.mask, det.box)
         if crop is None:
             continue
         ok, jpeg = cv2.imencode(
@@ -334,9 +377,10 @@ def record_confirmation(
     thumbnail_jpeg_b64: str,
 ) -> str:
     """
-    Adds one confirmed exemplar, updates the plateau streak, and returns
-    the verdict: "new" or "redundant" — see wikis/Gesture-Worker.md's
-    worked examples for exactly this state transition.
+    Adds one confirmed exemplar, records its verdict in the sliding
+    window, and returns that verdict: "new" or "redundant" — see
+    wikis/Gesture-Worker.md's worked examples for exactly this state
+    transition.
     """
     existing = store.get_gallery(state.job_id)
     scene_idx = _scene_idx_for_timestamp(state, ts)
@@ -347,16 +391,34 @@ def record_confirmation(
     store.add_gallery_entry(state.job_id, entry)
     state.entries_confirmed += 1
 
+    def _record(verdict: str) -> str:
+        state.recent_verdicts.append(1 if verdict == "redundant" else 0)
+        del state.recent_verdicts[:-PLATEAU_WINDOW]   # keep only the window
+        return verdict
+
     if not existing:
-        state.streak = 0
-        return "new"
+        return _record("new")
 
     gallery_arr = np.array([e.embedding for e in existing], dtype=np.float32)
-    if _reid.max_similarity(embedding, gallery_arr) >= GALLERY_REDUNDANCY_GAMMA:
-        state.streak += 1
-        return "redundant"
-    state.streak = 0
-    return "new"
+    # top_k_similarity clamps k to the gallery size, so early confirmations
+    # against a 1- or 2-entry gallery degrade to max/mean-of-2 rather than
+    # erroring — see workers/_reid.py.
+    similarity = _reid.top_k_similarity(embedding, gallery_arr, GALLERY_REDUNDANCY_TOP_K)
+    if similarity >= GALLERY_REDUNDANCY_GAMMA:
+        return _record("redundant")
+    return _record("new")
+
+
+def redundant_in_window(state: GalleryBuildState) -> int:
+    """How many of the last PLATEAU_WINDOW confirmations were redundant —
+    the numerator the dashboard shows the researcher as progress toward
+    stopping."""
+    return sum(state.recent_verdicts)
+
+
+def plateau_target() -> int:
+    """Redundant confirmations needed within a full window to stop."""
+    return math.ceil(PLATEAU_WINDOW * PLATEAU_REDUNDANT_RATIO)
 
 
 def should_stop(state: GalleryBuildState) -> Optional[str]:
@@ -366,6 +428,14 @@ def should_stop(state: GalleryBuildState) -> Optional[str]:
     derivable from the accumulated state, so it isn't decided here."""
     if state.entries_confirmed >= GALLERY_MAX_SIZE:
         return "cap"
-    if state.entries_confirmed >= GALLERY_MIN_SIZE and state.streak >= PLATEAU_STREAK:
+    # The window must be full before the ratio means anything — otherwise
+    # an early run like 2-of-2 redundant would trip an 0.8 ratio on the
+    # second confirmation. This makes PLATEAU_WINDOW the effective floor,
+    # which is stricter than GALLERY_MIN_SIZE; that floor is kept anyway so
+    # the two can be tuned independently.
+    if len(state.recent_verdicts) < PLATEAU_WINDOW:
+        return None
+    if (state.entries_confirmed >= GALLERY_MIN_SIZE
+            and redundant_in_window(state) >= plateau_target()):
         return "plateau"
     return None

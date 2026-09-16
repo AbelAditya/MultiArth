@@ -8,6 +8,7 @@ frames into time windows before dispatching to workers.
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -94,30 +95,60 @@ def frames_for_window(
     end_s: float,
     fps: float,
     max_frames: int = 150,
-) -> list[tuple[float, np.ndarray]]:
+) -> Iterator[tuple[float, np.ndarray]]:
     """
-    Read frames in [start_s, end_s) from a video.
-    Returns list of (timestamp_s, BGR frame).
-    Downsamples if the window would exceed max_frames.
+    Yield frames in [start_s, end_s) from a video, as (timestamp_s, BGR
+    frame). Downsamples if the window would exceed max_frames.
+
+    ## Streaming, not a list
+
+    This used to build and return the whole window as a list, and was
+    changed because that list *was* the memory profile that OOM-killed the
+    MeTRAbs branch (confirmed at the time via journalctl/OOM-killer
+    forensics, and documented in workers/gesture_worker.py's "Frame
+    resolution" section). Measured on 1080p footage, one decoded frame is
+    6.22MB and a full 150-frame window is 933MB — all of it live before any
+    inference has started, since the list was built to completion first.
+    Yielding holds one frame instead.
+
+    Note the old consumer already dropped its references as it went; that
+    shortened the tail but not the peak, which is at construction. The fix
+    has to be not building the list at all.
+
+    Nothing else changes. Every frame in the window is still decoded and
+    `step` still decides only which ones are handed on, so this is not
+    faster — decode is 2.05ms/frame against a ~100ms/frame inference
+    budget. The seek, the ordering and the timestamps are identical.
+
+    What it *enables* is running windows in separate processes
+    (GestureWorker's pool): six unstreamed windows would hold 5.6GB of
+    frames at once, which does not fit alongside ~489MB of models per
+    process on a 16GB machine. Streamed, the same six hold ~37MB.
+
+    Two consequences of being a generator worth knowing. The VideoCapture
+    stays open across the *consumer's* loop rather than just the read loop,
+    so it is released when the generator is exhausted or closed (the
+    `finally` covers early `break` and exceptions alike). And the call is
+    lazy: nothing is read until the first `next()`. A bad path yields
+    nothing where it previously returned [] — the same observable outcome,
+    just deferred.
     """
     cap = cv2.VideoCapture(video_path)
-    start_frame = int(start_s * fps)
-    end_frame = int(end_s * fps)
-    total = end_frame - start_frame
+    try:
+        start_frame = int(start_s * fps)
+        end_frame = int(end_s * fps)
+        total = end_frame - start_frame
 
-    step = max(1, total // max_frames)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        step = max(1, total // max_frames)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
-    frames = []
-    idx = start_frame
-    while idx < end_frame:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if (idx - start_frame) % step == 0:
-            ts = idx / fps
-            frames.append((ts, frame))
-        idx += 1
-
-    cap.release()
-    return frames
+        idx = start_frame
+        while idx < end_frame:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if (idx - start_frame) % step == 0:
+                yield idx / fps, frame
+            idx += 1
+    finally:
+        cap.release()

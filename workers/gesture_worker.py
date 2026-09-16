@@ -14,10 +14,9 @@ For each time window it:
   1. Reads frames from the video for that window
   2. Runs the YOLO11n-seg person detector (workers/_detector.py) on every
      frame, getting a box + segmentation mask per person
-  3. Selects which detection is "the subject": by gallery re-identification
-     if the job has a speaker gallery, otherwise by the heuristics
-     (most-central-to-frame, voted once per window/scene-cut, then
-     nearest-to-last-known-position) ported from the MeTRAbs branch
+  3. Selects which detection is "the subject" by gallery re-identification,
+     then holds the track by frame-to-frame appearance continuity — see
+     "Speaker selection"
   4. Runs MediaPipe Tasks' PoseLandmarker (single-person, 33-keypoint
      BlazePose topology, IMAGE running mode) on **only that one
      detection's crop**, and maps the landmarks back into frame
@@ -63,16 +62,28 @@ Consequences worth knowing:
     embedding runtime candidates from MediaPipe-derived masks meant the
     two sides of every cosine comparison had been cropped by different
     models.
-  - A detection whose crop MediaPipe declines to fit a pose to yields an
-    empty frame, not a guess. This is not rare for physically small
-    subjects: measured across 152 detections on real footage, MediaPipe
-    found a pose for only ~15/25 of the smallest ones (<15k mask pixels).
-    Neither expanding the crop box nor upscaling it fixed this (both
-    tested across margins 1.0-1.4 and minimum sides 192-384; differences
-    were within noise, and expansion was slightly *worse* while adding
-    back the background the detector exists to exclude). So the crop is
-    tight and unscaled, and the remaining gap is a genuine limitation of
-    BlazePose on small subjects rather than something tuning fixes.
+  - What MediaPipe is *fed* turned out to matter more than anything about
+    the detection itself. The crop is a square region of the frame around
+    the box (see _square_crop), not the box padded to square, because
+    padding starved the model: on a 76x302 box — an ordinary distant
+    standing speaker — a padded square is 75% black, and MediaPipe
+    returned no pose at all on 25 consecutive frames where detection,
+    mask, gallery match and continuity had every passed cleanly. Taking
+    the same-sized square from the image recovers all 25.
+
+    An earlier note here claimed expansion and upscaling had been tested
+    and made no difference, "within noise, expansion slightly worse". That
+    experiment was wrong: it expanded the box and then black-padded the
+    result, so it never varied the thing that actually mattered. The real
+    variable is whether the square is filled with image or with void — a
+    1.0x region of the image is exactly as large as the padded one and
+    still recovers 0/25.
+
+  - A detection whose crop MediaPipe still declines to fit a pose to
+    yields an empty frame, not a guess. That remains real for physically
+    small subjects: measured across 152 detections, MediaPipe found a pose
+    for only ~15/25 of the smallest ones (<15k mask pixels). Those were
+    measured under the old padded crop, so the figure is worth re-taking.
 
 `GestureFrame.left_hand`/`right_hand` are always empty here — MediaPipe's
 HandLandmarker was tried, wired up, and then deliberately removed again:
@@ -136,30 +147,149 @@ re-creating it per window would pay model-load cost for nothing.
 
 ## Speaker selection
 
-Selection is by detection-box centre (`_box_center`), which closes a gap
-that existed for the whole MediaPipe era of this branch. MeTRAbs's
-detector gave an explicit per-person bounding box; PoseLandmarker exposes
-none at all (confirmed directly — a `PoseLandmarkerResult` has
-`pose_landmarks`, `pose_world_landmarks` and `segmentation_masks`, nothing
-box-shaped), so this worker approximated one from landmarks. A raw min/max
-box over all 33 landmarks was rejected, because BlazePose always estimates
-a plausible position for every landmark even when occluded or off-screen
-(e.g. ankles in a close-up), and those extrapolated points skew a box
-centre away from the visible person; the mean of the shoulder/hip
-landmarks was used instead as a stabler proxy.
+**A speaker gallery is required.** `process_job` raises without one. Only
+the gallery can *acquire* a lock; everything else here maintains or
+invalidates an existing one.
 
-The detector now supplies a real box directly, so neither workaround is
-needed — and a detector box has no extrapolation failure mode at all. One
-practical caveat: a box centre sits at the body's midpoint, whereas the
-torso-mean sat higher, at shoulder/hip level. `_MAX_TRACK_JUMP` is
-measured against that quantity and was tuned for the old one, so it is on
-the retune list.
+The centrality vote this replaced — pick the candidate nearest the frame
+centre — was the MeTRAbs-era fallback for jobs with no gallery, and it was
+removed rather than kept as a degraded mode for two reasons. It is wrong
+often enough to matter on this footage: in a crowded auditorium frame the
+speaker stood at (0.25, 0.57) while the seated audience occupied the middle
+of the frame, so centrality would have picked an audience member. And as a
+*fallback* it fails silently — it always returns somebody, so a job with a
+missing or expired gallery would produce a confident, wrong gesture track
+rather than an obvious failure. Raising is louder than degrading, and an
+all-empty gesture track (the alternative if selection simply never
+succeeded) is indistinguishable from a video containing no people.
 
-Everything downstream of "which person is the subject" — vote-once at a
-window/scene-cut boundary, nearest-to-`ref_pos` tracking otherwise, the
-max-jump ambiguity guard, scene-cut-aware resets via this worker's own
-independent PySceneDetect pass — is unchanged from the MeTRAbs branch, but
-only applies to a job with **no** speaker gallery. See the next section.
+### Centrality returns — as a gallery-scoped tie-break only
+
+Centrality was later reintroduced in one narrow role: when **two or more**
+candidates have already cleared the gallery threshold, the one nearest the
+frame centre is chosen rather than the highest scorer (see
+`_gallery_match`). The trigger was live relay: TED-style stages project the
+speaker onto a screen behind them, the projection is the same person and so
+matches the gallery legitimately, and — being a sharp close-up — it usually
+outscores the small, distant real speaker. Appearance cannot separate them;
+position can, since screens hang above and beside the stage.
+
+This is not the heuristic removed above, and the scoping is what answers
+both of the original objections:
+
+  - *It picked audience members.* Audience members are different people,
+    so they fail the gallery threshold and are gone before centrality is
+    consulted. It only ever chooses between candidates the gallery has
+    already identified as the speaker — in practice, the speaker versus a
+    picture of the speaker.
+  - *It failed silently as a fallback.* It never runs without a gallery
+    match, so it cannot manufacture a track. A frame where nobody clears
+    the threshold is still empty.
+
+Accepted limitation: it needs both candidates present. When the detector
+misses the real speaker and returns only the projection, there is one
+passer and it wins. That is a recall problem, left for a later change.
+
+What remains, in full:
+
+  - **Acquisition** — `_gallery_match` over every candidate, at a window
+    start, after a scene cut, on lease expiry, or after a jump; with the
+    centrality tie-break above when more than one candidate passes.
+  - **Continuity** — the Locked-state check against the previous accepted
+    frame (see "Lock verification").
+  - **`_MAX_TRACK_JUMP`** — a heuristic that can only *reject*. It
+    invalidates a lock when the nearest candidate has moved implausibly
+    far, but never chooses who holds the lock. A rejected frame re-anchors
+    against the gallery.
+
+Positions come from `_box_center` on the detector's own box. This closed a
+long-standing gap: PoseLandmarker exposes no bounding box at all (confirmed
+— a `PoseLandmarkerResult` has `pose_landmarks`, `pose_world_landmarks` and
+`segmentation_masks`, nothing box-shaped), so this worker used to
+approximate one from the shoulder/hip landmark mean, itself chosen because
+a min/max box over all 33 landmarks is skewed by the positions BlazePose
+extrapolates for occluded or off-screen joints. A detector box has no such
+failure mode. One caveat: a box centre sits at the body's midpoint where
+the torso-mean sat at shoulder/hip level, and `_MAX_TRACK_JUMP` was tuned
+against the old quantity, so it is on the retune list.
+
+## Tracklet selection — one decision per scene, not per frame
+
+The centrality tie-break above fixes the frames where *both* the speaker
+and her projection are detected. It cannot fix the frames where only the
+projection is, and those are common: her detector confidence swings with
+her pose (measured 0.64 with arms raised, 0.162 with them down), so she
+drops in and out of the candidate list. Per-frame selection then alternates
+with whether she happened to be detected, and the track visibly jumps
+between her and the screen. The lease bounds each wrong lock to ~30 frames
+but cannot prevent the next one, because every re-anchor is decided from
+that frame's evidence alone.
+
+So selection is lifted to the scene. `_compute_scene_decision` streams a
+whole scene once, links every detection into tracklets geometrically
+(`_associate` — box overlap only, no embeddings), scores each *tracklet*
+against the gallery from a handful of sampled crops, and picks one
+(`_select_tracklet`). Two or more passing tracklets means the relay case,
+and the most central one by **median** distance wins — median because it is
+length-independent, so a short track of hers is judged on the same footing
+as a long one of the screen.
+
+Measured on a real relay scene (test_vid_39, 3.6-12.2s), three tracklets
+passed a researcher-built gallery and it chose correctly:
+
+    chosen    median centre distance 0.086, 148 frames
+    rejected  0.467 (203 frames, score 0.86)
+    rejected  0.477 (143 frames, score 0.89)
+
+Both rejects were *longer* and one scored *higher* — which is exactly why
+neither length nor gallery score is consulted in the choice.
+
+Deciding once is the whole point: a scene-level decision cannot alternate.
+Frames the chosen track does not cover come out empty, which is honest —
+she genuinely was not detected there — and is what stops the track jumping
+to the screen. Expect `pose_present_ratio` to fall on relay scenes as a
+result; that is the correct number replacing a wrong one, not a
+regression.
+
+Decisions are cached in Redis under `(job_id, scene_idx)` because a scene
+routinely spans several 5s windows and, with the process pool, those
+windows run in different processes. Without sharing they would not only
+recompute the decision but could reach *different* ones from their own
+partial view, making the track flip at window boundaries. Concurrent
+writers need no lock: the computation is deterministic over the same
+frames, so a race wastes work and never produces disagreement.
+
+Scene indices mean the same thing here and in the dashboard's gallery
+builder because both derive them from `_detect_scene_cuts`. That coupling
+is load-bearing — changing scene detection on one side only would silently
+repoint every stored index at a different scene.
+
+### Known costs and limitations, measured
+
+  - **Non-ambiguous scenes currently pay for detection twice.** Ambiguity
+    is the *output* of building tracklets, not a precondition, so the
+    decision pass runs for every scene; where it concludes "not
+    ambiguous", the per-frame path then re-detects the same frames.
+    Estimated from measured per-stage costs, this takes a 40-minute video
+    from ~1.41h to ~2.21h pooled. Two ways out are known and neither is
+    implemented: use the single passing tracklet too (~1.46h, but changes
+    behaviour on every scene), or trigger the scene pass only once
+    ambiguity has been observed for free during the ordinary path
+    (~1.48h, preserves the scoping). This is the main open question here.
+  - **Identity is judged from the five *earliest* sampled crops**, not
+    five spread along the track (`[:_TRACK_ID_SAMPLES]` over insertion
+    order). A track is therefore assessed on its opening frames, so an
+    identity switch partway through is invisible, and a speaker who
+    starts a scene turned away can have her whole track misjudged.
+  - **Association compares against a tracklet's last box regardless of
+    how stale it is.** After a long gap a moving person may fall below
+    `_TRACK_IOU_MIN` and start a spurious new track, while a static
+    projection re-links trivially — a bias toward the screen. Not yet
+    biting: her worst measured gap is 14 frames against a tolerance of 30.
+  - **A scene where the speaker is never detected still fails.** One
+    passing tracklet is not ambiguous, so the projection wins by the
+    ordinary path. This rests on the researcher's observation that she is
+    always detected for at least a few frames per scene.
 
 ## Speaker re-identification (gallery-based)
 
@@ -170,21 +300,24 @@ this worker runs one of two states per frame:
 
   - **Locked** — `ref_pos` is set, from an earlier confirmed gallery match.
     The nearest candidate to `ref_pos` is proposed, then **verified against
-    the gallery before being accepted** (`_score_candidate`, one embedding
+    the previous accepted frame** (`_CONTINUITY_THRESHOLD`, one embedding
     rather than the whole frame's worth). Proximity is a cheap prior here,
-    never the authority; failing verification drops the lock and falls
-    through to a full Searching match on the same frame. See "Lock
-    verification" below for why.
+    never the authority. Failing verification does not lose the frame: it
+    falls through to a full gallery match on that same frame, so the four
+    anchor triggers (Searching, jump, lease, continuity failure) all
+    resolve identically. See "Lock verification" below for why the
+    reference is the previous frame rather than the gallery.
   - **Searching** — no current lock (a window just started, a scene cut
-    just happened, or `_MAX_TRACK_JUMP` was exceeded — all three trigger
-    the same recovery here, never a centrality vote). Every detected
+    just happened, the lease expired, or `_MAX_TRACK_JUMP` was exceeded —
+    all four trigger the same recovery here). Every detected
     candidate is cropped via its own segmentation mask, embedded through
     OSNet (`_reid_model`, see below), and scored against the gallery by
-    top-`_GALLERY_MATCH_TOP_K` mean cosine similarity. Whichever candidate
-    clears `_GALLERY_MATCH_THRESHOLD` with the highest score gets locked
-    onto; if nobody does, this frame is emitted as empty — deliberately
-    "no speaker here" rather than a heuristic guess — and the next frame
-    tries again from Searching.
+    nearest-exemplar (max) cosine similarity. If exactly one candidate
+    clears `_GALLERY_MATCH_THRESHOLD` it gets locked onto; if several do,
+    the one nearest the frame centre wins (see "Centrality returns — as a
+    gallery-scoped tie-break only"); if nobody does, this frame is emitted
+    as empty — deliberately "no speaker here" rather than a heuristic
+    guess — and the next frame tries again from Searching.
 
 This means gallery matching isn't bounded to fixed checkpoints: a stretch
 of frames where the real speaker is off-screen or unmatchable pays the
@@ -226,9 +359,37 @@ better detector did not introduce the bug, it supplied the conditions that
 expose it.
 
 So Locked now verifies the candidate it proposes. Cost is one OSNet
-embedding per Locked frame (~5ms against a ~150ms frame budget), and
-crucially the check no longer depends on motion — a stationary impostor is
-rejected just as readily as a moving one.
+embedding per Locked frame, and crucially the check no longer depends on
+motion — a stationary impostor is rejected just as readily as a moving one.
+
+An earlier note here put that embedding at "~5ms against a ~150ms frame
+budget". Measured, it is 12.8ms in isolation and was 55ms as this pipeline
+was actually configured — the gap being thread-pool contention between the
+detector's, OSNet's and MediaPipe's separate pools, since each sizes itself
+for a machine it assumes it owns. That is now addressed at the two loaders
+(see _detector.load_detector's spin-wait note and _reid.limit_torch_threads)
+rather than by changing anything here, and the check costs ~26ms. Still the
+cheapest stage in the frame, but a fifth of the budget rather than a
+thirtieth.
+
+That verification is against the **previous accepted frame**
+(`_CONTINUITY_THRESHOLD`), not the gallery, with the gallery reserved for
+acquisition and for the periodic re-anchor `_LOCK_LEASE_FRAMES` forces.
+Verifying against the gallery every frame was tried first and dropped: a
+gallery is a set of discrete snapshots while appearance varies
+continuously, so frames falling between two held looks were rejected even
+though nothing was wrong with them — 50 of 300 frames (17%) on real
+footage, appearing to the researcher as scattered dropouts. Continuity
+recovered all 50. Measured on three videos, continuity-only and
+continuity-with-gallery-fallback perform identically at a 0.85 threshold
+(300/300, 200/200), while gallery-per-frame kept only 250/300 on the
+affected clip; gallery calls drop from one per frame to ~11 per 300.
+
+An impostor is still rejected on both paths — it scores ~0.5 against a
+previous speaker frame just as it does against the gallery — so removing
+the per-frame gallery check does not reopen the hijack above. Verified
+directly against the TED TEST_2 scene that produced it: 0 impostor frames
+posed.
 
 `_GALLERY_MATCH_THRESHOLD` currently reuses the same 0.85 value chosen for
 gallery-*building*'s own redundancy check (`gamma`, see the dashboard's
@@ -236,18 +397,19 @@ gallery-confirmation flow) — measured against real same-speaker/
 different-speaker footage (see wikis/Gesture-Worker.md's re-ID section for
 the actual numbers), but that experiment used max-similarity, single-person
 footage with no real simultaneous-multiple-candidates data. Reusing gamma
-here is a starting point, not a validated value for this specific
-top-K-mean-pooled decision — flagged for revisiting once real multi-person
-footage exists to calibrate it independently, same as `_GALLERY_MATCH_TOP_K`.
+here is now a like-for-like reuse — runtime matching is max-pooled too (see
+_gallery_match), so gamma and this threshold answer the same shape of
+question. Still worth calibrating independently once real multi-person
+footage exists.
 
 OSNet (`workers/_osnet.py`, vendored, MIT licensed — see that file's own
 docstring) is loaded lazily, once per `GestureWorker` instance (not
 per-job like the pose landmarker) — it's stateless and has no reason to be
 reloaded, so it stays warm across an entire bulk batch once any job in it
 needs a gallery.
-It's never loaded at all for a job with no gallery — the heuristic-only
-path pays zero cost for this feature, same reasoning as HandLandmarker's
-removal above: no cost for capability that job isn't using.
+It is loaded for every job, since selection always needs it: acquisition
+matches candidates against the gallery, and every Locked frame embeds one
+candidate for the continuity check.
 
 ## Frame resolution — downscaling removed, a deliberate, acknowledged risk
 
@@ -267,16 +429,21 @@ real precision there, which downscaling had been trading away for a
 memory-safety guarantee without ever being benchmarked against the
 alternative.
 
-Worth being direct about what removing it actually reintroduces:
-`core/preprocessing.py`'s `frames_for_window` holds up to 150
-full-resolution frames per window in one list, regardless of which model
-consumes them — at 1080p that's ~930MB, at 4K ~3.7GB, held raw before any
-inference starts. This is the exact memory profile that was directly
-confirmed (via `journalctl`/OOM-killer forensics) to have caused a real
-crash on the MeTRAbs branch, and downscaling was the fix. That risk is
-real again now, unmitigated — a live, accepted tradeoff made in exchange
-for accuracy, not a closed question, and worth revisiting if this branch
-sees a crash resembling that one.
+Removing it did reintroduce a real memory risk, since
+`core/preprocessing.py`'s `frames_for_window` used to hold up to 150
+full-resolution frames per window in one list — at 1080p ~930MB (measured:
+6.22MB per frame), at 4K ~3.7GB, held raw before any inference started.
+That is the exact profile confirmed (via `journalctl`/OOM-killer
+forensics) to have crashed the MeTRAbs branch, and downscaling had been
+the fix.
+
+That risk is now closed by a different route: `frames_for_window` streams,
+so one decoded frame is alive at a time rather than a window's worth. The
+peak fell from ~933MB to ~6MB per window without touching resolution, so
+the accuracy that motivated removing the downscale is kept. Streaming is
+also what makes the window pool viable — see _process_windows_pooled;
+four unstreamed windows in flight would be ~3.7GB of frames on top of
+~489MB of models per process.
 
 Coordinates come back from the landmarker already normalised to [0, 1]
 (not raw pixels, unlike MeTRAbs's output) — this was already resolution
@@ -318,7 +485,10 @@ that's still true here, and should not assume mm either.
 from __future__ import annotations
 
 import math
+import multiprocessing
 import urllib.request
+from collections.abc import Iterator
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import NamedTuple, Optional
 
@@ -364,19 +534,205 @@ _POSE_MODEL_URL = (
     "pose_landmarker_full/float16/latest/pose_landmarker_full.task"
 )
 
-_FRAME_CENTER = (0.5, 0.5)
-
 # Same ContentDetector default CameraWorker uses (core/camera_worker.py) —
 # not shared/imported from there deliberately, see _detect_scene_cuts.
 _SCENE_CUT_THRESHOLD = 27.0
 
 # If the nearest-to-ref_pos candidate is farther than this (normalised
 # [0,1] frame-fraction distance) from the last known position, it's treated
-# as implausible — track loss, not a real continuation. A job with no
-# gallery re-votes by centrality; a job with a gallery drops the lock and
-# re-enters Searching instead (see module docstring's "Speaker
-# re-identification"). Starting value, not empirically tuned.
+# as implausible — track loss, not a real continuation. The lock is dropped
+# and the frame re-anchored against the gallery. It is deliberately a
+# heuristic that can only *reject*: it invalidates a lock but never chooses
+# who holds it. Starting value, not empirically tuned.
 _MAX_TRACK_JUMP = 0.3
+
+# Frame-normalised centre, for the gallery tie-break in _gallery_match —
+# consulted only when two or more candidates have *already* cleared the
+# gallery threshold. See module docstring's "Speaker selection" for why this
+# is not the centrality vote that was removed.
+_FRAME_CENTER = (0.5, 0.5)
+
+# --- Tracklets (see module docstring's "Tracklet selection") -------------
+# Minimum box-overlap for a detection to continue an existing tracklet.
+# Deliberately loose: a speaker walking at 30fps barely moves between
+# frames, so anything this low is a continuation, and the alternative
+# (starting a new tracklet) is the failure that matters — it fragments her
+# into stubs that lose to the projection's single long track.
+_TRACK_IOU_MIN = 0.3
+
+# How many consecutive frames a tracklet survives with no detection before
+# it is closed. This is load-bearing rather than a tidiness parameter: the
+# speaker's detectability swings with her pose (measured 0.64 with arms
+# raised, 0.162 with them down, against a 0.1 detector floor), so she
+# drops out repeatedly. A short gap tolerance shatters her into stubs
+# while the static projection stays one clean track, and any criterion
+# that prefers longer tracks then picks the screen. One second at 30fps.
+_TRACK_MAX_GAP_FRAMES = 30
+
+# Detections a tracklet needs before it may be *selected*. A sanity floor
+# against single-frame noise, not a preference for long tracks — the
+# speaker is sometimes detected only briefly in a projection scene, so
+# raising this hands those scenes to the screen. Starting value, expected
+# to need tuning against measured tracklet lengths.
+_TRACK_MIN_SUPPORT = 10
+
+# Identity crops are taken every Nth frame while scanning a scene. Each
+# costs a mask build (~4.8ms), which the rest of that pass deliberately
+# avoids by working on boxes alone, so they are sampled rather than taken
+# for every detection.
+_TRACK_ID_STRIDE = 10
+
+# How many of a tracklet's detections are embedded to decide its identity.
+# Identity is a property of the track, not the frame: sampling a handful
+# costs a fraction of embedding every candidate in every frame, which is
+# what makes this affordable at _CONF_THRESHOLD = 0.1 (10-20 detections
+# per frame).
+_TRACK_ID_SAMPLES = 5
+
+
+def _scene_index(ts: float, cuts: list[float]) -> int:
+    """Which scene a timestamp falls in. `cuts` are scene *start* times as
+    _detect_scene_cuts returns them (cuts[0] is 0.0), so scene i spans
+    [cuts[i], cuts[i+1]).
+
+    Both the gallery builder and this worker derive scenes from the same
+    _detect_scene_cuts call, which is what lets a scene index mean the same
+    thing on both sides. That coupling is load-bearing: changing this
+    worker's scene detection without changing the dashboard's would
+    silently repoint every stored scene index at a different scene.
+    """
+    lo, hi = 0, len(cuts)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if cuts[mid] <= ts:
+            lo = mid + 1
+        else:
+            hi = mid
+    return max(0, lo - 1)
+
+
+def _scene_bounds(
+    scene_idx: int, cuts: list[float], duration_s: float,
+) -> tuple[float, float]:
+    """[start, end) of one scene. The last scene runs to the video's end."""
+    start = cuts[scene_idx] if scene_idx < len(cuts) else 0.0
+    end = cuts[scene_idx + 1] if scene_idx + 1 < len(cuts) else duration_s
+    return start, end
+
+
+def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    iw, ih = max(0, ix1 - ix0), max(0, iy1 - iy0)
+    inter = iw * ih
+    if inter == 0:
+        return 0.0
+    union = (ax1 - ax0) * (ay1 - ay0) + (bx1 - bx0) * (by1 - by0) - inter
+    return inter / union if union > 0 else 0.0
+
+
+class _Tracklet:
+    """One candidate's path through a scene: frame index -> detection box.
+
+    Deliberately holds boxes only, never masks or frames. A scene's worth
+    of boxes is a few kilobytes and is safe to buffer, cache in Redis and
+    hand between processes; a scene's worth of masks would be gigabytes.
+    """
+
+    __slots__ = ("boxes", "last_frame", "score")
+
+    def __init__(self, frame_idx: int, box: tuple[int, int, int, int]):
+        self.boxes: dict[int, tuple[int, int, int, int]] = {frame_idx: box}
+        self.last_frame = frame_idx
+        self.score: Optional[float] = None      # gallery similarity, set later
+
+    def add(self, frame_idx: int, box: tuple[int, int, int, int]) -> None:
+        self.boxes[frame_idx] = box
+        self.last_frame = frame_idx
+
+    @property
+    def support(self) -> int:
+        return len(self.boxes)
+
+    def median_centre_distance(self, frame_w: int, frame_h: int) -> float:
+        """Median distance of this track's boxes from the frame centre.
+
+        Median rather than mean so one frame catching the speaker at the
+        edge of frame mid-stride doesn't drag the whole track's score, and
+        because it is length-independent — a 4-frame track of hers is
+        judged on the same footing as a 200-frame track of the screen.
+        """
+        return float(np.median([
+            _dist(_box_center(b, frame_w, frame_h), _FRAME_CENTER)
+            for b in self.boxes.values()
+        ]))
+
+
+def _associate(per_frame_boxes: list[tuple[int, list]]) -> list[_Tracklet]:
+    """Links per-frame detection boxes into tracklets by overlap.
+
+    Greedy highest-overlap-first matching, which is enough here: the
+    subjects in question are a person walking and a projection that barely
+    moves, not a crowd crossing paths. `per_frame_boxes` is
+    [(frame_idx, [box, ...]), ...] in increasing frame order.
+
+    Purely geometric — no embeddings, no model. That is what makes it
+    affordable to run over every frame of a scene; identity is decided
+    per tracklet afterwards.
+    """
+    tracks: list[_Tracklet] = []
+    for frame_idx, boxes in per_frame_boxes:
+        live = [t for t in tracks if frame_idx - t.last_frame <= _TRACK_MAX_GAP_FRAMES]
+        pairs = sorted(
+            ((_iou(t.boxes[t.last_frame], b), ti, bi)
+             for ti, t in enumerate(live) for bi, b in enumerate(boxes)),
+            key=lambda p: -p[0],
+        )
+        used_t: set[int] = set()
+        used_b: set[int] = set()
+        for score, ti, bi in pairs:
+            if score < _TRACK_IOU_MIN or ti in used_t or bi in used_b:
+                continue
+            live[ti].add(frame_idx, boxes[bi])
+            used_t.add(ti)
+            used_b.add(bi)
+        for bi, b in enumerate(boxes):
+            if bi not in used_b:
+                tracks.append(_Tracklet(frame_idx, b))
+    return tracks
+
+
+def _select_tracklet(
+    tracks: list[_Tracklet], frame_w: int, frame_h: int,
+) -> Optional[_Tracklet]:
+    """Picks the speaker's tracklet, or None if the scene is unambiguous
+    and the caller should use the ordinary per-frame path.
+
+    Returns a track only when **two or more** tracklets pass the gallery,
+    which is the live-relay case: the speaker and her projection are the
+    same person, so both match legitimately and appearance cannot separate
+    them. Position can — screens hang above and beside the stage — so the
+    most central track wins, exactly as _gallery_match's per-frame
+    tie-break does, but decided once from the whole scene instead of
+    re-decided every frame.
+
+    Deciding once is the point. Per-frame selection alternates with
+    whether she happened to be detected in that frame, which is what makes
+    the track jump between her and the screen; a scene-level decision
+    cannot alternate, and frames where the chosen track has no detection
+    simply come out empty.
+    """
+    passing = [
+        t for t in tracks
+        if t.score is not None
+        and t.score > _GALLERY_MATCH_THRESHOLD
+        and t.support >= _TRACK_MIN_SUPPORT
+    ]
+    if len(passing) < 2:
+        return None
+    return min(passing, key=lambda t: t.median_centre_distance(frame_w, frame_h))
 
 # --- Speaker re-identification (gallery-based) — see module docstring ---
 # Model loading, crop extraction, and embedding math itself all live in
@@ -384,20 +740,138 @@ _MAX_TRACK_JUMP = 0.3
 # gallery confirmation flow — see that file's own docstring for why this
 # is deliberately factored out rather than duplicated here.
 
-# How many of the gallery's per-exemplar similarity scores to average when
-# deciding whether a live candidate matches — measures "does this match
-# *any* of our confirmed looks" rather than diluting across every look the
-# gallery happens to contain. Chosen provisionally (see module docstring's
-# "Speaker re-identification" for why); revisit once real same-frame
-# multi-person footage exists to validate it against.
-_GALLERY_MATCH_TOP_K = 3
+# --- Lock continuity ----------------------------------------------------
+# While Locked, a candidate is verified against the *previous accepted
+# frame* rather than against the gallery. Consecutive frames of the same
+# person are near-identical (measured: median cosine 0.987 between adjacent
+# frames, 0.943 at the 5th percentile), so this is a much sharper signal
+# than gallery similarity — and, crucially, it does not depend on the
+# gallery happening to hold the speaker's current look.
+#
+# That last point is what the gallery structurally cannot do. A gallery is
+# a set of discrete snapshots while appearance varies continuously, so a
+# frame falling between two held looks scores below both. Measured on real
+# footage, 50 of 300 frames (17%) were dropped that way with per-frame
+# gallery verification; continuity recovers all of them, because each is
+# ~0.99 similar to its own neighbour even when it is only ~0.80 similar to
+# anything in the gallery.
+#
+# 0.85 rather than 0.90: the genuine mid-lease failures measured on real
+# footage sat at 0.867/0.887/0.893 — ordinary frames differing from their
+# neighbour by a combination of motion blur, mask wobble and pose, none
+# individually large. A known impostor scores ~0.5 against a previous
+# speaker frame, so the margin against a real intruder remains wide.
+_CONTINUITY_THRESHOLD = 0.80
 
-# Minimum top-K mean similarity for a Searching-state candidate to be
-# accepted as the speaker. Currently reuses gallery-building's own
-# redundancy threshold (gamma) as a starting point — see module
-# docstring for why that's not the same decision and this value should be
-# independently revisited.
-_GALLERY_MATCH_THRESHOLD = 0.85
+# How many frames a lock may run on continuity alone before it must be
+# re-anchored against the gallery. Continuity walks its reference forward
+# every frame, so errors would otherwise compound with nothing to pull them
+# back — the same self-reinforcing shape as VIDEO mode's ROI latching. This
+# is not hypothetical: a frame scoring only 0.819 against the gallery (below
+# the match threshold) was observed being admitted by continuity at 0.975
+# and then serving as the reference for the next frame. Similarity to a
+# frame one second earlier is 0.897 median and two seconds earlier 0.796, so
+# ~1s is about where the tracked appearance has meaningfully moved.
+_LOCK_LEASE_FRAMES = 30
+
+# Minimum nearest-exemplar similarity for a candidate to be accepted as
+# the speaker — used by both Searching and Locked verification (see
+# _gallery_match, which is the single place pooling is decided).
+# Reuses gallery-building's own redundancy threshold (gamma), which is now
+# a defensible reuse rather than a placeholder: both sides ask the same
+# max-pooled question, so the two halves of the system agree on what
+# "similar enough" means. Still worth calibrating against real
+# multi-person footage.
+_GALLERY_MATCH_THRESHOLD = 0.80
+
+
+# How many worker *processes* share out a job's windows. 1 disables the
+# pool and runs everything inline, which is what you want for debugging (a
+# traceback from a pool child is a pickled shadow of the real one).
+#
+# 4 rather than 6 on a 6-physical-core machine: measured throughput was
+# 4.63 frames/s at one process, 8.13 at two, 11.17 at four and 13.01 at
+# six, so the last two processes buy 1.16x for 50% more memory and leave
+# nothing for the three other workers Orchestrator._run_parallel is running
+# alongside this one.
+#
+# Processes rather than threads twice over. The GIL would serialise the
+# non-inference half of the loop; and the models themselves scale badly
+# with threads — the detector graph only reaches ~2x across six threads
+# (160ms -> 79ms) while OSNet is fastest single-threaded — so N
+# single-threaded processes do far more total work than one N-threaded one.
+_POOL_PROCESSES = 4
+
+# Per-process thread caps for pool children. Every library here sizes its
+# pool for a machine it assumes it owns, and four such processes on six
+# cores would oversubscribe several times over.
+_POOL_THREADS_PER_PROCESS = 1
+
+# Set in each pool child by _pool_init and read by _pool_process_window.
+# Module-level because ProcessPoolExecutor's initializer has nowhere else
+# to leave state, and because "spawn" gives every child a fresh import of
+# this module, so there is no cross-process sharing to worry about.
+_POOL_STATE: dict = {}
+
+
+def _pool_init(gallery: np.ndarray, job_id: str, all_cuts: list[float]) -> None:
+    """Runs once per pool child: caps threads, then loads the three models
+    that child will reuse for every window it is handed.
+
+    The gallery, job id and cut list arrive here rather than as per-window
+    arguments because they are the same for the whole job — passing them
+    per task would re-pickle ~140KB several hundred times for nothing.
+    """
+    import cv2 as _cv2
+
+    _cv2.setNumThreads(_POOL_THREADS_PER_PROCESS)
+
+    # A child now gets its own store, solely to share per-scene tracklet
+    # decisions with its siblings (see _scene_decision). Results still come
+    # back to the parent to be written, so this does not make children
+    # general writers: scene decisions are write-once and identical
+    # whoever computes them, which is the one safe shape for concurrent
+    # writes from parallel children. A store that cannot be reached is
+    # not fatal — decisions are simply recomputed per window.
+    try:
+        store = FeatureStore()
+    except Exception as exc:
+        logger.warning(f"[gesture] pool child has no store ({exc}); "
+                       "scene decisions will not be shared")
+        store = None
+
+    worker = GestureWorker(store=store)
+    worker._open_landmarker()
+    worker._detector = _detector.load_detector(
+        intra_op_threads=_POOL_THREADS_PER_PROCESS
+    )
+    worker._ensure_reid_model()          # also caps torch to one thread
+
+    # Deliberately no teardown hook for the landmarker. ProcessPoolExecutor
+    # offers none, and atexit does not work here: MediaPipe's close()
+    # dispatches through a ThreadPoolExecutor, and concurrent.futures
+    # registers its own shutdown via threading._register_atexit, which
+    # CPython runs *before* ordinary atexit callbacks. Registering
+    # worker.close therefore cannot succeed — it raises "cannot schedule
+    # new futures after shutdown" on every child, every time (observed, not
+    # theorised). Letting the process exit reclaims the native resources
+    # anyway, and a child builds exactly one landmarker for its whole life,
+    # so there is nothing here that leaks while the process is running.
+    _POOL_STATE["worker"] = worker
+    _POOL_STATE["gallery"] = gallery
+    _POOL_STATE["job_id"] = job_id
+    _POOL_STATE["all_cuts"] = all_cuts
+
+
+def _pool_process_window(
+    meta: VideoMeta, start_s: float, end_s: float, window_cuts: list[float],
+) -> GestureFeatures:
+    """One window, in a pool child. Module-level and taking only picklable
+    arguments, because that is what ProcessPoolExecutor can dispatch."""
+    return _POOL_STATE["worker"]._process_window(
+        meta, start_s, end_s, window_cuts, _POOL_STATE["gallery"],
+        job_id=_POOL_STATE["job_id"], all_cuts=_POOL_STATE["all_cuts"],
+    )
 
 
 class _MappedLandmark(NamedTuple):
@@ -430,52 +904,87 @@ def _box_center(
     return ((x0 + x1) / 2 / frame_w, (y0 + y1) / 2 / frame_h)
 
 
-def _letterbox_crop(
+# How far the square pose crop extends beyond the detector box. Measured,
+# and the exact value matters less than being clear of 1.0: on 25 frames
+# where MediaPipe returned no pose at all, a square region of the *image*
+# recovered 0/25 at 1.0x but 25/25 at 1.15x and again at 1.5x-2.5x, with a
+# non-monotonic dip to 16/25 at 1.3x. 1.5x sits in the flat, reliable band
+# rather than on the edge of the 1.15x cliff.
+_POSE_CROP_SCALE = 1.5
+
+
+def _square_crop(
     rgb: np.ndarray, box: tuple[int, int, int, int],
-) -> tuple[np.ndarray, int, int, int]:
+) -> tuple[np.ndarray, int, int]:
     """
-    Cuts `box` out of the frame and pads it into a square canvas, without
-    rescaling. Returns (square, side, off_x, off_y) — the three values
+    Cuts a square region *of the frame* centred on `box` and expanded by
+    _POSE_CROP_SCALE. Returns (crop, origin_x, origin_y) — the two offsets
     _crop_norm_to_frame_norm needs to invert this.
 
-    Square, padded, and *not* stretched, for three separate reasons:
-      - MediaPipe's landmark-projection step assumes a square ROI when it
-        isn't handed IMAGE_DIMENSIONS (the "Using NORM_RECT without
-        IMAGE_DIMENSIONS" warning it logs); a square input makes that
-        assumption true rather than approximately true.
-      - Stretching a person changes their apparent proportions, which is
-        off-distribution for a model trained on real photographs.
-      - `pose_world_landmarks` — the basis for every angle in
-        core/fusion_engine.py — is estimated from apparent geometry, so
-        anisotropic scaling would bias yaw/pitch systematically rather
-        than just adding noise.
+    ## Why a region of the image, not a padded box
 
-    No resize happens here: the square is max(box_w, box_h) at native
-    resolution, so a small distant speaker stays exactly as many pixels as
-    the frame gave us. MediaPipe rescales to its own input internally.
+    This replaced a letterbox crop that cut out the box exactly and padded
+    it to square with black. That failed badly on tall, thin subjects: a
+    distant standing speaker gives a box like 76x302, so padding to a
+    302x302 square makes **75% of MediaPipe's input black**, and BlazePose
+    — trained on photographs — has nothing to work with. Measured on real
+    footage, that crop returned no pose at all on 25 consecutive frames
+    where detection, mask, gallery match and continuity had every passed
+    cleanly (detector confidence 0.82-0.86, gallery similarity
+    0.854-0.942). Taking the same-sized square from the image instead
+    recovers all 25.
+
+    Note the fix is *what fills the square*, not merely its size: a
+    1.0x-scaled region of the image is exactly as large as the padded one
+    and still recovers 0/25, so the model needs genuine surrounding
+    context, not just fewer black pixels.
+
+    Squareness is kept for the same three reasons the letterbox version
+    had it — MediaPipe's landmark projection assumes a square ROI when not
+    handed IMAGE_DIMENSIONS; stretching a person is off-distribution; and
+    `pose_world_landmarks`, the basis for every angle in
+    core/fusion_engine.py, is estimated from apparent geometry, so
+    anisotropic scaling would bias yaw/pitch rather than just add noise.
+
+    Near a frame edge the square is **slid inward** rather than clipped,
+    so it stays square and stays full of real pixels. Only a square larger
+    than the frame itself is truncated, which is why the caller must use
+    the returned crop's actual shape rather than assuming it.
+
+    No resize happens here: the region is taken at native resolution, so a
+    small distant speaker keeps exactly the pixels the frame gave us.
+    MediaPipe rescales to its own input internally.
     """
+    h, w = rgb.shape[:2]
     x0, y0, x1, y1 = box
-    crop = rgb[y0:y1, x0:x1]
-    bh, bw = crop.shape[:2]
-    side = max(bw, bh)
-    square = np.zeros((side, side, 3), dtype=rgb.dtype)
-    off_x, off_y = (side - bw) // 2, (side - bh) // 2
-    square[off_y:off_y + bh, off_x:off_x + bw] = crop
-    return np.ascontiguousarray(square), side, off_x, off_y
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    side = min(max(x1 - x0, y1 - y0) * _POSE_CROP_SCALE, float(w), float(h))
+    half = side / 2.0
+    # Slide the centre so the square lies fully inside the frame.
+    cx = min(max(cx, half), w - half)
+    cy = min(max(cy, half), h - half)
+    ax, ay = int(round(cx - half)), int(round(cy - half))
+    bx, by = ax + int(round(side)), ay + int(round(side))
+    ax, ay = max(0, ax), max(0, ay)
+    bx, by = min(w, bx), min(h, by)
+    return np.ascontiguousarray(rgb[ay:by, ax:bx]), ax, ay
 
 
 def _crop_norm_to_frame_norm(
     nx: float, ny: float,
-    box: tuple[int, int, int, int], side: int, off_x: int, off_y: int,
+    origin_x: int, origin_y: int, crop_w: int, crop_h: int,
     frame_w: int, frame_h: int,
 ) -> tuple[float, float]:
     """
-    Inverts _letterbox_crop for one landmark: crop-normalised (nx, ny) ->
+    Inverts _square_crop for one landmark: crop-normalised (nx, ny) ->
     frame-normalised. Kept as a pure function, separate from the frame
     loop, precisely because this is the class of arithmetic that fails
-    *silently* — an off-by-one or a forgotten padding offset yields
-    landmarks that are wrong but entirely plausible-looking, with nothing
-    raised anywhere. See tests/test_gesture_crop_mapping.py.
+    *silently* — an off-by-one or a wrong origin yields landmarks that are
+    wrong but entirely plausible-looking, with nothing raised anywhere.
+    See tests/test_gesture_crop_mapping.py.
+
+    `crop_w`/`crop_h` come from the returned crop's real shape rather than
+    the requested side, since a square larger than the frame is truncated.
 
     Coordinates are deliberately not clamped to [0, 1]: MediaPipe
     legitimately extrapolates landmarks outside its input (a speaker whose
@@ -483,8 +992,8 @@ def _crop_norm_to_frame_norm(
     the border as if they had been observed there. `visibility` is what
     downstream code uses to judge them.
     """
-    px = box[0] + nx * side - off_x
-    py = box[1] + ny * side - off_y
+    px = origin_x + nx * crop_w
+    py = origin_y + ny * crop_h
     return px / frame_w, py / frame_h
 
 
@@ -501,7 +1010,10 @@ def _ensure_model(path: Path, url: str, name: str) -> None:
 
 
 class GestureWorker:
-    def __init__(self, store: FeatureStore):
+    def __init__(self, store: Optional[FeatureStore]):
+        # None only for a pool child (see _pool_init): it computes window
+        # features and hands them back to the parent, which owns every
+        # write. Anything calling process_job needs a real store.
         self.store = store
         self._pose_landmarker = None  # per-job, see process_job
         self._reid_model = None  # per-worker-instance, lazy — see _ensure_reid_model
@@ -549,6 +1061,7 @@ class GestureWorker:
                 running_mode=vision.RunningMode.IMAGE,
                 num_poses=1,
                 output_segmentation_masks=False,
+                min_pose_detection_confidence = 0.60,
             )
         )
         self._mp = mp  # stashed for mp.Image/mp.ImageFormat use in the per-frame loop
@@ -559,9 +1072,17 @@ class GestureWorker:
         way BulkOrchestrator already keeps one GestureWorker warm across
         every video. Never called at all for a job with no gallery. See
         workers/_reid.py for the actual loading logic, shared with the
-        dashboard's gallery-building flow."""
+        dashboard's gallery-building flow.
+
+        The thread cap is taken here rather than inside load_reid_model
+        because it is process-global: this worker wants it (OSNet is one of
+        three models taking turns on the same cores every frame), the
+        dashboard's gallery flow has no such contention, and VerbalWorker's
+        locally-loaded SenseVoice would rather not have it. See
+        _reid.limit_torch_threads for the measurements and the tradeoff."""
         if self._reid_model is not None:
             return
+        _reid.limit_torch_threads(1)
         self._reid_model = _reid.load_reid_model()
 
     def _ensure_detector(self) -> None:
@@ -583,39 +1104,121 @@ class GestureWorker:
         windows: list[tuple[float, float]],
     ) -> None:
         logger.info(f"[gesture] Starting job {job_id} — {len(windows)} windows")
+
+        # A gallery is *required*: it is the only thing that can acquire a
+        # lock (see module docstring's "Speaker selection"). Raising rather
+        # than degrading, because the alternative is worse — with no way to
+        # select a subject, every frame would come out empty and the job
+        # would "succeed" with output indistinguishable from a video
+        # containing no people at all. Failing is loud; silently shipping an
+        # empty gesture track is not.
+        #
+        # Checked before scene detection deliberately: that is a full pass
+        # over the video (~3 min on a 40-minute one), and there is no point
+        # paying it for a job that cannot produce anything.
+        gallery_entries = self.store.get_gallery(job_id)
+        if not gallery_entries:
+            raise RuntimeError(
+                f"Job {job_id} has no speaker gallery. Gesture analysis needs one "
+                "to identify the subject — build it in the dashboard's Bulk Upload "
+                "or Live Analysis flow before processing."
+            )
+        gallery = np.array([e.embedding for e in gallery_entries], dtype=np.float32)
+        logger.info(
+            f"[gesture] Job {job_id} has a {len(gallery_entries)}-entry speaker gallery"
+        )
+
         cuts = self._detect_scene_cuts(meta.path)
         logger.info(f"[gesture] Found {len(cuts)} scene cuts (own independent pass)")
+        # Sliced once here, in the parent: one pass over the cut list
+        # instead of one per window, and in pooled mode a child receives
+        # only the cuts for the window it was given.
+        per_window_cuts = [
+            [c for c in cuts if start <= c < end] for start, end in windows
+        ]
 
-        # Empty list (no gallery for this job — single-file upload always,
-        # or a bulk video whose gallery wasn't built) means the heuristic
-        # -only path below, unchanged from before this feature existed —
-        # see module docstring's "Speaker re-identification".
-        gallery_entries = self.store.get_gallery(job_id)
-        gallery: Optional[np.ndarray] = None
-        if gallery_entries:
-            gallery = np.array([e.embedding for e in gallery_entries], dtype=np.float32)
-            logger.info(
-                f"[gesture] Job {job_id} has a {len(gallery_entries)}-entry speaker "
-                "gallery — using gallery-based re-identification, heuristics disabled"
-            )
+        if _POOL_PROCESSES > 1:
+            self._process_windows_pooled(job_id, meta, windows, per_window_cuts, gallery, cuts)
+        else:
+            self._process_windows_inline(job_id, meta, windows, per_window_cuts, gallery, cuts)
+        logger.info(f"[gesture] Job {job_id} complete")
 
+    def _process_windows_inline(
+        self, job_id, meta, windows, per_window_cuts, gallery, cuts,
+    ) -> None:
+        """Every window in this process, in order — the original behaviour,
+        kept for _POOL_PROCESSES == 1. Worth keeping rather than deleting:
+        an exception raised in a pool child reaches the parent as a pickled
+        copy with its traceback flattened to a string, so debugging the
+        frame loop is much easier here."""
         self._open_landmarker()
-        self._ensure_detector()   # unconditional: the detector is now what
-        # finds people at all, for gallery and heuristic jobs alike.
-        if gallery is not None:
-            self._ensure_reid_model()
+        self._ensure_detector()   # the detector is what finds people at all
+        self._ensure_reid_model() # always needed now: both acquisition and
+        # the per-frame continuity check embed candidates.
         try:
             for idx, (start, end) in enumerate(windows):
                 try:
-                    window_cuts = [c for c in cuts if start <= c < end]
-                    features = self._process_window(meta, start, end, window_cuts, gallery)
+                    features = self._process_window(
+                        meta, start, end, per_window_cuts[idx], gallery,
+                        job_id=job_id, all_cuts=cuts,
+                    )
                     self.store.put_gesture(job_id, idx, features)
                     logger.debug(f"[gesture] window {idx} done")
                 except Exception as exc:
                     logger.error(f"[gesture] Window {idx} failed: {exc}")
         finally:
             self._close_landmarker()
-        logger.info(f"[gesture] Job {job_id} complete")
+
+    def _process_windows_pooled(
+        self, job_id, meta, windows, per_window_cuts, gallery, cuts,
+    ) -> None:
+        """Windows fanned out across _POOL_PROCESSES child processes.
+
+        Safe to do at all only because windows are independent: each one
+        re-acquires its own lock from the gallery at its first frame and
+        carries no state in or out (see _process_window's own note on
+        ordering, which the switch to IMAGE mode freed up).
+
+        "spawn", not "fork", and not negotiable: this parent has already
+        loaded onnxruntime, torch and MediaPipe, each with live thread
+        pools, and forking a process with threads mid-flight is a classic
+        way to inherit a lock held by a thread that does not exist in the
+        child. A spawned child imports this module fresh and builds its own
+        models in _pool_init.
+
+        Results come back to the parent to be written, so a child needs no
+        Redis connection and the store keeps a single writer.
+
+        Note this pool runs *inside* one of the four worker threads
+        Orchestrator._run_parallel starts, so briefly there are four
+        gesture processes plus three sibling workers competing. The
+        siblings finish in minutes against this worker's hours, so the
+        overlap is short and not worth scheduling around.
+        """
+        logger.info(
+            f"[gesture] Processing {len(windows)} windows across "
+            f"{_POOL_PROCESSES} processes"
+        )
+        ctx = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(
+            max_workers=_POOL_PROCESSES, mp_context=ctx,
+            initializer=_pool_init, initargs=(gallery, job_id, cuts),
+        ) as pool:
+            futures = {
+                pool.submit(
+                    _pool_process_window, meta, start, end, per_window_cuts[idx],
+                ): idx
+                for idx, (start, end) in enumerate(windows)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    self.store.put_gesture(job_id, idx, future.result())
+                    logger.debug(f"[gesture] window {idx} done")
+                except Exception as exc:
+                    # Same contract as the inline path: one bad window is
+                    # logged and skipped, it does not abort the job.
+                    logger.error(f"[gesture] Window {idx} failed: {exc}")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -644,11 +1247,145 @@ class GestureWorker:
         scene_manager.detect_scenes(video, show_progress=False)
         return [start_tc.get_seconds() for start_tc, _ in scene_manager.get_scene_list()]
 
+    def _scene_decision(
+        self, job_id: str, meta: VideoMeta, scene_idx: int,
+        scene_start: float, scene_end: float, gallery: np.ndarray,
+    ) -> dict:
+        """Cached per-scene speaker-track decision — see _compute_scene_decision.
+
+        Keyed by (job_id, scene_idx) in Redis so that the several windows
+        overlapping one scene agree and compute it once. A store is
+        optional: without one this still works, just without the sharing.
+        """
+        if self.store is not None:
+            try:
+                cached = self.store.get_scene_track(job_id, scene_idx)
+                if cached is not None:
+                    return cached
+            except Exception as exc:          # a cache miss must never be fatal
+                logger.warning(f"[gesture] scene-track cache read failed: {exc}")
+
+        decision = self._compute_scene_decision(meta, scene_start, scene_end, gallery)
+        if self.store is not None:
+            try:
+                self.store.put_scene_track(job_id, scene_idx, decision)
+            except Exception as exc:
+                logger.warning(f"[gesture] scene-track cache write failed: {exc}")
+        return decision
+
+    def _compute_scene_decision(
+        self, meta: VideoMeta, scene_start: float, scene_end: float,
+        gallery: np.ndarray,
+    ) -> dict:
+        """
+        Decides, once for a whole scene, which tracklet is the speaker.
+
+        Returns either `{"ambiguous": False}` — meaning the caller should
+        use the ordinary per-frame path — or `{"ambiguous": True, "boxes":
+        {frame_index: box}}` giving the chosen tracklet's box for every
+        frame it was detected in.
+
+        ## Why a scene-level decision at all
+
+        Per-frame selection alternates with whether the speaker happened to
+        be detected in that frame. She flickers — measured, her detector
+        confidence swings from 0.64 with arms raised to 0.162 with them
+        down — so on a relay scene the track jumps between her and her
+        projection, and the lease re-anchors onto whichever is visible at
+        that instant. A decision made once from the whole scene cannot
+        alternate.
+
+        ## Why this does not double the detector cost
+
+        The obvious objection is that this is a second pass. It is not:
+        the returned boxes are what the caller then uses, so in an
+        ambiguous scene the per-frame path skips detection entirely and the
+        detector still runs exactly once per frame. Only the frames are
+        read twice, and decoding is 2.05ms against detection's 58ms.
+
+        Frames are never retained. Boxes are kept for every frame (a few
+        kilobytes per scene) and a handful of *crops* per tracklet for
+        identity scoring; the frames themselves are released as they
+        stream past, so this does not reopen the memory profile that
+        streaming just closed.
+        """
+        per_frame: list[tuple[int, list]] = []
+        # Crops kept for identity scoring, keyed by the box they came from:
+        # boxes are what _associate works on, and a box identifies its
+        # detection uniquely within a frame.
+        crops: dict[tuple[int, tuple], np.ndarray] = {}
+
+        for ts, bgr in frames_for_window(
+            meta.path, scene_start, scene_end, meta.fps, max_frames=10 ** 9,
+        ):
+            fi = int(round(ts * meta.fps))
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            dets = _detector.detect_people(self._detector, rgb)
+            per_frame.append((fi, [d.box for d in dets]))
+            # Sample sparsely: one crop per detection every _TRACK_ID_STRIDE
+            # frames is plenty to identify a track, and each costs a mask
+            # build (~4.8ms) that the rest of this pass avoids.
+            if fi % _TRACK_ID_STRIDE == 0:
+                for d in dets:
+                    crop = _reid.crop_via_mask(rgb, d.mask, d.box)
+                    if crop is not None:
+                        crops[(fi, d.box)] = crop
+
+        tracks = _associate(per_frame)
+        for t in tracks:
+            samples = [
+                crops[(fi, box)] for fi, box in t.boxes.items()
+                if (fi, box) in crops
+            ][:_TRACK_ID_SAMPLES]
+            if not samples:
+                continue
+            # Max over samples, matching runtime's max-pooled matching:
+            # "does this track ever look like the speaker".
+            t.score = max(
+                _reid.max_similarity(_reid.embed_crop(self._reid_model, c), gallery)
+                for c in samples
+            )
+
+        chosen = _select_tracklet(tracks, meta.width, meta.height)
+        if chosen is None:
+            logger.debug(
+                f"[gesture] scene {scene_start:.1f}-{scene_end:.1f}s: "
+                f"{len(tracks)} tracklets, fewer than 2 passed — per-frame path"
+            )
+            return {"ambiguous": False}
+
+        passers = [t for t in tracks if t.score is not None
+                   and t.score > _GALLERY_MATCH_THRESHOLD
+                   and t.support >= _TRACK_MIN_SUPPORT]
+        logger.info(
+            f"[gesture] scene {scene_start:.1f}-{scene_end:.1f}s: {len(passers)} "
+            f"tracklets passed the gallery; chose the one at median centre "
+            f"distance {chosen.median_centre_distance(meta.width, meta.height):.3f} "
+            f"({chosen.support} frames) over "
+            + ", ".join(
+                f"{t.median_centre_distance(meta.width, meta.height):.3f}"
+                f"({t.support}f, score {t.score:.2f})"
+                for t in passers if t is not chosen
+            )
+        )
+        return {
+            "ambiguous": True,
+            "boxes": {str(fi): list(box) for fi, box in chosen.boxes.items()},
+        }
+
     def _process_window(
         self, meta: VideoMeta, start_s: float, end_s: float, window_cuts: list[float],
         gallery: Optional[np.ndarray],
+        job_id: Optional[str] = None, all_cuts: Optional[list[float]] = None,
     ) -> GestureFeatures:
         """
+        `job_id` and `all_cuts` enable per-scene tracklet selection: the
+        scene a frame belongs to is defined by the *whole* video's cuts,
+        not the few that fall inside this window, and decisions are cached
+        per (job_id, scene_idx) so the several windows overlapping one
+        scene agree. Both optional — without them this falls back to the
+        per-frame path, which is what a caller with no store does.
+
         Window ordering is unconstrained as of the switch to IMAGE mode.
         Under VIDEO mode windows had to be processed in non-decreasing
         start_s order across the whole job — detect_for_video raises
@@ -662,52 +1399,99 @@ class GestureWorker:
         chronologically (core/preprocessing.py's compute_windows builds
         them that way); nothing depends on it here any more.
 
-        gallery is None for a job with no speaker gallery (the heuristic
-        -only path); otherwise an (N, 512) array of L2-normalised
-        exemplar embeddings — see module docstring's "Speaker
-        re-identification".
+        gallery is an (N, 512) array of L2-normalised exemplar embeddings
+        and is always present — process_job raises without one (see module
+        docstring's "Speaker selection").
         """
         raw_frames = frames_for_window(meta.path, start_s, end_s, meta.fps)
-        gesture_frames = self._process_frames(raw_frames, meta, window_cuts, gallery)
+        gesture_frames = self._process_frames(
+            raw_frames, meta, window_cuts, gallery, job_id, all_cuts,
+        )
         return self._aggregate(start_s, end_s, gesture_frames, meta.width, meta.height)
 
     def _process_frames(
         self,
-        raw_frames: list[tuple[float, np.ndarray]],
+        raw_frames: Iterator[tuple[float, np.ndarray]],
         meta: VideoMeta,
         window_cuts: list[float],
         gallery: Optional[np.ndarray],
+        job_id: Optional[str] = None,
+        all_cuts: Optional[list[float]] = None,
     ) -> list[GestureFrame]:
         gesture_frames: list[GestureFrame] = []
-        # None means "no current lock" — for a heuristic-only job (gallery
-        # is None) that means the next frame runs a fresh centrality vote;
-        # for a gallery job it means Searching (see module docstring's
-        # "Speaker re-identification"). Reset every window (never carried
+        # Per-scene tracklet decisions, resolved lazily as the frames cross
+        # into each scene. Function-local on purpose: the pool reuses one
+        # GestureWorker for every window a child handles, so anything kept
+        # on `self` would leak across windows — and because windows are
+        # distributed nondeterministically, that leak would make results
+        # vary run to run. Redis is where cross-window sharing belongs
+        # (see _scene_decision), not worker state.
+        scene_decisions: dict[int, dict] = {}
+        use_scenes = job_id is not None and all_cuts is not None and gallery is not None
+        # None means "no current lock" — the next frame runs Searching,
+        # i.e. a full gallery match (see module docstring's "Speaker
+        # re-identification"). Reset every window (never carried
         # across windows) *and* at every scene cut within a window — see
         # next_cut_idx below — and, for a gallery job only, whenever a
         # tracked position jumps further than plausible (see the
         # _MAX_TRACK_JUMP branch below).
         ref_pos: Optional[tuple[float, float]] = None
+        # Appearance of the last accepted frame, and how many frames have
+        # passed since the lock was last anchored against the gallery.
+        ref_emb: Optional[np.ndarray] = None
+        lock_age = 0
         next_cut_idx = 0
 
-        for frame_idx in range(len(raw_frames)):
-            ts, bgr = raw_frames[frame_idx]
-            raw_frames[frame_idx] = None  # release this frame's raw buffer as
-            # we go, rather than keeping the whole window's raw frames alive
-            # for the entire loop — see module docstring's "Frame
-            # resolution" section: this alone doesn't bound peak memory the
-            # way downscaling used to, it's just not holding onto frames any
-            # longer than each one is actually needed for.
-
+        # raw_frames streams (core/preprocessing.py's frames_for_window is a
+        # generator), so exactly one decoded frame is alive at a time and
+        # this loop never sees the window as a whole. That replaced an
+        # explicit `raw_frames[i] = None` after each read, which dropped
+        # references as it went but could not help with the peak — the list
+        # was fully built before the first frame was ever processed.
+        for frame_idx, (ts, bgr) in enumerate(raw_frames):
             # A cut landing anywhere at-or-before this frame's timestamp
             # invalidates whatever we were tracking — the next frame is a
             # different shot, so "nearest to ref_pos" would be measuring
             # distance in a scene ref_pos was never computed from.
             while next_cut_idx < len(window_cuts) and window_cuts[next_cut_idx] <= ts:
-                ref_pos = None
+                ref_pos, ref_emb, lock_age = None, None, 0
                 next_cut_idx += 1
 
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+            # --- Scene-level tracklet selection ------------------------
+            # If this frame's scene was decided ambiguous (two or more
+            # tracklets matched the gallery — the speaker and her
+            # projection), that decision already names which box is hers
+            # in every frame. Use it and skip everything below: no
+            # detection, no embedding, no lock. Frames the chosen track
+            # does not cover are empty, which is the point — that is what
+            # stops the track jumping to the screen whenever she is missed.
+            if use_scenes:
+                s_idx = _scene_index(ts, all_cuts)
+                if s_idx not in scene_decisions:
+                    s_start, s_end = _scene_bounds(s_idx, all_cuts, meta.duration_s)
+                    scene_decisions[s_idx] = self._scene_decision(
+                        job_id, meta, s_idx, s_start, s_end, gallery,
+                    )
+                decision = scene_decisions[s_idx]
+                if decision.get("ambiguous"):
+                    box = decision.get("boxes", {}).get(str(int(round(ts * meta.fps))))
+                    if box is None:
+                        gesture_frames.append(self._empty_frame(frame_idx, ts))
+                        continue
+                    pose = self._pose_on_crop(
+                        rgb, tuple(box), meta.width, meta.height,
+                    )
+                    if pose is None:
+                        gesture_frames.append(self._empty_frame(frame_idx, ts))
+                        continue
+                    landmarks, world_landmarks = pose
+                    gesture_frames.append(self._build_frame(
+                        frame_idx, ts, landmarks, world_landmarks,
+                        meta.width, meta.height,
+                    ))
+                    continue
 
             # Detection first, pose second — see module docstring's
             # "Detector-first pipeline". Nothing here runs a pose model
@@ -718,49 +1502,62 @@ class GestureWorker:
             detections = _detector.detect_people(self._detector, rgb)
 
             if not detections:
+                ref_pos, ref_emb, lock_age = None, None, 0
                 gesture_frames.append(self._empty_frame(frame_idx, ts))
                 continue
 
             centers = [_box_center(d.box, meta.width, meta.height) for d in detections]
 
-            if ref_pos is None:
-                # Searching (gallery job) / fresh vote (heuristic job) —
-                # see module docstring's "Speaker re-identification".
-                if gallery is not None:
-                    chosen = self._gallery_match(rgb, detections, gallery)
-                    if chosen is None:
-                        gesture_frames.append(self._empty_frame(frame_idx, ts))
-                        continue
-                else:
-                    chosen = min(range(len(centers)), key=lambda i: _dist(centers[i], _FRAME_CENTER))
-            else:
-                chosen = min(range(len(centers)), key=lambda i: _dist(centers[i], ref_pos))
-                # Two independent ways to lose the lock. The jump check is
-                # geometric: an implausible move is more likely a track
-                # switch than real motion. The identity check below is what
-                # makes proximity a *prior* rather than an authority — see
-                # "Lock verification" in the module docstring for the
-                # confirmed bug that motivated it.
-                lost_lock = _dist(centers[chosen], ref_pos) > _MAX_TRACK_JUMP
-                if gallery is not None and not lost_lock:
-                    score = self._score_candidate(rgb, detections[chosen], gallery)
-                    lost_lock = score is None or score < _GALLERY_MATCH_THRESHOLD
+            # Four things can require a gallery anchor on this frame: no
+            # current lock (Searching), the jump guard firing, the lease
+            # expiring, or continuity failing. They all resolve the same
+            # way — match every candidate against the gallery, here, now —
+            # so the anchor is written once below rather than at each
+            # trigger.
+            chosen = None
+            needs_anchor = ref_pos is None
 
-                if lost_lock:
-                    # A heuristic-only job re-votes by centrality; a gallery
-                    # job drops the lock and re-attempts gallery matching
-                    # on this same frame instead — never a centrality
-                    # fallback for a gallery job (see module docstring).
-                    if gallery is not None:
-                        chosen = self._gallery_match(rgb, detections, gallery)
-                        if chosen is None:
-                            ref_pos = None  # explicitly Searching for the
-                            # next frame too, not still "locked" onto the
-                            # stale pre-jump position.
-                            gesture_frames.append(self._empty_frame(frame_idx, ts))
-                            continue
-                    else:
-                        chosen = min(range(len(centers)), key=lambda i: _dist(centers[i], _FRAME_CENTER))
+            if not needs_anchor:
+                chosen = min(range(len(centers)), key=lambda i: _dist(centers[i], ref_pos))
+                # The geometric guard is independent of identity: an
+                # implausible move is more likely a track switch than real
+                # motion, whatever the candidate looks like. It is the one
+                # heuristic left in the selection path, and it only ever
+                # *rejects* — it can invalidate a lock but never choose who
+                # holds it, so it cannot put the wrong person on the track.
+                needs_anchor = (
+                    _dist(centers[chosen], ref_pos) > _MAX_TRACK_JUMP
+                    # The lease bypasses continuity deliberately: it only
+                    # bounds drift if failing it actually breaks the lock.
+                    or lock_age + 1 > _LOCK_LEASE_FRAMES
+                )
+
+            if not needs_anchor:
+                lock_age += 1
+                emb = self._embed_candidate(rgb, detections[chosen])
+                if emb is None or ref_emb is None or (
+                    float(emb @ ref_emb) < _CONTINUITY_THRESHOLD
+                ):
+                    # Continuity failed — fall through to the gallery on
+                    # *this* frame rather than dropping it. A frame the
+                    # gallery still recognises is worth keeping: continuity
+                    # dips on ordinary motion blur and mask wobble (measured
+                    # failures sat at 0.867-0.893), and the gallery catches
+                    # exactly those.
+                    needs_anchor = True
+                else:
+                    ref_emb = emb   # the reference walks with the subject
+
+            if needs_anchor:
+                match = self._gallery_match(rgb, detections, gallery)
+                if match is None:
+                    # Explicitly Searching for the next frame too, not still
+                    # "locked" onto the stale position.
+                    ref_pos, ref_emb, lock_age = None, None, 0
+                    gesture_frames.append(self._empty_frame(frame_idx, ts))
+                    continue
+                chosen, ref_emb = match
+                lock_age = 0
             ref_pos = centers[chosen]
 
             pose = self._pose_on_crop(rgb, detections[chosen].box, meta.width, meta.height)
@@ -790,9 +1587,10 @@ class GestureWorker:
         frame_w: int, frame_h: int,
     ):
         """
-        Runs the single-person landmarker on one detection's letterboxed
-        crop and maps the result back into frame-normalised coordinates.
-        Returns (landmarks, world_landmarks), or None if no pose was found.
+        Runs the single-person landmarker on a square region of the frame
+        around one detection (see _square_crop) and maps the result back
+        into frame-normalised coordinates. Returns (landmarks,
+        world_landmarks), or None if no pose was found.
 
         The returned `landmarks` are plain _MappedLandmark objects rather
         than MediaPipe's own type: their coordinates have been transformed
@@ -804,12 +1602,13 @@ class GestureWorker:
         core/fusion_engine.py is unaffected by this change.
         """
         mp = self._mp
-        square, side, off_x, off_y = _letterbox_crop(rgb, box)
-        if square.size == 0:
+        crop, origin_x, origin_y = _square_crop(rgb, box)
+        if crop.size == 0:
             return None
+        crop_h, crop_w = crop.shape[:2]
 
         result = self._pose_landmarker.detect(
-            mp.Image(image_format=mp.ImageFormat.SRGB, data=square)
+            mp.Image(image_format=mp.ImageFormat.SRGB, data=crop)
         )
         if not result.pose_landmarks:
             return None
@@ -817,7 +1616,7 @@ class GestureWorker:
         mapped = []
         for lm in result.pose_landmarks[0]:
             fx, fy = _crop_norm_to_frame_norm(
-                lm.x, lm.y, box, side, off_x, off_y, frame_w, frame_h,
+                lm.x, lm.y, origin_x, origin_y, crop_w, crop_h, frame_w, frame_h,
             )
             # z is left in MediaPipe's own units, i.e. now scaled relative
             # to the *crop* rather than the frame. Nothing downstream reads
@@ -831,16 +1630,109 @@ class GestureWorker:
 
     def _gallery_match(
         self, rgb: np.ndarray, detections, gallery: np.ndarray,
-    ) -> Optional[int]:
+    ) -> Optional[tuple[int, np.ndarray]]:
         """
         Embeds every detected candidate via its own segmentation-mask
-        crop, scores each against the gallery by top-_GALLERY_MATCH_TOP_K
-        mean cosine similarity, and returns whichever index clears
-        _GALLERY_MATCH_THRESHOLD with the highest score — or None if
-        nobody does (this frame gets treated as "no speaker here", not a
-        guess). See module docstring's "Speaker re-identification"; the
-        actual crop/embed/score math lives in workers/_reid.py, shared
-        with the dashboard's gallery-building flow.
+        crop, scores each against the gallery by nearest-exemplar (max)
+        cosine similarity, and returns `(index, embedding)` for the chosen
+        candidate — or None if nobody clears _GALLERY_MATCH_THRESHOLD (this
+        frame gets treated as "no speaker here", not a guess). See module
+        docstring's "Speaker re-identification"; the actual
+        crop/embed/score math lives in workers/_reid.py, shared with the
+        dashboard's gallery-building flow.
+
+        Which candidate is chosen depends on how many clear the threshold:
+
+          - **none**  -> None.
+          - **one**   -> that one, regardless of where it is in the frame.
+          - **two+**  -> the one nearest the frame centre, *not* the highest
+                         scorer. See "Why centrality breaks ties" below.
+
+        The winner's embedding is returned rather than just its index
+        because the caller needs it as the next continuity reference, and
+        it has already been computed here — re-deriving it would pay a
+        second ~14ms OSNet pass on every anchor.
+
+        ## Why centrality breaks ties
+
+        On TED-style stages the speaker is often relayed live onto a
+        projection screen behind them. That projection is the *same person*,
+        so it matches the gallery legitimately — re-ID cannot reject it, and
+        a better re-ID model would score it higher, not lower. Worse, it is
+        usually a sharp, well-lit close-up while the real speaker is small
+        and distant, so "highest score wins" systematically prefers the
+        screen. Once chosen, continuity then holds it: a static projection
+        is perfectly self-consistent frame to frame.
+
+        Position separates them where appearance cannot. Screens are
+        mounted above and beside the stage; the speaker stands on it. On two
+        frames of such a scene the distances from frame centre were
+        0.057 vs 0.361 and 0.052 vs 0.363 — speaker vs projection, a ~7x
+        margin both times, and mostly *vertical*, which is why it should
+        generalise beyond these shots rather than being a quirk of framing.
+
+        Scored ranking is deliberately discarded among the passers rather
+        than blended with position: the screen's score advantage is exactly
+        the bias being corrected, so weighing it back in would reintroduce
+        it.
+
+        Because every anchor trigger (Searching, jump, lease expiry,
+        continuity failure) resolves here, this also lets the lease repair
+        a wrong lock: if the track has drifted onto the screen, the next
+        re-anchor pulls it back to the stage. A position prior ("nearest
+        the previous ref_pos") would instead preserve the error.
+
+        ## Known limitation, accepted
+
+        The tie-break needs *both* candidates. When the detector finds only
+        the projection there is a single passer and it wins, so the track
+        goes to the screen.
+
+        That is what drove `_CONF_THRESHOLD` down to 0.1. Measured while it
+        was still 0.25: the speaker scored 0.162 — found by YOLO, then
+        discarded by the floor — against the projection's 0.89, and the
+        same speaker scored 0.64 a few seconds later with her arms raised.
+        Her detectability swings ~4x with her pose, so at 0.25 she flickered
+        out of the candidate list entirely; at 0.1 she is admitted.
+
+        Note the detector's confidence is *anti-correlated* with
+        correctness here — a sharp, well-lit, front-facing close-up on a
+        screen outscores a small, dim, side-on figure on a stage — so
+        raising the floor makes this worse, and any rule preferring
+        higher-scoring detections prefers the screen.
+
+        A residue remains: she can still fall below the *gallery* threshold
+        while the sharper projection clears it, and a frame where she is
+        genuinely undetected offers nothing to choose. See the module
+        docstring's "Tracklet selection", which lifts the decision to the
+        scene for exactly that case.
+
+        ## Why max, not a top-K mean
+
+        This used to average the top 3 similarities. The stated reason was
+        noise robustness: requiring several exemplars to agree stops one
+        fluke high score admitting the wrong person. The problem is that the
+        same requirement breaks on a look the gallery only holds once or
+        twice — the mean pulls in the gallery's other, legitimately
+        different looks and drags a genuine match down. Measured on real
+        footage, a correctly-tracked speaker in a scene with one matching
+        exemplar scored 0.66-0.68 under top-K (rejected) versus 0.90-0.97
+        under max (accepted), while a known impostor stayed at 0.47-0.49
+        under both.
+
+        That is not a tuning problem. Gallery-building stops once new looks
+        stop appearing, so rare looks are left with only one or two
+        exemplars at the moment sampling ends — precisely the condition a
+        top-K mean cannot score fairly. Whatever the stopping rule, the
+        gallery will always be thin somewhere.
+
+        The two halves of the system pool *differently* on purpose:
+        building's redundancy check is top-K (a duplicate must resemble
+        several held exemplars — see core/gallery_builder.py's
+        GALLERY_REDUNDANCY_TOP_K), matching here is max (one strong
+        resemblance is enough to be recognised). Different questions, so the
+        asymmetry is intended rather than the silent disagreement it used to
+        be.
 
         Masks come from the detector rather than MediaPipe now. That also
         closes a subtle mismatch: gallery *exemplars* were always built
@@ -850,28 +1742,49 @@ class GestureWorker:
         sides now go through the same detector and the same
         crop_via_mask.
         """
-        best_idx: Optional[int] = None
-        best_score = _GALLERY_MATCH_THRESHOLD
+        h, w = rgb.shape[:2]
+        passing: list[tuple[int, np.ndarray, float]] = []
         for i, det in enumerate(detections):
-            score = self._score_candidate(rgb, det, gallery)
-            if score is not None and score > best_score:
-                best_idx, best_score = i, score
-        return best_idx
+            emb = self._embed_candidate(rgb, det)
+            if emb is None:
+                continue
+            score = _reid.max_similarity(emb, gallery)
+            if score > _GALLERY_MATCH_THRESHOLD:
+                passing.append((i, emb, score))
 
-    def _score_candidate(self, rgb: np.ndarray, det, gallery: np.ndarray) -> Optional[float]:
-        """Top-`_GALLERY_MATCH_TOP_K` mean cosine similarity between one
-        detection and the gallery, or None if the detection's mask is too
-        small/degenerate to crop (see workers/_reid.py's MIN_MASK_PIXELS).
+        if not passing:
+            return None
+        if len(passing) == 1:
+            i, emb, _ = passing[0]
+            return i, emb
 
-        Split out of _gallery_match so the Locked state can verify its
-        single tracked candidate without embedding every other candidate
-        in the frame — one OSNet forward pass per frame instead of one per
-        person."""
-        crop = _reid.crop_via_mask(rgb, det.mask)
+        # Two or more gallery-confirmed candidates: the nearest to frame
+        # centre wins. Score is used only to break an exact distance tie,
+        # so the choice is deterministic.
+        i, emb, _ = min(
+            passing,
+            key=lambda p: (_dist(_box_center(detections[p[0]].box, w, h), _FRAME_CENTER),
+                           -p[2]),
+        )
+        logger.debug(
+            f"[gesture] {len(passing)} candidates cleared the gallery; "
+            f"centrality chose #{i} over "
+            + ", ".join(f"#{p[0]}({p[2]:.2f})" for p in passing if p[0] != i)
+        )
+        return i, emb
+
+    def _embed_candidate(self, rgb: np.ndarray, det) -> Optional[np.ndarray]:
+        """L2-normalised OSNet embedding of one detection's mask crop, or
+        None if the mask is too small/degenerate to crop (workers/_reid.py's
+        MIN_MASK_PIXELS). Shared by gallery scoring and the continuity
+        check so both compare embeddings built exactly the same way.
+
+        The box is passed purely so crop_via_mask can find the mask's extent
+        without scanning the whole frame — it does not change the crop."""
+        crop = _reid.crop_via_mask(rgb, det.mask, det.box)
         if crop is None:
             return None
-        emb = _reid.embed_crop(self._reid_model, crop)
-        return _reid.top_k_similarity(emb, gallery, _GALLERY_MATCH_TOP_K)
+        return _reid.embed_crop(self._reid_model, crop)
 
     @staticmethod
     def _build_frame(

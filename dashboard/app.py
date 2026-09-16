@@ -19,6 +19,7 @@ import uuid as _uuid_module
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote
 
 import dash
 import dash_bootstrap_components as dbc
@@ -41,9 +42,9 @@ from core.bulk_orchestrator import BulkOrchestrator, _resolve_path, load_manifes
 from core.drive_download import download_drive_file
 from core.feature_store import FeatureStore
 from core.gallery_builder import (
-    PLATEAU_STREAK, GalleryBuildState, draw_next_candidate,
-    embed_candidate_from_b64, init_state,
-    record_confirmation, should_stop,
+    PLATEAU_WINDOW, GalleryBuildState, draw_next_candidate,
+    embed_candidate_from_b64, init_state, plateau_target,
+    record_confirmation, redundant_in_window, should_stop,
 )
 from core.models import FusedWindow, HorizontalAngle, VerticalAngle
 from core.orchestrator import Orchestrator
@@ -128,7 +129,7 @@ def _bulk_work_dir() -> str:
 # this doesn't re-accumulate the same unbounded-local-storage problem the
 # upload cleanup elsewhere in this file was written to avoid.
 _BROWSE_CACHE_DIR = Path(os.environ.get("WORK_DIR", "/tmp/mannerism")) / "browse_cache"
-_BROWSE_CACHE_MAX_VIDEOS = 3
+_BROWSE_CACHE_MAX_VIDEOS = 2
 _BROWSE_CACHE_LOCKS: dict[str, threading.Lock] = {}
 _BROWSE_CACHE_LOCKS_GUARD = threading.Lock()
 
@@ -177,6 +178,72 @@ def _serve_browse_video(job_id: str, collection: str) -> flask.Response:
             _evict_browse_cache(keep=cache_path)
 
     return flask.send_from_directory(str(_BROWSE_CACHE_DIR), cache_path.name, conditional=True)
+
+
+# How much of an upload is held in memory at once. The point of the
+# streaming route below is that this is the *only* thing proportional to
+# nothing — a 2GB video and a 6MB one both cost one buffer.
+_UPLOAD_CHUNK_BYTES = 1 << 20   # 1 MiB
+
+
+@server.route("/upload-video", methods=["POST"])
+def upload_video():
+    """Streams an uploaded video straight to disk, a chunk at a time.
+
+    This replaced a `dcc.Upload` component, and the reason is worth
+    recording because the failure was severe and entirely invisible
+    server-side. `dcc.Upload` reads the whole file in the *browser* via
+    FileReader.readAsDataURL and holds it as one base64 JavaScript string,
+    then posts it as JSON. So a 500MB video became a ~667MB string, on top
+    of the raw ArrayBuffer and the JSON payload, all live in one tab at
+    once — and V8 caps a single string at roughly 512MB-1GB anyway. The
+    renderer ran out of memory and Chrome killed the tab; the observable
+    symptom was DevTools disconnecting mid-upload and nothing whatsoever in
+    the server logs, because the request never arrived.
+
+    The server side was no better: `base64.b64decode(contents.split(",")[1])`
+    held the request buffer, a second copy of the b64 string, and the
+    decoded bytes simultaneously — about 3.7x the file size, which is what
+    made a memory-capped container (Docker Desktop's WSL2 VM) fail where a
+    16GB Linux host coped.
+
+    Streaming removes both. The browser hands `fetch`/XHR the `File` object
+    and never materialises it; here, `request.stream` is read in 1MB
+    chunks, so peak memory is the chunk, not the video. A 2GB upload costs
+    the same as a 6MB one.
+
+    Bulk upload deliberately still uses base64 (see handle_manifest_upload)
+    — that path carries a small YAML manifest and reads the videos
+    themselves from disk or Drive by path, which is why it kept working
+    when this did not.
+    """
+    # Never trust a client-supplied path: take the basename only, so
+    # "../../etc/passwd" or an absolute path cannot escape _UPLOAD_DIR.
+    raw_name = unquote(flask.request.headers.get("X-Filename", "")) or "upload.mp4"
+    name = Path(raw_name).name
+    if not name or name in (".", ".."):
+        return flask.jsonify({"error": "invalid filename"}), 400
+
+    _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    dest = _UPLOAD_DIR / name
+    written = 0
+    try:
+        with open(dest, "wb") as fh:
+            while True:
+                chunk = flask.request.stream.read(_UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                written += len(chunk)
+    except Exception as exc:
+        logger.error(f"[dashboard] Upload of {name} failed after {written} bytes: {exc}")
+        return flask.jsonify({"error": str(exc)}), 500
+
+    if written == 0:
+        return flask.jsonify({"error": "empty upload"}), 400
+
+    logger.info(f"[dashboard] Uploaded {name} ({written / 1e6:.1f} MB) -> {dest}")
+    return flask.jsonify({"path": str(dest), "name": name, "bytes": written})
 
 
 @server.route("/video")
@@ -232,6 +299,7 @@ C = {
     "camera":  "#7B5EA7",
     "cursor":  "#E8A838",
     "corpus":  "#4361EE",
+    "transitional": "#0A95EE"
 }
 
 KW_COLOUR = "#00B4D8"  # cyan-teal — distinct from all section colours and cursor amber
@@ -582,10 +650,18 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
             html.Div(style=SECTION_STYLE, children=[
                 section_header("Video Upload", C["muted"], "Drop a video file to begin analysis"),
 
-                dcc.Upload(
-                    id="video-upload",
+                # A plain file input, not dcc.Upload: that component
+                # base64s the whole video into a single JavaScript string
+                # in the browser, which crashed the tab on large files (see
+                # the /upload-video route for the full account). The
+                # clientside callback below streams the File straight to
+                # that route via XHR, so nothing ever holds the video
+                # whole. The input itself is hidden — the styled label is
+                # the click target, keeping the original drop-zone look.
+                html.Label(
+                    htmlFor="video-file-input",
                     children=html.Div([
-                        html.P("Drop a video file here, or click to browse", style={
+                        html.P("Click to choose a video file", style={
                             "fontFamily": "DM Mono, monospace", "fontSize": "12px",
                             "color": C["muted"], "margin": "0 0 4px 0",
                         }),
@@ -594,18 +670,50 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
                             "letterSpacing": "0.1em", "color": C["border"], "margin": "0",
                         }),
                     ], style={"textAlign": "center", "padding": "16px 0"}),
-                    accept="video/*",
-                    multiple=False,
-                    max_size=-1,
                     style={
+                        "display": "block",
                         "width": "100%",
                         "border": f"1px dashed {C['border']}",
                         "borderRadius": "8px",
                         "cursor": "pointer",
-                        "marginBottom": "12px",
+                        "marginBottom": "8px",
                         "backgroundColor": C["bg"],
                     },
                 ),
+                # dcc.Input, not html.Input: only the dcc one reports
+                # `value` back to Dash, which is what triggers the uploader.
+                # It has no `accept` prop (Dash 4.4.1), so the file-type
+                # filter is applied in the clientside callback instead.
+                dcc.Input(
+                    id="video-file-input", type="file",
+                    style={"display": "none"},
+                ),
+                # Upload progress. XHR rather than fetch specifically so
+                # this can exist: fetch exposes no upload-progress event,
+                # and a multi-hundred-MB upload with no feedback is
+                # indistinguishable from a hang — which is exactly how the
+                # old failure presented.
+                html.Div(id="upload-progress-wrap", style={"display": "none",
+                                                           "marginBottom": "12px"},
+                         children=[
+                    html.Div(style={
+                        "width": "100%", "height": "4px", "borderRadius": "2px",
+                        "backgroundColor": C["border"], "overflow": "hidden",
+                    }, children=[
+                        html.Div(id="upload-progress-bar", style={
+                            "width": "0%", "height": "100%",
+                            "backgroundColor": C["muted"], "transition": "width 0.15s",
+                        }),
+                    ]),
+                    html.P(id="upload-progress-text", style={
+                        "fontFamily": "DM Mono, monospace", "fontSize": "10px",
+                        "color": C["muted"], "margin": "4px 0 0 0",
+                    }),
+                ]),
+                # Written by the clientside uploader once the file is on
+                # disk; handle_upload keys off this instead of the old
+                # dcc.Upload contents.
+                dcc.Store(id="uploaded-video-path"),
                 # ── Speaker gallery confirmation (Live Analysis) ────────
                 # Same flow as Bulk Upload's (core/gallery_builder.py,
                 # workers/gesture_worker.py's "Speaker re-identification"),
@@ -1077,6 +1185,128 @@ app.layout = html.Div(style={"backgroundColor": C["bg"], "minHeight": "100vh"}, 
 ])
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Clientside: streaming video upload
+# ─────────────────────────────────────────────────────────────────────────────
+# Streams the chosen File straight to /upload-video and reports progress.
+#
+# The `File` object is handed to xhr.send() untouched, so the browser
+# streams it from disk — it is never read into a string or an ArrayBuffer.
+# That is the entire point: dcc.Upload's FileReader.readAsDataURL held the
+# whole video as one base64 string and killed the tab on large files (see
+# the /upload-video route's docstring).
+#
+# XHR rather than fetch purely for `upload.onprogress`, which fetch does not
+# expose. Without it a large upload looks identical to a hang.
+#
+# Dash gives a clientside callback only the input's `value` (the fake
+# "C:\\fakepath\\name.mp4" the browser reports), never the File itself, so
+# the real object is read off the DOM node. `value` is still the right
+# trigger: it changes whenever a new file is chosen, including re-choosing
+# after a failure.
+clientside_callback(
+    """
+    function(value) {
+        const dc = window.dash_clientside;
+        if (!value) return dc.no_update;
+
+        const input = document.getElementById('video-file-input');
+        const file = input && input.files && input.files[0];
+        if (!file) return dc.no_update;
+
+        // The input has no `accept` attribute to lean on (dcc.Input
+        // exposes none), so the extension check lives here.
+        const OK = ['.mp4', '.mov', '.mkv', '.avi', '.webm'];
+        const lower = file.name.toLowerCase();
+        if (!OK.some((ext) => lower.endsWith(ext))) {
+            const t = document.getElementById('upload-progress-text');
+            const w = document.getElementById('upload-progress-wrap');
+            if (w) w.style.display = 'block';
+            if (t) t.textContent =
+                'Unsupported file type — use MP4, MOV, MKV, AVI or WEBM.';
+            return dc.no_update;
+        }
+
+        // Guard against re-uploading the same selection on a spurious
+        // re-render: Dash re-fires `value` when the component remounts.
+        const tag = file.name + ':' + file.size + ':' + file.lastModified;
+        if (window.__mannerismLastUpload === tag) return dc.no_update;
+        window.__mannerismLastUpload = tag;
+
+        // Re-query on every write rather than caching the nodes: Dash may
+        // re-render this subtree while the upload is in flight, and a
+        // stale reference would silently write to a detached element.
+        const el = (id) => document.getElementById(id);
+        const mb = (b) => (b / 1e6).toFixed(1) + ' MB';
+        const show = (pct, msg) => {
+            const w = el('upload-progress-wrap');
+            const b = el('upload-progress-bar');
+            const t = el('upload-progress-text');
+            if (w) w.style.display = 'block';
+            if (b && pct !== null) b.style.width = pct + '%';
+            if (t) t.textContent = msg;
+        };
+
+        // Paint a visible state immediately. On a local/loopback upload the
+        // browser can hand the whole file to the socket in well under a
+        // second, so onprogress may fire only once at 100% — without this
+        // the indicator looks like it never moved at all.
+        show(0, 'Preparing upload — ' + file.name + ' (' + mb(file.size) + ')…');
+        console.log('[upload] starting', file.name, file.size, 'bytes');
+
+        return new Promise((resolve) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', '/upload-video', true);
+            xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+
+            xhr.upload.onprogress = (e) => {
+                if (!e.lengthComputable) {
+                    show(null, 'Uploading ' + file.name + ' — ' + mb(e.loaded) + ' sent…');
+                    return;
+                }
+                const pct = (e.loaded / e.total) * 100;
+                show(pct.toFixed(1),
+                     'Uploading ' + file.name + ' — ' + mb(e.loaded) +
+                     ' / ' + mb(e.total) + ' (' + pct.toFixed(0) + '%)');
+                console.log('[upload] progress', pct.toFixed(1) + '%');
+            };
+            xhr.onload = () => {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    let data = {};
+                    try { data = JSON.parse(xhr.responseText); } catch (err) {}
+                    console.log('[upload] done', xhr.status, data);
+                    // The upload is the *quick* part. What follows —
+                    // probe, a full scene-detection decode pass, loading
+                    // the detector and OSNet, drawing the first candidate
+                    // — is minutes on a long video and has no progress of
+                    // its own, so say so rather than leaving a finished
+                    // bar that looks stuck.
+                    show(100, 'Uploaded ' + file.name + ' (' + mb(file.size) +
+                              '). Preparing video — scene detection and model ' +
+                              'loading can take a few minutes on a long video…');
+                    resolve(data.path ? {path: data.path, name: data.name} : dc.no_update);
+                } else {
+                    console.error('[upload] failed', xhr.status, xhr.responseText);
+                    show(0, 'Upload failed (HTTP ' + xhr.status + '). Please try again.');
+                    window.__mannerismLastUpload = null;   // allow a retry
+                    resolve(dc.no_update);
+                }
+            };
+            xhr.onerror = () => {
+                console.error('[upload] network error');
+                show(0, 'Upload failed — connection lost.');
+                window.__mannerismLastUpload = null;
+                resolve(dc.no_update);
+            };
+            xhr.send(file);
+        });
+    }
+    """,
+    Output("uploaded-video-path", "data"),
+    Input("video-file-input", "value"),
+    prevent_initial_call=True,
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Clientside: chart click → seek video
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1178,7 +1408,7 @@ clientside_callback(
 _UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/tmp/mannerism/uploads"))
 
 
-def _cleanup_previous_upload() -> None:
+def _cleanup_previous_upload(keep: Optional[str] = None) -> None:
     """Delete the previously uploaded video and its extracted-audio cache.
 
     The dashboard only ever plays back one active video at a time (`_VIDEO_PATH`
@@ -1186,15 +1416,44 @@ def _cleanup_previous_upload() -> None:
     is guaranteed to no longer be needed — nothing else in the codebase ever
     cleans these up for the live-analysis (non-bulk) path, so they'd otherwise
     accumulate on disk with every upload.
+
+    `keep` handles re-uploading a video under a name already on disk. The
+    streaming /upload-video route writes before this runs, and writes to
+    `_UPLOAD_DIR / name`, so in that case old_path *is* the new file:
+    deleting it would destroy what was just uploaded. The video is left
+    alone — being overwritten in place is exactly the intended outcome.
+
+    The extracted audio is a different matter and must still go. It is
+    cached by video *stem* (core/preprocessing.py's extract_audio), and
+    that function returns early when the WAV already exists rather than
+    re-running ffmpeg:
+
+        if out_path.exists():
+            return str(out_path)        # ffmpeg never runs; -y is moot
+
+    So a same-named replacement would silently inherit the previous
+    video's audio, and the job would come out with prosody and verbal
+    features from one video and gesture and camera from another — visible
+    only as an "Audio already extracted" line in the log. Deleting the WAV
+    here forces a genuine re-extraction.
     """
     old_path = _VIDEO_PATH.get("path")
     if not old_path:
         return
+
     audio_path = _orch.work_dir / (Path(old_path).stem + "_audio.wav")
-    for p in (Path(old_path), audio_path):
+    replaced_in_place = bool(keep) and (
+        os.path.abspath(old_path) == os.path.abspath(keep)
+    )
+    # Same name: drop only the stale audio. Different name: the old video
+    # is now orphaned, so it goes too.
+    targets = (audio_path,) if replaced_in_place else (Path(old_path), audio_path)
+
+    for p in targets:
         try:
             if p.exists():
                 p.unlink()
+                logger.info(f"[dashboard] Cleaned up {p}")
         except OSError as exc:
             logger.warning(f"[dashboard] Could not delete {p}: {exc}")
 
@@ -1214,22 +1473,29 @@ def _cleanup_previous_upload() -> None:
     Output("live-gallery-candidate-row", "children"),
     Output("live-gallery-candidates", "data"),
     Output("live-gallery-build-state", "data"),
-    Input("video-upload", "contents"),
-    State("video-upload", "filename"),
+    Input("uploaded-video-path", "data"),
     prevent_initial_call=True,
 )
-def handle_upload(contents, filename):
+def handle_upload(upload_data):
+    """Picks up where the streaming upload left off.
+
+    The video is already on disk by the time this runs — the clientside
+    uploader streamed it to the /upload-video route, which is what keeps a
+    large file out of both the browser's and this process's memory. So this
+    callback receives a path, not bytes, and does no decoding at all.
+    """
     no_change = (dash.no_update,) * 14
-    if not contents:
+    if not upload_data or not upload_data.get("path"):
         return no_change
 
-    _cleanup_previous_upload()
+    video_path = upload_data["path"]
+    if not os.path.exists(video_path):
+        logger.error(f"[dashboard] Upload reported {video_path} but it is not on disk")
+        return no_change
 
-    _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    _, b64 = contents.split(",", 1)
-    video_path = str(_UPLOAD_DIR / filename)
-    with open(video_path, "wb") as fh:
-        fh.write(base64.b64decode(b64))
+    # Must come after the new file exists, and must not delete it — see
+    # _cleanup_previous_upload's `keep`.
+    _cleanup_previous_upload(keep=video_path)
 
     _VIDEO_PATH["path"] = video_path
     video_src = f"/video?t={os.path.getmtime(video_path)}"
@@ -1518,12 +1784,25 @@ def _setup_gallery_for_entry(entries: list[dict], idx: int) -> Optional[dict]:
     return {"entries": entries, "idx": idx, "state": state, "frame_data": frame_data, "label": label}
 
 
+def _plateau_progress(state: GalleryBuildState) -> str:
+    """Progress toward the sliding-window stop, phrased as what it now
+    measures: redundant confirmations within the last PLATEAU_WINDOW.
+    While the window is still filling, say so — the ratio is not yet
+    meaningful and should_stop deliberately won't fire on a partial
+    window."""
+    seen = len(state.recent_verdicts)
+    if seen < PLATEAU_WINDOW:
+        return f'sampling {seen}/{PLATEAU_WINDOW}'
+    return f'redundant {redundant_in_window(state)}/{PLATEAU_WINDOW} (stop at {plateau_target()})'
+
+
 def _gallery_status_text(setup: dict) -> str:
     state: GalleryBuildState = setup["state"]
     n = len(setup["entries"])
     return (
         f'Video {setup["idx"] + 1} of {n}: {setup["label"]} — '
-        f'gallery: {state.entries_confirmed} confirmed · streak {state.streak}/{PLATEAU_STREAK}'
+        f'gallery: {state.entries_confirmed} confirmed · '
+        f'{_plateau_progress(state)}'
     )
 
 
@@ -1540,7 +1819,7 @@ def _gallery_status_text(setup: dict) -> str:
 # (collection, drive_url, "move to the next one") that doesn't apply here.
 
 def _live_gallery_status_text(state: GalleryBuildState) -> str:
-    return f'Gallery: {state.entries_confirmed} confirmed · streak {state.streak}/{PLATEAU_STREAK}'
+    return f'Gallery: {state.entries_confirmed} confirmed · {_plateau_progress(state)}'
 
 
 def _setup_live_gallery(video_path: str) -> dict:
@@ -2643,7 +2922,7 @@ def c_shot(data, ct, occ):
 # near-neutral grey, which shares the same chart.
 H_ANGLE_COLOURS = {
     HorizontalAngle.FRONTAL:      C["prosody"],
-    HorizontalAngle.TRANSITIONAL: "#9C8F3A",
+    HorizontalAngle.TRANSITIONAL: C["transitional"],
     HorizontalAngle.OBLIQUE:      C["cursor"],
     HorizontalAngle.UNKNOWN:      C["muted"],
 }

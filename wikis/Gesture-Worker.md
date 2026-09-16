@@ -25,24 +25,136 @@ For every time window, `GestureWorker`:
 
 1. Reads frames from the video for that window
    (`frames_for_window`, [`core/preprocessing.py`](../core/preprocessing.py)).
-2. Runs **MediaPipe Tasks' PoseLandmarker** (multi-person, 33-point
-   BlazePose topology) on each frame, in `VIDEO` running mode — not
-   `IMAGE` mode — so MediaPipe uses its own internal frame-to-frame
-   tracking rather than re-detecting from scratch every frame (faster, and
-   reduces jitter — see "VIDEO mode" below).
-3. Selects which detected person is "the subject" — same design as the
-   main branch's MeTRAbs implementation, ported over: most-central at a
-   window's first frame or right after a scene cut (voted once), then
-   nearest-to-last-known-position otherwise, with a max-jump ambiguity
-   guard and its own independent scene-cut detection pass. See "Speaker
-   selection" below for the one real difference (no bounding box).
-4. Computes kinematic features (velocity, amplitude, handedness) from only
+2. Runs the **YOLO11n-seg** person detector on each frame, getting a box
+   and segmentation mask per person (`workers/_detector.py`). No pose model
+   runs at this stage.
+3. Selects which detection is "the subject" — by matching candidates
+   against a human-confirmed **speaker gallery**, then holding the track by
+   frame-to-frame appearance continuity, with a max-jump guard and its own
+   independent scene-cut detection pass. See "Working" and "Speaker
+   selection" below.
+4. Runs **MediaPipe Tasks' PoseLandmarker** (single-person, 33-point
+   BlazePose topology, `IMAGE` running mode — see "IMAGE mode" below) on
+   **only that one detection's crop**, mapping the landmarks back into
+   frame coordinates.
+5. Computes kinematic features (velocity, amplitude, handedness) from only
    the selected person's landmarks — everyone else discarded before a
    `GestureFrame` is ever built, same as before.
 
 No hand/finger model runs — `GestureFrame.left_hand`/`right_hand` are
 always empty, same as on the main branch, though for a different reason
 (see "Hand landmarks — tried, removed" below).
+
+## Working
+
+End to end, from gallery construction to a single processed frame. Constants
+named here are the live values in
+[`core/gallery_builder.py`](../core/gallery_builder.py) and
+[`workers/gesture_worker.py`](../workers/gesture_worker.py).
+
+### Phase 1 — Gallery construction (dashboard, interactive)
+
+Runs once per video, before any processing, in both the Bulk Upload and
+Live Analysis flows.
+
+1. **Scene detection.** PySceneDetect `ContentDetector(threshold=27.0)`
+   splits the video into scenes.
+2. **Sampling schedule.** Each scene gets `round(duration / 5s)` slots,
+   clamped to `[1, 6]`. Slots are laid out in *interleaved sweeps* — every
+   scene gets its 1st slot before any scene gets its 2nd — shuffled within
+   each sweep. Each slot owns a distinct, non-overlapping sub-interval of
+   its scene's timeline, so coverage of a long scene is structural rather
+   than left to chance.
+3. **Draw a candidate.** `draw_next_candidate` pops one slot and samples a
+   random, not-yet-shown frame index inside that slot's sub-interval,
+   retrying up to 4 times *within the same slot* if nobody is detected.
+4. **Show candidates.** YOLO11n-seg returns boxes + masks; `crop_via_mask`
+   produces background-zeroed crops taken from *the mask's own extent*,
+   not the detector box. The researcher clicks the speaker, or skips.
+5. **Record.** OSNet embeds the clicked crop (512-d, L2-normalised) into
+   Redis at `job:{id}:gallery:{n}`. It is marked **redundant** if
+   `top_k(3) >= 0.85` against what is already held — but stored either way;
+   redundancy only drives stopping.
+6. **Stop** when 16 of the last 20 confirmations were redundant (sliding
+   window), or at 70 entries (hard cap), or when the researcher says so.
+   Floor of 3.
+
+### Phase 2 — Runtime
+
+**Job setup.** `process_job` **raises if there is no gallery** — it is the
+only thing that can acquire a lock — and checks that *before* scene
+detection, so a doomed job does not pay a full video pass first. Then its
+own independent PySceneDetect pass, and loads landmarker, detector and
+OSNet.
+
+**Per window** (5s): `frames_for_window` reads frames, capped at 150. So
+30fps footage is processed every frame; 60fps is decimated by 2.
+
+**Per scene, before its frames are processed:** the scene is streamed once,
+every detection is linked into tracklets geometrically, each tracklet is
+scored against the gallery, and if **two or more pass** the scene is
+"ambiguous" — the speaker plus her projection. The most central tracklet by
+median distance is chosen and its per-frame boxes are cached in Redis under
+`(job_id, scene_idx)`. Frames in such a scene then skip steps 2-4 entirely:
+the box is already known, so no detector and no re-ID run, and frames the
+chosen track does not cover are emitted empty. See "Tracklet selection".
+
+**Per frame** (scenes that are *not* ambiguous):
+
+1. **Scene cut?** Drop the lock (`ref_pos`, `ref_emb`, `lock_age` reset).
+2. **Detect.** YOLO11n-seg, 640x640 letterboxed, confidence >= 0.1, at
+   most 20 detections. No pose model has run yet.
+3. **No detections** -> empty frame, lock dropped.
+4. **Select.** Four triggers require a gallery anchor:
+
+   ```
+   needs_anchor = (no current lock)                 # Searching
+                or dist(nearest, ref_pos) > 0.30    # jump guard
+                or lock_age + 1 > 30                # lease expiry
+                or emb . ref_emb < 0.80             # continuity failure
+
+   if any:  _gallery_match over every candidate, max-similarity > 0.80.
+            One passer -> it wins. Two+ passers -> the one nearest frame
+            centre wins, not the highest scorer (see "The centrality
+            tie-break"). No passer -> empty frame, lock dropped.
+   else:    keep the proximity pick; ref_emb := emb (the reference walks
+            forward with the subject).
+   ```
+
+5. **Pose, once.** A square region *of the frame* around the chosen box,
+   expanded by `_POSE_CROP_SCALE` (1.5x) and taken at native resolution, is
+   run through single-person MediaPipe in IMAGE mode. The region is slid
+   inward near a frame edge rather than clipped, so it stays square and
+   full of real pixels — padding the box to square with black instead
+   starves the model on tall, thin subjects and was measured returning no
+   pose on 25 consecutive otherwise-healthy frames. Landmarks are mapped back to frame coordinates by
+   `_crop_norm_to_frame_norm`; world landmarks pass through untouched,
+   being hip-origin and person-relative, which is why every angle in
+   `core/fusion_engine.py` is unaffected by cropping.
+6. **No pose fitted** -> empty frame, but the **lock is kept** — the
+   detector's track is still good, so a momentary pose failure should not
+   cost a full gallery re-search.
+
+**Aggregate per window:** wrist velocity, max displacement, handedness and
+pose-present ratio from *every* frame; `pose_keyframes` at `step=3` for the
+dashboard viewer.
+
+### The invariant
+
+| mechanism | can it *choose* the subject? |
+|---|---|
+| gallery match | **yes — the only one** |
+| tracklet selection | only *among gallery-passing tracklets*, when 2+ pass |
+| centrality tie-break | only *among gallery passers*, when 2+ pass |
+| continuity (0.80) | no — accepts or rejects the proximity pick |
+| `_MAX_TRACK_JUMP` (0.30) | no — rejects only |
+
+Nothing except a human-confirmed gallery can put a person on the track.
+Centrality can choose *which* gallery-confirmed candidate, but never admits
+one the gallery rejected — so it cannot introduce a person the researcher
+did not confirm. See "Speaker selection" for the centrality vote that was
+removed, and "The centrality tie-break" for why this scoped version is
+different.
 
 ## Why this branch exists
 
@@ -113,24 +225,204 @@ bulk run (see "Bulk runs" below).
 
 ## Speaker selection
 
-Ported from the main branch's MeTRAbs implementation almost unchanged —
-vote-once/track-thereafter, scene-cut-aware resets (this worker's own
-independent PySceneDetect pass, same as main, for the same reason: keeping
-gesture and camera's dispatch concurrent without cross-worker wiring), a
-max-jump ambiguity guard. The one real difference: MeTRAbs's detector gave
-an explicit per-person bounding box to compute a "center" from;
-`PoseLandmarkerResult` doesn't expose one at all (confirmed directly
-against the installed library — it has `pose_landmarks`,
-`pose_world_landmarks`, `segmentation_masks`, nothing box-shaped).
+The live mechanism is described in "Working" above. This section is the
+history of how it got there, and what was removed.
 
-A raw min/max bounding box over all 33 landmarks was considered and
-rejected — BlazePose, like MeTRAbs, always estimates a plausible position
-for every landmark even when occluded or off-screen (e.g. ankles in a
-close-up shot), and those wildly extrapolated points would skew a bbox
-center away from where the visible person actually is. Centering instead
-on the mean of just the shoulder and hip landmarks (BlazePose indices 11,
-12, 23, 24 — its own stable torso anchors) is a closer analogue to what
-MeTRAbs's detector box represented.
+**A speaker gallery is now required** — `process_job` raises without one.
+Only the gallery can *acquire* a lock; continuity maintains it and
+`_MAX_TRACK_JUMP` can only invalidate it.
+
+**The centrality vote is gone.** The MeTRAbs-era design was
+vote-once/track-thereafter: pick the candidate nearest the frame centre at
+a window start or scene cut, then track nearest-to-last-position. That
+survived into the gallery era as the fallback for jobs with no gallery, and
+was removed for two reasons. It is wrong often enough to matter on this
+footage — in a crowded auditorium frame the speaker stood at (0.25, 0.57)
+while the seated audience occupied the middle of the frame, so centrality
+would have picked an audience member. And as a *fallback* it fails
+silently: it always returns somebody, so a job with a missing or expired
+gallery would have produced a confident, wrong gesture track rather than an
+obvious failure. Raising is louder than degrading.
+
+### The centrality tie-break
+
+Centrality came back later in one narrow role: when **two or more**
+candidates have already cleared the gallery threshold, `_gallery_match`
+picks the one nearest the frame centre `(0.5, 0.5)` instead of the highest
+scorer.
+
+**The problem it solves.** TED-style stages relay the speaker live onto a
+projection screen behind them. The projection is the *same person*, so it
+matches the gallery legitimately — re-ID cannot reject it, and a better
+re-ID model would score it higher, not lower. It is also usually a sharp,
+well-lit close-up while the real speaker is small and distant, so "highest
+score wins" systematically chose the screen. Continuity then held it there,
+since a static projection is perfectly self-consistent frame to frame.
+
+**Why position works.** Screens hang above and beside the stage; the
+speaker stands on it. Measured on two frames of such a scene (distance from
+frame centre, normalised):
+
+| frame | speaker | projection |
+|---|---|---|
+| arms down | 0.057 | 0.361 |
+| arms raised | 0.052 | 0.363 |
+
+A ~7x margin, and mostly *vertical* — which is why it is expected to
+generalise rather than being a quirk of these shots. MediaPipe-derived
+depth was tried as the discriminator first and ruled out: it estimated the
+projection as **2.89x nearer** than the speaker, and assigned the flat
+projection *more* 3D depth structure (`z_spread` 0.661) than the real
+person (0.406). It is a single-person regressor that assumes it is looking
+at a real human, so it has no way to represent a picture of one.
+
+**Why this is not the heuristic that was removed.** The scoping answers
+both original objections:
+
+- *It picked audience members.* They are different people, so they fail
+  the gallery threshold before centrality is consulted.
+- *It failed silently as a fallback.* It never runs without a gallery
+  match, so it cannot manufacture a track.
+
+Score is deliberately discarded among the passers rather than blended with
+position — the screen's score advantage is exactly the bias being
+corrected. It is used only to break an exact distance tie.
+
+Because every anchor trigger resolves through `_gallery_match`, the lease
+also becomes self-repairing: a track that has drifted onto the screen is
+pulled back to the stage at the next re-anchor. A position prior ("nearest
+the previous position") was considered and rejected for this reason — it
+would preserve a wrong lock rather than correct it.
+
+**Accepted limitation.** The tie-break needs both candidates present. When
+the detector misses the speaker and returns only the projection, there is
+one passer and it wins.
+
+This is what drove `_CONF_THRESHOLD` down to **0.1**. Measured on one such
+frame while it was still 0.25: the speaker scored **0.162** — detected by
+YOLO, then discarded by the floor — while the projection scored **0.89**,
+and the same speaker scored **0.64** a few seconds later with her arms
+raised. Her detectability swings roughly 4x with her pose, so at 0.25 she
+flickered in and out of the candidate list entirely. At 0.1 she is
+admitted, and the tie-break can do its job.
+
+Note the detector's confidence is *anti-correlated* with correctness here:
+the wrong answer (a sharp, well-lit, front-facing close-up on a screen)
+scores far higher than the right one (a small, dim, side-on figure on
+stage). Raising the floor makes this worse, and any rule preferring
+higher-scoring detections prefers the screen.
+
+Lowering the floor does not close the gap completely — she can still fall
+below the *gallery* threshold while the sharper projection clears it, and
+a frame where she is genuinely not detected has no candidate to choose.
+That residue is what "Tracklet selection" below addresses.
+
+Tests: `tests/test_gallery_centrality.py`. The one that matters most is
+`test_non_passing_central_candidate_is_ignored` — it pins the scoping that
+makes reintroduction safe.
+
+### Tracklet selection
+
+The centrality tie-break fixes frames where *both* the speaker and her
+projection are detected. It cannot fix frames where only the projection is
+— and those are common, because her detector confidence swings with her
+pose (**0.64** with arms raised, **0.162** with them down, against a 0.1
+floor). Per-frame selection then alternates with whether she happened to be
+detected that frame, and the track visibly jumps between her and the
+screen. The 30-frame lease bounds each wrong lock but cannot prevent the
+next, since every re-anchor is decided from one frame's evidence.
+
+So the decision moved to the scene:
+
+1. Stream the scene once; record **every** detection's box per frame.
+2. Link them into tracklets by box overlap (`_associate`) — purely
+   geometric, gap-tolerant to `_TRACK_MAX_GAP_FRAMES` (30).
+3. Score each *tracklet* from a few sampled crops (`_TRACK_ID_STRIDE`,
+   `_TRACK_ID_SAMPLES`), not every frame.
+4. If 2+ tracklets pass the gallery and the support floor
+   (`_TRACK_MIN_SUPPORT`, 10), pick the one with the lowest **median**
+   centre distance. Otherwise return "not ambiguous" and use the per-frame
+   path.
+
+Measured on `test_vid_39` (scene 3.6-12.2s) against a researcher-built
+gallery:
+
+| tracklet | median centre dist | frames | gallery score | outcome |
+|---|---|---|---|---|
+| speaker | **0.086** | 148 | — | **chosen** |
+| projection (right screen) | 0.467 | 203 | 0.86 | rejected |
+| projection (left screen) | 0.477 | 143 | 0.89 | rejected |
+
+Both rejects are *longer* and one scores *higher*. Neither length nor
+gallery score is consulted — the projection usually wins on both, which is
+the bias being corrected.
+
+**Why gap tolerance is load-bearing.** Her worst measured gap is 14 frames.
+At a tolerance below that she fragments into stubs while the static
+projection stays one clean track, and any criterion rewarding length then
+picks the screen. 30 frames clears it with margin. The same inversion
+applies to `_TRACK_MIN_SUPPORT`: raise it above the length of her genuine
+track and the screen is all that remains.
+
+**Caching.** A scene routinely spans several 5s windows, and with the
+process pool those run in different processes. Decisions are cached in
+Redis under `job:{id}:scene:{n}:track` — swept by the existing `delete_job`
+wildcard, so no new teardown path. Concurrent writers need no lock: the
+computation is deterministic, so a race wastes work but cannot disagree.
+
+Scene indices are shared with the dashboard's gallery builder only because
+both call `_detect_scene_cuts`. Changing scene detection on one side alone
+would silently repoint every stored index.
+
+**Expect `pose_present_ratio` to fall on relay scenes.** Frames the chosen
+track does not cover are emitted empty, which is the honest answer — she
+was not detected there — replacing a pose fitted to the screen.
+
+#### Known costs and limitations
+
+- **Non-ambiguous scenes pay for detection twice.** Ambiguity is the
+  *output* of building tracklets, not a precondition, so the decision pass
+  runs for every scene; where it concludes "not ambiguous" the per-frame
+  path re-detects the same frames. Estimated from measured per-stage
+  costs, a 40-minute video goes from ~1.41h to ~2.21h pooled. Two fixes
+  are known, neither implemented — use the single passing tracklet too
+  (~1.46h, but changes behaviour on every scene), or trigger the scene
+  pass only after ambiguity is observed for free during the ordinary path
+  (~1.48h, preserves the scoping). **This is the main open question.**
+- **Identity is judged from the five *earliest* sampled crops**, not five
+  spread along the track. An identity switch partway through is invisible,
+  and a speaker who begins a scene turned away can have her whole track
+  misjudged.
+- **Association compares against a tracklet's last box however stale.**
+  After a long gap a moving person may fall below `_TRACK_IOU_MIN` and
+  start a spurious track while a static projection re-links trivially — a
+  bias toward the screen. Not yet biting at the measured 14-frame gap.
+- **A scene where the speaker is never detected still fails**: one passing
+  tracklet is not ambiguous, so the projection wins by the ordinary path.
+  This rests on the observation that she is always detected for at least a
+  few frames per scene.
+
+Tests: `tests/test_tracklets.py`. The two that matter are
+`test_speaker_with_gaps_stays_one_tracklet` and
+`test_short_speaker_track_still_beats_long_projection_track` — both guard
+failures that would hand the scene to the screen while raising nothing.
+
+**Positions come from the detector's own box** (`_box_center`). This closed
+a gap that existed for the whole MediaPipe era: MeTRAbs's detector gave an
+explicit per-person bounding box, but `PoseLandmarkerResult` exposes none
+at all (confirmed directly against the installed library — it has
+`pose_landmarks`, `pose_world_landmarks`, `segmentation_masks`, nothing
+box-shaped). A raw min/max box over all 33 landmarks was considered and
+rejected, because BlazePose always estimates a plausible position for every
+landmark even when occluded or off-screen (e.g. ankles in a close-up), and
+those extrapolated points skew a box centre away from the visible person;
+the mean of the shoulder/hip landmarks (indices 11, 12, 23, 24) was used
+instead as a stabler proxy. A detector box has no such failure mode, so
+neither workaround is needed.
+
+One caveat carried forward: a box centre sits at the body's midpoint where
+the torso-mean sat at shoulder/hip level, and `_MAX_TRACK_JUMP` was tuned
+against the old quantity — so it is on the retune list.
 
 Background-subtraction-based foreground filtering was tried and reverted
 on the main branch before this one existed (measured directly: it

@@ -56,7 +56,7 @@ dashboard is network-served, which is what AGPL's network clause turns on.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -87,7 +87,7 @@ _PROTO_SIZE = 160       # prototype masks are at input/4 resolution
 # centrality) is what decides which detection is the subject, so admitting
 # a few extra weak candidates is far cheaper here than dropping the true
 # one. Not empirically tuned against this project's footage yet.
-_CONF_THRESHOLD = 0.25
+_CONF_THRESHOLD = 0.1
 
 _IOU_THRESHOLD = 0.45   # NMS overlap threshold, Ultralytics' own default
 _MAX_DETECTIONS = 20    # bound on candidates handed downstream per frame —
@@ -96,14 +96,52 @@ _MAX_DETECTIONS = 20    # bound on candidates handed downstream per frame —
 _MASK_BINARY_THRESHOLD = 0.5
 
 
-@dataclass
 class PersonDetection:
     """One detected person. `mask` is full-frame-sized so it can be handed
     straight to workers/_reid.py's crop_via_mask, which is shape-agnostic
-    between this and MediaPipe's own (H, W, 1) masks (it squeezes)."""
-    box: tuple[int, int, int, int]   # (x0, y0, x1, y1), frame pixels
-    score: float
-    mask: np.ndarray                 # (H, W) bool, frame-sized
+    between this and MediaPipe's own (H, W, 1) masks (it squeezes).
+
+    ## Why the mask is lazy
+
+    `mask` is built on first access and then cached, rather than assembled
+    for every detection before this object exists. It reads as an ordinary
+    attribute either way; the difference is only *when* the work happens.
+
+    That matters because assembling a mask is not cheap — measured ~3.9ms
+    per detection, on top of ~2.8ms fixed — and the runtime consumer usually
+    wants exactly one of them. workers/gesture_worker.py in its Locked state
+    embeds a single candidate (the one nearest the tracked position) and
+    discards the rest, so on a crowded auditorium frame at _MAX_DETECTIONS
+    the eager version spent ~80ms building twenty masks to use one.
+
+    The Searching path and core/gallery_builder.py do want every mask, and
+    they still pay in full — nothing is saved there, and nothing is lost
+    either, since the cache means a mask is never assembled twice.
+
+    One consequence worth knowing: an unrealised mask holds a reference to
+    the frame's prototype tensor (~3.3MB) via its builder, so detections are
+    heavier to *retain* than before even though they are cheaper to create.
+    Callers here keep them only for the frame being processed, which is what
+    makes this a straight win; holding a frame's detections indefinitely
+    would not be.
+    """
+
+    def __init__(self, box: tuple[int, int, int, int], score: float, mask_builder):
+        self.box = box                      # (x0, y0, x1, y1), frame pixels
+        self.score = score
+        self._mask_builder = mask_builder
+        self._mask: Optional[np.ndarray] = None
+
+    @property
+    def mask(self) -> np.ndarray:
+        """(H, W) bool, frame-sized. Assembled on first access."""
+        if self._mask is None:
+            self._mask = self._mask_builder()
+        return self._mask
+
+    def __repr__(self) -> str:
+        state = "built" if self._mask is not None else "unbuilt"
+        return f"PersonDetection(box={self.box}, score={self.score:.3f}, mask={state})"
 
 
 def ensure_detector_weights() -> None:
@@ -124,17 +162,41 @@ def ensure_detector_weights() -> None:
     )
 
 
-def load_detector():
+def load_detector(intra_op_threads: Optional[int] = None):
     """Builds an onnxruntime session. Callers own their own lazily-cached
     singleton — same division of responsibility as workers/_reid.py's
     load_reid_model, and for the same reason: GestureWorker and the
-    dashboard's gallery builder want different lifetimes for it."""
+    dashboard's gallery builder want different lifetimes for it.
+
+    `intra_op_threads` caps ORT's own thread pool; None leaves ORT's
+    default (one thread per physical core). Set it to 1 when several
+    detector processes share a machine — measured, this graph only scales
+    ~2x across six threads (160ms -> 79ms), so six single-threaded
+    processes do far more total work than one six-threaded one. See
+    GestureWorker's window pool.
+    """
     import onnxruntime as ort
 
     ensure_detector_weights()
     logger.info("[detector] Loading YOLO11n-seg person detector...")
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    if intra_op_threads is not None:
+        opts.intra_op_num_threads = intra_op_threads
+    # Park the intra-op threads between inferences instead of busy-waiting
+    # for the next one. ORT's default assumes it owns the machine and that
+    # another `run` is imminent, which is right for a dedicated inference
+    # server and wrong here: this session is one of *three* models taking
+    # turns on the same cores every frame (detector -> OSNet -> MediaPipe,
+    # see workers/gesture_worker.py), so what the spin actually does is burn
+    # every core while the next model tries to use them.
+    #
+    # Measured on real footage, one OSNet embedding costs 12.8ms called on
+    # its own but 55ms in that sequence; disabling the spin recovers roughly
+    # half of that gap, for ~14% off the whole per-frame budget. Nothing
+    # about *what* is computed changes — this is purely how the work is
+    # scheduled onto cores.
+    opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
     return ort.InferenceSession(
         str(DETECTOR_MODEL_PATH), opts, providers=["CPUExecutionProvider"],
     )
@@ -163,11 +225,19 @@ def _letterbox(rgb: np.ndarray) -> tuple[np.ndarray, float, int, int]:
     return canvas, scale, pad_x, pad_y
 
 
-def _build_masks(
-    coeffs: np.ndarray, protos: np.ndarray, boxes_in: np.ndarray,
+# Half-open pixel-index grids for the box crop, at *input* resolution.
+# Module-level because _INPUT_SIZE is baked into the exported graph, so
+# these never vary — building them per mask would be pure repeat work now
+# that masks are assembled one at a time (see PersonDetection).
+_GX = np.arange(_INPUT_SIZE, dtype=np.float32)[None, :]
+_GY = np.arange(_INPUT_SIZE, dtype=np.float32)[:, None]
+
+
+def _build_mask(
+    coeffs: np.ndarray, protos_flat: np.ndarray, box_in: np.ndarray,
     frame_wh: tuple[int, int], scale: float, pad_x: int, pad_y: int,
-) -> list[np.ndarray]:
-    """Assembles per-instance masks from the prototype basis.
+) -> np.ndarray:
+    """Assembles one instance mask from the prototype basis.
 
     YOLO-seg does not emit a mask per detection directly; it emits 32
     prototype masks for the whole image plus, per detection, 32
@@ -175,43 +245,38 @@ def _build_masks(
     sigmoid(coeffs @ protos), then cropped to its own box (the linear
     combination is global and spills outside the instance otherwise), then
     un-letterboxed back to frame resolution.
+
+    Called lazily, once per detection whose mask is actually wanted — see
+    PersonDetection. `protos_flat` is the frame's (32, 160*160) prototype
+    view, shared across that frame's detections.
     """
     w, h = frame_wh
-    flat = protos.reshape(_NUM_MASK_COEFFS, -1)          # (32, 160*160)
-    m = (coeffs @ flat).reshape(-1, _PROTO_SIZE, _PROTO_SIZE)   # logits, NOT
+    m = (coeffs @ protos_flat).reshape(_PROTO_SIZE, _PROTO_SIZE)   # logits, NOT
     # probabilities — no sigmoid is applied anywhere here. Binarising at
     # logit > 0 is exactly equivalent to sigmoid(x) > 0.5 and skips the
     # transcendental, which is what Ultralytics does too (`masks.gt_(0.0)`).
 
+    # Order matters, and not in the intuitive direction: upsample to input
+    # resolution FIRST, then crop to the box. Cropping at prototype
+    # resolution and upsampling afterwards lets bilinear interpolation
+    # smear the mask edge back outside the box — this is Ultralytics' own
+    # upstream issue #24272, and getting it backwards here measurably
+    # degraded agreement with their output (worst-case mask IoU 0.66 vs
+    # 0.99) with no error raised anywhere. Cropping against float box
+    # bounds rather than rounded integer slice indices matters for the same
+    # reason, and disproportionately so on physically small detections —
+    # precisely the small-distant-speaker case this detector exists to get
+    # right.
+    full = cv2.resize(m, (_INPUT_SIZE, _INPUT_SIZE), interpolation=cv2.INTER_LINEAR)
+    x0, y0, x1, y1 = box_in
+    binary = (full > 0.0) & (_GX >= x0) & (_GX < x1) & (_GY >= y0) & (_GY < y1)
+    if not binary.any():
+        return np.zeros((h, w), dtype=bool)
+    # letterboxed input -> strip padding -> original frame resolution.
     nw, nh = int(round(w * scale)), int(round(h * scale))
-    # Half-open pixel-index grids for the box crop, at *input* resolution.
-    gx = np.arange(_INPUT_SIZE, dtype=np.float32)[None, :]
-    gy = np.arange(_INPUT_SIZE, dtype=np.float32)[:, None]
-
-    out: list[np.ndarray] = []
-    for i in range(m.shape[0]):
-        # Order matters, and not in the intuitive direction: upsample to
-        # input resolution FIRST, then crop to the box. Cropping at
-        # prototype resolution and upsampling afterwards lets bilinear
-        # interpolation smear the mask edge back outside the box — this is
-        # Ultralytics' own upstream issue #24272, and getting it backwards
-        # here measurably degraded agreement with their output (worst-case
-        # mask IoU 0.66 vs 0.99) with no error raised anywhere. Cropping
-        # against float box bounds rather than rounded integer slice
-        # indices matters for the same reason, and disproportionately so on
-        # physically small detections — precisely the small-distant-speaker
-        # case this detector exists to get right.
-        full = cv2.resize(m[i], (_INPUT_SIZE, _INPUT_SIZE), interpolation=cv2.INTER_LINEAR)
-        x0, y0, x1, y1 = boxes_in[i]
-        binary = (full > 0.0) & (gx >= x0) & (gx < x1) & (gy >= y0) & (gy < y1)
-        if not binary.any():
-            out.append(np.zeros((h, w), dtype=bool))
-            continue
-        # letterboxed input -> strip padding -> original frame resolution.
-        unpadded = binary[pad_y:pad_y + nh, pad_x:pad_x + nw].astype(np.float32)
-        resized = cv2.resize(unpadded, (w, h), interpolation=cv2.INTER_LINEAR)
-        out.append(resized > _MASK_BINARY_THRESHOLD)
-    return out
+    unpadded = binary[pad_y:pad_y + nh, pad_x:pad_x + nw].astype(np.float32)
+    resized = cv2.resize(unpadded, (w, h), interpolation=cv2.INTER_LINEAR)
+    return resized > _MASK_BINARY_THRESHOLD
 
 
 def detect_people(
@@ -258,13 +323,15 @@ def detect_people(
     idxs = np.array(idxs).flatten()
     order = idxs[np.argsort(-scores[idxs])][:max_detections]
 
-    masks = _build_masks(
-        preds[order, 4 + 80:4 + 80 + _NUM_MASK_COEFFS], protos[0],
-        boxes_in[order], (w, h), scale, pad_x, pad_y,
-    )
+    # Masks are not assembled here — each detection carries the recipe and
+    # builds its own on first access (see PersonDetection). `protos_flat`
+    # is a reshape *view*, so all of this frame's detections share the one
+    # prototype tensor rather than copying it.
+    protos_flat = protos[0].reshape(_NUM_MASK_COEFFS, -1)          # (32, 160*160)
+    coeffs = preds[:, 4 + 80:4 + 80 + _NUM_MASK_COEFFS]
 
     detections: list[PersonDetection] = []
-    for i, det_i in enumerate(order):
+    for det_i in order:
         x0, y0, x1, y1 = boxes_in[det_i]
         # Undo the letterbox, then clamp into the frame — a box may
         # legitimately extend past the edge for a partially-visible person.
@@ -275,6 +342,13 @@ def detect_people(
         if bx1 <= bx0 or by1 <= by0:
             continue
         detections.append(PersonDetection(
-            box=(bx0, by0, bx1, by1), score=float(scores[det_i]), mask=masks[i],
+            box=(bx0, by0, bx1, by1),
+            score=float(scores[det_i]),
+            # partial, not a lambda: a closure over the loop variable would
+            # bind late and give every detection the last one's mask.
+            mask_builder=partial(
+                _build_mask, coeffs[det_i], protos_flat, boxes_in[det_i],
+                (w, h), scale, pad_x, pad_y,
+            ),
         ))
     return detections

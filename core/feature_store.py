@@ -15,6 +15,8 @@ Key schema
   job:{job_id}:meta            STRING  AnalysisJob JSON
   job:{job_id}:gallery:count   STRING  next gallery entry index (INCR counter)
   job:{job_id}:gallery:{n}     STRING  GalleryEntry JSON (n = entry index)
+  job:{job_id}:scene:{s}:track STRING  gesture's per-scene tracklet decision
+                                       JSON (s = scene index; see put_scene_track)
 
 All keys are set with a 24-hour TTL by default.
 
@@ -225,6 +227,40 @@ class FeatureStore:
             if raw:
                 entries.append(GalleryEntry.model_validate_json(raw))
         return entries
+
+    # ------------------------------------------------------------------
+    # Per-scene speaker track (gesture only)
+    # ------------------------------------------------------------------
+
+    def put_scene_track(self, job_id: str, scene_idx: int, data: dict) -> None:
+        """Cache one scene's speaker-track decision.
+
+        Written by whichever gesture worker first processes a window
+        overlapping that scene, and read by the others. A scene routinely
+        spans several 5s windows, and with the process pool those windows
+        run in different processes — without this they would each recompute
+        the same decision, and (worse) could reach *different* ones from
+        their own partial view of the scene, making the track flip at
+        window boundaries. See workers/gesture_worker.py's "Tracklet
+        selection".
+
+        Concurrent writers are safe and need no lock: the computation is
+        deterministic over the same frames, so two children racing on an
+        uncached scene write the same value. The cost is occasional
+        duplicated work, never an inconsistent result.
+
+        Lives under the job's own key prefix, so delete_job's wildcard
+        sweep already reclaims it — no new teardown path, and no state that
+        can survive into another job.
+        """
+        self.r.set(f"job:{job_id}:scene:{scene_idx}:track", json.dumps(data), ex=_TTL)
+
+    def get_scene_track(self, job_id: str, scene_idx: int) -> Optional[dict]:
+        """None = not computed yet (the caller computes and caches it).
+        This is a cache, not a source of truth: a miss costs time, never
+        correctness."""
+        raw = self.r.get(f"job:{job_id}:scene:{scene_idx}:track")
+        return json.loads(raw) if raw else None
 
     def delete_job(self, job_id: str) -> None:
         """Remove every Redis key for a job, freeing its scratch data early
