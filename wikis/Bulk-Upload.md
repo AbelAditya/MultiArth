@@ -12,7 +12,10 @@ shipped to MongoDB — no terminal required.
 ## Prerequisites
 
 - `MONGO_URI` (and optionally `MONGO_DB`) configured — see the main
-  [README](../README.md) — since this is what videos get shipped to.
+  [README](../README.md) — since this is what videos get shipped to. Once a
+  cluster fills up, add another as `MONGO_URI_2` (then `_3`, …): new videos
+  go to the first cluster with room, and dedup and Browse Corpus cover all
+  of them (README, "Spanning several MongoDB clusters").
 - If any manifest entry uses `drive_url` instead of a pre-staged local
   `path`, **`GOOGLE_DRIVE_API_KEY`** must be set (`.env.example`). The video
   must be shared **"Anyone with the link"** on Drive — this only needs the

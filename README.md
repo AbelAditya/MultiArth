@@ -178,10 +178,28 @@ place and the failure is reported in the run summary — just re-run the same
 manifest later; already-shipped videos are skipped automatically (dedup'd
 by `drive_url`, falling back to the local path, scoped per `collection`).
 
+#### Spanning several MongoDB clusters
+
+A free Atlas cluster holds 512MB, which a few dozen talks fill. Add more
+clusters for the same corpus as `MONGO_URI_2`, `MONGO_URI_3`, … (in the order
+they should fill) alongside `MONGO_URI`:
+
+- **New videos** go, whole, to the first cluster with room for them. If Atlas
+  refuses a write for quota anyway, the partial write is removed and the video
+  goes to the next cluster. If none has room, shipping fails with a message
+  saying to add another.
+- **Browse Corpus, dedup and `--force`** all work across every cluster: you see
+  one merged list of videos, a video already shipped to the first cluster is
+  still skipped, and a forced reprocess removes the old copy wherever it is.
+
+Every cluster uses the same `MONGO_DB` name. See `core/results_repository.py`
+("Shards") for the details.
+
 Options:
 ```
 --force           Reprocess and re-ship even if already present in Mongo
---mongo-uri       MongoDB Atlas connection string (default: $MONGO_URI)
+--mongo-uri       MongoDB Atlas connection string; repeat for several
+                  clusters in fill order (default: $MONGO_URI, $MONGO_URI_2, ...)
 --mongo-db        MongoDB database name (default: $MONGO_DB or "multiarth")
 --window          Window size in seconds (default: 5.0)
 --whisper-model   Whisper model size (default: small)

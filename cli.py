@@ -137,7 +137,7 @@ def _make_bulk_progress_reporter():
 @main.command()
 @click.argument("manifest_path")
 @click.option("--force", is_flag=True, default=False, help="Reprocess even if already shipped to Mongo")
-@click.option("--mongo-uri", default=None, help="MongoDB Atlas connection string (default: $MONGO_URI)")
+@click.option("--mongo-uri", multiple=True, help="MongoDB Atlas connection string; repeat for several shards, in fill order (default: $MONGO_URI, $MONGO_URI_2, ...)")
 @click.option("--mongo-db", default=None, help="MongoDB database name (default: $MONGO_DB or 'multiarth')")
 @click.option("--window", default=5.0, show_default=True, help="Window size in seconds")
 @click.option("--whisper-model", default="small", show_default=True, help="Whisper model size")
@@ -154,7 +154,7 @@ def bulk(ctx, manifest_path, force, mongo_uri, mongo_db, window, whisper_model, 
     """
     store = ctx.obj["store"]
     try:
-        repo = ResultsRepository(uri=mongo_uri, db_name=mongo_db)
+        repo = ResultsRepository(uris=list(mongo_uri) or None, db_name=mongo_db)
     except Exception as exc:
         click.echo(click.style(f"Could not connect to MongoDB: {exc}", fg="red"), err=True)
         sys.exit(1)

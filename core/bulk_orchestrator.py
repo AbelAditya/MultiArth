@@ -304,20 +304,22 @@ class BulkOrchestrator:
         last_exc = None
         for attempt in range(1, _SHIP_ATTEMPTS + 1):
             try:
-                self.repo.save_job(
-                    collection, job, drive_url=drive_url, label=label,
+                # One call so the whole job lands on a single shard, chosen
+                # by its real size — see core/results_repository.py "Shards".
+                shard = self.repo.ship_job(
+                    collection, job, windows,
+                    drive_url=drive_url, label=label,
                     dedupe_key=dedupe_key, duration_s=duration_s,
+                    artifacts=dict(
+                        wordlist=self.store.get_wordlist(job_id),
+                        ngrams=self.store.get_ngrams(job_id),
+                        collocations=self.store.get_collocations(job_id),
+                        spectrogram=self.store.get_spectrogram(job_id),
+                        waveform=self.store.get_waveform(job_id),
+                        segmented_tokens=self.store.get_segmented_tokens(job_id),
+                    ),
                 )
-                self.repo.save_fused_windows(collection, job_id, windows)
-                self.repo.save_artifacts(
-                    collection, job_id,
-                    wordlist=self.store.get_wordlist(job_id),
-                    ngrams=self.store.get_ngrams(job_id),
-                    collocations=self.store.get_collocations(job_id),
-                    spectrogram=self.store.get_spectrogram(job_id),
-                    waveform=self.store.get_waveform(job_id),
-                    segmented_tokens=self.store.get_segmented_tokens(job_id),
-                )
+                logger.info(f"[bulk] Job {job_id} shipped to MongoDB shard {shard}")
                 return
             except Exception as exc:
                 last_exc = exc
