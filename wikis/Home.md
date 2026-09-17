@@ -34,7 +34,7 @@ the full design:
 | Notebook | Hosts | Env vars |
 |---|---|---|
 | [`colab/gesture_server.ipynb`](../colab/gesture_server.ipynb) | MeTRAbs (pose) | `GESTURE_REMOTE_URL`, `GESTURE_API_KEY` |
-| [`colab/sensevoice_server.ipynb`](../colab/sensevoice_server.ipynb) | SenseVoice (Chinese ASR) | `SENSEVOICE_REMOTE_URL`, `SENSEVOICE_API_KEY` |
+| [`colab/sensevoice_server.ipynb`](../colab/sensevoice_server.ipynb) | SenseVoice (Chinese ASR) | `SENSEVOICE_REMOTE_URL`, `SENSEVOICE_API_KEY`; `SENSEVOICE_MODE=local` ignores both (`docker-compose.local-asr.yml`) |
 
 ## Full dependency list
 

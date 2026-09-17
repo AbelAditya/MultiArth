@@ -8,10 +8,10 @@ for each time window assigns tokens and computes linguistic features.
 Language is auto-detected by Whisper; the matching spaCy model is loaded
 lazily and cached so multi-language sessions don't reload unnecessarily.
 
-SenseVoice (see _ALT_ASR_LANGS/_transcribe_alt below) can optionally run
-remotely instead of loading funasr+torch locally — see
-`colab/sensevoice_server.ipynb` and the SENSEVOICE_REMOTE_URL /
-SENSEVOICE_API_KEY env vars below. Whichever mode is active, the rest of
+SenseVoice (see _ALT_ASR_LANGS/_transcribe_alt below) runs either locally,
+loading funasr+torch into this process, or remotely — see
+`colab/sensevoice_server.ipynb` and the SENSEVOICE_MODE /
+SENSEVOICE_REMOTE_URL / SENSEVOICE_API_KEY env vars below. Whichever mode is active, the rest of
 this file (windowing, corpus stats, everything downstream of _transcribe)
 is unaffected — it only ever sees a list[WordToken], same as from Whisper.
 """
@@ -60,6 +60,17 @@ _ALT_ASR_LANGS = frozenset({"zh"})
 # Empty/unset means "load and run SenseVoice locally", the original behaviour.
 _REMOTE_URL_ENV = "SENSEVOICE_REMOTE_URL"
 _REMOTE_API_KEY_ENV = "SENSEVOICE_API_KEY"
+
+# Explicit choice of where SenseVoice runs, overriding the URL's presence:
+#   local   always load SenseVoice in this process, even if a remote URL is
+#           set — so one deployment can run locally while sharing a .env
+#           with another that runs remotely (docker-compose.local-asr.yml).
+#   remote  always call SENSEVOICE_REMOTE_URL; it is an error for it to be
+#           unset, rather than a silent switch to loading torch locally.
+#   (unset) remote if SENSEVOICE_REMOTE_URL is set, otherwise local — the
+#           behaviour before this switch existed.
+_MODE_ENV = "SENSEVOICE_MODE"
+_MODES = ("local", "remote")
 _SENSEVOICE_MODEL = "iic/SenseVoiceSmall"
 
 # Remote transcription is chunked rather than sent as one whole-file request
@@ -115,6 +126,22 @@ def _split_number_glue(word: str, keep_glued: frozenset) -> Optional[tuple[str, 
     return None
 
 
+def _resolve_remote_url() -> Optional[str]:
+    """The remote SenseVoice URL to use, or None to run it locally — see
+    _MODE_ENV above."""
+    url = os.environ.get(_REMOTE_URL_ENV) or None
+    mode = (os.environ.get(_MODE_ENV) or "").strip().lower()
+    if not mode:
+        return url
+    if mode not in _MODES:
+        raise ValueError(f"{_MODE_ENV}={mode!r} — expected one of {', '.join(_MODES)}")
+    if mode == "local":
+        return None
+    if not url:
+        raise ValueError(f"{_MODE_ENV}=remote but {_REMOTE_URL_ENV} is not set")
+    return url
+
+
 class VerbalWorker:
     def __init__(
         self,
@@ -134,10 +161,12 @@ class VerbalWorker:
         # If set, SenseVoice never gets loaded in this process at all —
         # _transcribe_alt calls a remote instance instead (see
         # colab/sensevoice_server.ipynb, and _REMOTE_URL_ENV's docstring above).
-        self._remote_url = os.environ.get(_REMOTE_URL_ENV) or None
+        self._remote_url = _resolve_remote_url()
         self._remote_api_key = os.environ.get(_REMOTE_API_KEY_ENV) or None
         if self._remote_url:
             logger.info(f"[verbal] SenseVoice will run remotely at {self._remote_url}")
+        else:
+            logger.info(f"[verbal] SenseVoice will run locally on {device} (loaded on first use)")
 
     def _get_nlp(self, lang_code: str):
         """Return a cached spaCy model for *lang_code*, loading it on first use."""

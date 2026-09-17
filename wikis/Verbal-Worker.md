@@ -69,6 +69,27 @@ lexical statistics with **spaCy**.
    already falls back to Whisper's output for that job. Leaving
    `SENSEVOICE_REMOTE_URL` unset (the default) keeps everything local,
    unchanged from before this option existed.
+
+   **Choosing explicitly: `SENSEVOICE_MODE`.** `local` runs SenseVoice
+   in-process even when `SENSEVOICE_REMOTE_URL` is set; `remote` requires the
+   URL and raises at startup without it, instead of quietly loading torch;
+   unset keeps the URL-decides behaviour above. It exists so a local-ASR
+   deployment can share a `.env` with a remote one:
+
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.local-asr.yml up -d --build
+   ```
+
+   `docker-compose.local-asr.yml` only sets `SENSEVOICE_MODE=local` — same
+   image, since the Dockerfile already installs `funasr` and bakes the
+   SenseVoice weights in. The startup log says which mode is active
+   (`SenseVoice will run locally on cpu` / `... remotely at <url>`).
+
+   Measured locally on CPU (12 cores), 60 s of Mandarin: 6.5 s including
+   Whisper's language-detection pass, 273 tokens, peak memory 3.7 GB with
+   Whisper and SenseVoice both loaded. So a ~25 min talk transcribes in
+   roughly 3 min, and no Colab session is involved — but that memory is held
+   alongside the gesture worker's, which runs concurrently.
 2. **Per-window features** (`_process_window`) — tokens are bucketed into
    each window by start time; a `VerbalFeatures` record (transcript text,
    token list, word count) is stored per window.
