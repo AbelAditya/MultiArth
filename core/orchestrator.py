@@ -57,6 +57,7 @@ from core.fusion_engine import FusionEngine
 from core.models import AnalysisJob, FusedWindow, JobStatus
 from core.preprocessing import compute_windows, extract_audio, probe_video
 from workers.camera_worker import CameraWorker
+from workers._gesture_params import DEFAULT_PARAMS, GestureParams
 from workers.gesture_worker import GestureWorker
 from workers.prosody_worker import ProsodyWorker
 from workers.verbal_worker import VerbalWorker
@@ -71,6 +72,7 @@ class Orchestrator:
         whisper_model: str = "small",
         whisper_device: str = "cpu",
         parallel: bool = True,
+        gesture_params: GestureParams | None = None,
     ):
         self.store = store
         self.work_dir = Path(work_dir or os.environ.get("WORK_DIR", "/tmp/mannerism"))
@@ -79,6 +81,11 @@ class Orchestrator:
         self.parallel = parallel
         self._whisper_model = whisper_model
         self._whisper_device = whisper_device
+        # Per-video gesture tuning: no single set of thresholds works for
+        # every video (see workers/_gesture_params.py). None means the
+        # documented defaults, which is what every job used before this
+        # existed.
+        self._gesture_params = gesture_params or DEFAULT_PARAMS
 
         # All four workers are lazy (see the properties below) — none of
         # them, including this process itself, load anything until the
@@ -116,7 +123,9 @@ class Orchestrator:
     @property
     def _gesture_worker(self) -> GestureWorker:
         if self._gesture_worker_inst is None:
-            self._gesture_worker_inst = GestureWorker(self.store)
+            self._gesture_worker_inst = GestureWorker(
+                self.store, params=self._gesture_params
+            )
         return self._gesture_worker_inst
 
     # ------------------------------------------------------------------

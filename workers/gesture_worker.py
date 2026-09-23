@@ -501,6 +501,12 @@ from core.feature_store import FeatureStore
 from core.models import GalleryEntry, GestureFeatures, GestureFrame, Landmark, PoseKeyframe, TimeWindow
 from core.preprocessing import VideoMeta, frames_for_window
 from workers import _detector, _reid
+from workers._gesture_params import (
+    _FRAME_CENTER,
+    DEFAULT_PARAMS,
+    TIE_BREAKS,
+    GestureParams,
+)
 
 # MediaPipe's BlazePose 33-point topology — standard, documented ordering
 # (https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker):
@@ -544,13 +550,19 @@ _SCENE_CUT_THRESHOLD = 27.0
 # and the frame re-anchored against the gallery. It is deliberately a
 # heuristic that can only *reject*: it invalidates a lock but never chooses
 # who holds it. Starting value, not empirically tuned.
-_MAX_TRACK_JUMP = 0.3
+_MAX_TRACK_JUMP = DEFAULT_PARAMS.max_track_jump
 
-# Frame-normalised centre, for the gallery tie-break in _gallery_match —
+# Frame-normalised centre, for the centrality tie-break in _gallery_match —
 # consulted only when two or more candidates have *already* cleared the
 # gallery threshold. See module docstring's "Speaker selection" for why this
 # is not the centrality vote that was removed.
-_FRAME_CENTER = (0.5, 0.5)
+#
+# Every constant in this file is now the *default* value of the matching
+# GestureParams field (workers/_gesture_params.py), kept as a module-level
+# name because the docstrings above reference them and because a caller
+# that passes no params gets exactly these. A job's real values come from
+# the GestureParams it was given, never from these names.
+_FRAME_CENTER = _FRAME_CENTER  # re-exported for the docstrings above
 
 # --- Tracklets (see module docstring's "Tracklet selection") -------------
 # Minimum box-overlap for a detection to continue an existing tracklet.
@@ -558,7 +570,7 @@ _FRAME_CENTER = (0.5, 0.5)
 # frames, so anything this low is a continuation, and the alternative
 # (starting a new tracklet) is the failure that matters — it fragments her
 # into stubs that lose to the projection's single long track.
-_TRACK_IOU_MIN = 0.3
+_TRACK_IOU_MIN = DEFAULT_PARAMS.track_iou_min
 
 # How many consecutive frames a tracklet survives with no detection before
 # it is closed. This is load-bearing rather than a tidiness parameter: the
@@ -567,27 +579,27 @@ _TRACK_IOU_MIN = 0.3
 # drops out repeatedly. A short gap tolerance shatters her into stubs
 # while the static projection stays one clean track, and any criterion
 # that prefers longer tracks then picks the screen. One second at 30fps.
-_TRACK_MAX_GAP_FRAMES = 30
+_TRACK_MAX_GAP_FRAMES = DEFAULT_PARAMS.track_max_gap_frames
 
 # Detections a tracklet needs before it may be *selected*. A sanity floor
 # against single-frame noise, not a preference for long tracks — the
 # speaker is sometimes detected only briefly in a projection scene, so
 # raising this hands those scenes to the screen. Starting value, expected
 # to need tuning against measured tracklet lengths.
-_TRACK_MIN_SUPPORT = 10
+_TRACK_MIN_SUPPORT = DEFAULT_PARAMS.track_min_support
 
 # Identity crops are taken every Nth frame while scanning a scene. Each
 # costs a mask build (~4.8ms), which the rest of that pass deliberately
 # avoids by working on boxes alone, so they are sampled rather than taken
 # for every detection.
-_TRACK_ID_STRIDE = 10
+_TRACK_ID_STRIDE = DEFAULT_PARAMS.track_id_stride
 
 # How many of a tracklet's detections are embedded to decide its identity.
 # Identity is a property of the track, not the frame: sampling a handful
 # costs a fraction of embedding every candidate in every frame, which is
 # what makes this affordable at _CONF_THRESHOLD = 0.1 (10-20 detections
 # per frame).
-_TRACK_ID_SAMPLES = 5
+_TRACK_ID_SAMPLES = DEFAULT_PARAMS.track_id_samples
 
 
 def _scene_index(ts: float, cuts: list[float]) -> int:
@@ -656,21 +668,34 @@ class _Tracklet:
     def support(self) -> int:
         return len(self.boxes)
 
-    def median_centre_distance(self, frame_w: int, frame_h: int) -> float:
-        """Median distance of this track's boxes from the frame centre.
+    def median_key(self, frame_w: int, frame_h: int, key) -> float:
+        """Median of `key` over this track's boxes — the track's geometric
+        score under whichever tie-break the job is using (smaller wins).
 
         Median rather than mean so one frame catching the speaker at the
         edge of frame mid-stride doesn't drag the whole track's score, and
         because it is length-independent — a 4-frame track of hers is
-        judged on the same footing as a 200-frame track of the screen.
+        judged on the same footing as a 200-frame track of the screen. It
+        is also what makes the vertical rule survive a panning shot: the
+        camera moves her x across the frame, but her y — feet on the stage
+        floor — stays put, so the median is stable in the axis that rule
+        reads.
         """
         return float(np.median([
-            _dist(_box_center(b, frame_w, frame_h), _FRAME_CENTER)
-            for b in self.boxes.values()
+            key(_box_center(b, frame_w, frame_h)) for b in self.boxes.values()
         ]))
 
+    def median_centre_distance(self, frame_w: int, frame_h: int) -> float:
+        """This track's median distance from the frame centre — the
+        centrality tie-break's score, kept as a named method because the
+        logs and tests speak in those terms."""
+        return self.median_key(frame_w, frame_h, TIE_BREAKS["centrality"])
 
-def _associate(per_frame_boxes: list[tuple[int, list]]) -> list[_Tracklet]:
+
+def _associate(
+    per_frame_boxes: list[tuple[int, list]],
+    params: GestureParams = DEFAULT_PARAMS,
+) -> list[_Tracklet]:
     """Links per-frame detection boxes into tracklets by overlap.
 
     Greedy highest-overlap-first matching, which is enough here: the
@@ -684,7 +709,8 @@ def _associate(per_frame_boxes: list[tuple[int, list]]) -> list[_Tracklet]:
     """
     tracks: list[_Tracklet] = []
     for frame_idx, boxes in per_frame_boxes:
-        live = [t for t in tracks if frame_idx - t.last_frame <= _TRACK_MAX_GAP_FRAMES]
+        live = [t for t in tracks
+                if frame_idx - t.last_frame <= params.track_max_gap_frames]
         pairs = sorted(
             ((_iou(t.boxes[t.last_frame], b), ti, bi)
              for ti, t in enumerate(live) for bi, b in enumerate(boxes)),
@@ -693,7 +719,7 @@ def _associate(per_frame_boxes: list[tuple[int, list]]) -> list[_Tracklet]:
         used_t: set[int] = set()
         used_b: set[int] = set()
         for score, ti, bi in pairs:
-            if score < _TRACK_IOU_MIN or ti in used_t or bi in used_b:
+            if score < params.track_iou_min or ti in used_t or bi in used_b:
                 continue
             live[ti].add(frame_idx, boxes[bi])
             used_t.add(ti)
@@ -706,6 +732,7 @@ def _associate(per_frame_boxes: list[tuple[int, list]]) -> list[_Tracklet]:
 
 def _select_tracklet(
     tracks: list[_Tracklet], frame_w: int, frame_h: int,
+    params: GestureParams = DEFAULT_PARAMS,
 ) -> Optional[_Tracklet]:
     """Picks the speaker's tracklet, or None if the scene is unambiguous
     and the caller should use the ordinary per-frame path.
@@ -724,15 +751,25 @@ def _select_tracklet(
     cannot alternate, and frames where the chosen track has no detection
     simply come out empty.
     """
-    passing = [
-        t for t in tracks
-        if t.score is not None
-        and t.score > _GALLERY_MATCH_THRESHOLD
-        and t.support >= _TRACK_MIN_SUPPORT
-    ]
+    passing = _gallery_passing_tracks(tracks, params)
     if len(passing) < 2:
         return None
-    return min(passing, key=lambda t: t.median_centre_distance(frame_w, frame_h))
+    key = params.tie_break_key
+    return min(passing, key=lambda t: t.median_key(frame_w, frame_h, key))
+
+
+def _gallery_passing_tracks(
+    tracks: list[_Tracklet], params: GestureParams,
+) -> list[_Tracklet]:
+    """Tracks eligible to be selected: scored, over the identity threshold,
+    and long enough to be more than noise. Shared by _select_tracklet and
+    the logging around it so the two can never disagree about who passed."""
+    return [
+        t for t in tracks
+        if t.score is not None
+        and t.score > params.gallery_match_threshold
+        and t.support >= params.track_min_support
+    ]
 
 # --- Speaker re-identification (gallery-based) — see module docstring ---
 # Model loading, crop extraction, and embedding math itself all live in
@@ -761,7 +798,7 @@ def _select_tracklet(
 # neighbour by a combination of motion blur, mask wobble and pose, none
 # individually large. A known impostor scores ~0.5 against a previous
 # speaker frame, so the margin against a real intruder remains wide.
-_CONTINUITY_THRESHOLD = 0.80
+_CONTINUITY_THRESHOLD = DEFAULT_PARAMS.continuity_threshold
 
 # How many frames a lock may run on continuity alone before it must be
 # re-anchored against the gallery. Continuity walks its reference forward
@@ -772,7 +809,7 @@ _CONTINUITY_THRESHOLD = 0.80
 # and then serving as the reference for the next frame. Similarity to a
 # frame one second earlier is 0.897 median and two seconds earlier 0.796, so
 # ~1s is about where the tracked appearance has meaningfully moved.
-_LOCK_LEASE_FRAMES = 30
+_LOCK_LEASE_FRAMES = DEFAULT_PARAMS.lock_lease_frames
 
 # Minimum nearest-exemplar similarity for a candidate to be accepted as
 # the speaker — used by both Searching and Locked verification (see
@@ -782,7 +819,7 @@ _LOCK_LEASE_FRAMES = 30
 # max-pooled question, so the two halves of the system agree on what
 # "similar enough" means. Still worth calibrating against real
 # multi-person footage.
-_GALLERY_MATCH_THRESHOLD = 0.80
+_GALLERY_MATCH_THRESHOLD = DEFAULT_PARAMS.gallery_match_threshold
 
 
 # How many worker *processes* share out a job's windows. 1 disables the
@@ -800,12 +837,12 @@ _GALLERY_MATCH_THRESHOLD = 0.80
 # with threads — the detector graph only reaches ~2x across six threads
 # (160ms -> 79ms) while OSNet is fastest single-threaded — so N
 # single-threaded processes do far more total work than one N-threaded one.
-_POOL_PROCESSES = 4
+_POOL_PROCESSES = DEFAULT_PARAMS.pool_processes
 
 # Per-process thread caps for pool children. Every library here sizes its
 # pool for a machine it assumes it owns, and four such processes on six
 # cores would oversubscribe several times over.
-_POOL_THREADS_PER_PROCESS = 1
+_POOL_THREADS_PER_PROCESS = DEFAULT_PARAMS.pool_threads_per_process
 
 # Set in each pool child by _pool_init and read by _pool_process_window.
 # Module-level because ProcessPoolExecutor's initializer has nowhere else
@@ -814,17 +851,24 @@ _POOL_THREADS_PER_PROCESS = 1
 _POOL_STATE: dict = {}
 
 
-def _pool_init(gallery: np.ndarray, job_id: str, all_cuts: list[float]) -> None:
+def _pool_init(
+    gallery: np.ndarray, job_id: str, all_cuts: list[float],
+    params: GestureParams = DEFAULT_PARAMS,
+) -> None:
     """Runs once per pool child: caps threads, then loads the three models
     that child will reuse for every window it is handed.
 
-    The gallery, job id and cut list arrive here rather than as per-window
-    arguments because they are the same for the whole job — passing them
-    per task would re-pickle ~140KB several hundred times for nothing.
+    The gallery, job id, cut list and params arrive here rather than as
+    per-window arguments because they are the same for the whole job —
+    passing them per task would re-pickle ~140KB several hundred times for
+    nothing. `params` in particular MUST come through this path: a spawned
+    child imports this module fresh, so it would otherwise fall back to the
+    module defaults and silently process some of a job's windows with
+    different settings from the rest.
     """
     import cv2 as _cv2
 
-    _cv2.setNumThreads(_POOL_THREADS_PER_PROCESS)
+    _cv2.setNumThreads(params.pool_threads_per_process)
 
     # A child now gets its own store, solely to share per-scene tracklet
     # decisions with its siblings (see _scene_decision). Results still come
@@ -840,10 +884,10 @@ def _pool_init(gallery: np.ndarray, job_id: str, all_cuts: list[float]) -> None:
                        "scene decisions will not be shared")
         store = None
 
-    worker = GestureWorker(store=store)
+    worker = GestureWorker(store=store, params=params)
     worker._open_landmarker()
     worker._detector = _detector.load_detector(
-        intra_op_threads=_POOL_THREADS_PER_PROCESS
+        intra_op_threads=params.pool_threads_per_process
     )
     worker._ensure_reid_model()          # also caps torch to one thread
 
@@ -1010,11 +1054,20 @@ def _ensure_model(path: Path, url: str, name: str) -> None:
 
 
 class GestureWorker:
-    def __init__(self, store: Optional[FeatureStore]):
+    def __init__(
+        self,
+        store: Optional[FeatureStore],
+        params: GestureParams = DEFAULT_PARAMS,
+    ):
         # None only for a pool child (see _pool_init): it computes window
         # features and hands them back to the parent, which owns every
         # write. Anything calling process_job needs a real store.
         self.store = store
+        # Every tunable this worker uses, so a per-video override reaches
+        # detection, identity, tracklets and selection from one object —
+        # see workers/_gesture_params.py. Pool children are handed a copy
+        # through _pool_init; nothing reads the module-level constants.
+        self.params = params
         self._pose_landmarker = None  # per-job, see process_job
         self._reid_model = None  # per-worker-instance, lazy — see _ensure_reid_model
         self._detector = None    # per-worker-instance, lazy — see _ensure_detector
@@ -1061,7 +1114,8 @@ class GestureWorker:
                 running_mode=vision.RunningMode.IMAGE,
                 num_poses=1,
                 output_segmentation_masks=False,
-                min_pose_detection_confidence = 0.60,
+                min_pose_detection_confidence=self.params.pose_detection_confidence,
+                min_pose_presence_confidence=self.params.pose_presence_confidence,
             )
         )
         self._mp = mp  # stashed for mp.Image/mp.ImageFormat use in the per-frame loop
@@ -1095,7 +1149,7 @@ class GestureWorker:
         finds people at all."""
         if self._detector is not None:
             return
-        self._detector = _detector.load_detector()
+        self._detector = _detector.load_detector(intra_op_threads=self.params.pool_threads_per_process)
 
     def process_job(
         self,
@@ -1137,7 +1191,7 @@ class GestureWorker:
             [c for c in cuts if start <= c < end] for start, end in windows
         ]
 
-        if _POOL_PROCESSES > 1:
+        if self.params.pool_processes > 1:
             self._process_windows_pooled(job_id, meta, windows, per_window_cuts, gallery, cuts)
         else:
             self._process_windows_inline(job_id, meta, windows, per_window_cuts, gallery, cuts)
@@ -1197,12 +1251,13 @@ class GestureWorker:
         """
         logger.info(
             f"[gesture] Processing {len(windows)} windows across "
-            f"{_POOL_PROCESSES} processes"
+            f"{self.params.pool_processes} processes"
         )
         ctx = multiprocessing.get_context("spawn")
         with ProcessPoolExecutor(
-            max_workers=_POOL_PROCESSES, mp_context=ctx,
-            initializer=_pool_init, initargs=(gallery, job_id, cuts),
+            max_workers=self.params.pool_processes, mp_context=ctx,
+            initializer=_pool_init,
+            initargs=(gallery, job_id, cuts, self.params),
         ) as pool:
             futures = {
                 pool.submit(
@@ -1320,23 +1375,25 @@ class GestureWorker:
         ):
             fi = int(round(ts * meta.fps))
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            dets = _detector.detect_people(self._detector, rgb)
+            dets = _detector.detect_people(
+                self._detector, rgb, conf_threshold=self.params.conf_threshold
+            )
             per_frame.append((fi, [d.box for d in dets]))
             # Sample sparsely: one crop per detection every _TRACK_ID_STRIDE
             # frames is plenty to identify a track, and each costs a mask
             # build (~4.8ms) that the rest of this pass avoids.
-            if fi % _TRACK_ID_STRIDE == 0:
+            if fi % self.params.track_id_stride == 0:
                 for d in dets:
                     crop = _reid.crop_via_mask(rgb, d.mask, d.box)
                     if crop is not None:
                         crops[(fi, d.box)] = crop
 
-        tracks = _associate(per_frame)
+        tracks = _associate(per_frame, self.params)
         for t in tracks:
             samples = [
                 crops[(fi, box)] for fi, box in t.boxes.items()
                 if (fi, box) in crops
-            ][:_TRACK_ID_SAMPLES]
+            ][:self.params.track_id_samples]
             if not samples:
                 continue
             # Max over samples, matching runtime's max-pooled matching:
@@ -1346,7 +1403,7 @@ class GestureWorker:
                 for c in samples
             )
 
-        chosen = _select_tracklet(tracks, meta.width, meta.height)
+        chosen = _select_tracklet(tracks, meta.width, meta.height, self.params)
         if chosen is None:
             logger.debug(
                 f"[gesture] scene {scene_start:.1f}-{scene_end:.1f}s: "
@@ -1354,16 +1411,15 @@ class GestureWorker:
             )
             return {"ambiguous": False}
 
-        passers = [t for t in tracks if t.score is not None
-                   and t.score > _GALLERY_MATCH_THRESHOLD
-                   and t.support >= _TRACK_MIN_SUPPORT]
+        passers = _gallery_passing_tracks(tracks, self.params)
+        key = self.params.tie_break_key
         logger.info(
             f"[gesture] scene {scene_start:.1f}-{scene_end:.1f}s: {len(passers)} "
-            f"tracklets passed the gallery; chose the one at median centre "
-            f"distance {chosen.median_centre_distance(meta.width, meta.height):.3f} "
+            f"tracklets passed the gallery; {self.params.tie_break} chose the "
+            f"one scoring {chosen.median_key(meta.width, meta.height, key):.3f} "
             f"({chosen.support} frames) over "
             + ", ".join(
-                f"{t.median_centre_distance(meta.width, meta.height):.3f}"
+                f"{t.median_key(meta.width, meta.height, key):.3f}"
                 f"({t.support}f, score {t.score:.2f})"
                 for t in passers if t is not chosen
             )
@@ -1499,7 +1555,9 @@ class GestureWorker:
             # gallery job) mask crops, both of which the detector supplies
             # directly, so pose inference is deferred until exactly one
             # candidate has been chosen.
-            detections = _detector.detect_people(self._detector, rgb)
+            detections = _detector.detect_people(
+                self._detector, rgb, conf_threshold=self.params.conf_threshold
+            )
 
             if not detections:
                 ref_pos, ref_emb, lock_age = None, None, 0
@@ -1526,17 +1584,17 @@ class GestureWorker:
                 # *rejects* — it can invalidate a lock but never choose who
                 # holds it, so it cannot put the wrong person on the track.
                 needs_anchor = (
-                    _dist(centers[chosen], ref_pos) > _MAX_TRACK_JUMP
+                    _dist(centers[chosen], ref_pos) > self.params.max_track_jump
                     # The lease bypasses continuity deliberately: it only
                     # bounds drift if failing it actually breaks the lock.
-                    or lock_age + 1 > _LOCK_LEASE_FRAMES
+                    or lock_age + 1 > self.params.lock_lease_frames
                 )
 
             if not needs_anchor:
                 lock_age += 1
                 emb = self._embed_candidate(rgb, detections[chosen])
                 if emb is None or ref_emb is None or (
-                    float(emb @ ref_emb) < _CONTINUITY_THRESHOLD
+                    float(emb @ ref_emb) < self.params.continuity_threshold
                 ):
                     # Continuity failed — fall through to the gallery on
                     # *this* frame rather than dropping it. A frame the
@@ -1749,7 +1807,7 @@ class GestureWorker:
             if emb is None:
                 continue
             score = _reid.max_similarity(emb, gallery)
-            if score > _GALLERY_MATCH_THRESHOLD:
+            if score > self.params.gallery_match_threshold:
                 passing.append((i, emb, score))
 
         if not passing:
@@ -1761,14 +1819,14 @@ class GestureWorker:
         # Two or more gallery-confirmed candidates: the nearest to frame
         # centre wins. Score is used only to break an exact distance tie,
         # so the choice is deterministic.
+        tie_key = self.params.tie_break_key
         i, emb, _ = min(
             passing,
-            key=lambda p: (_dist(_box_center(detections[p[0]].box, w, h), _FRAME_CENTER),
-                           -p[2]),
+            key=lambda p: (tie_key(_box_center(detections[p[0]].box, w, h)), -p[2]),
         )
         logger.debug(
             f"[gesture] {len(passing)} candidates cleared the gallery; "
-            f"centrality chose #{i} over "
+            f"{self.params.tie_break} chose #{i} over "
             + ", ".join(f"#{p[0]}({p[2]:.2f})" for p in passing if p[0] != i)
         )
         return i, emb
