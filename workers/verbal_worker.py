@@ -54,6 +54,14 @@ _SPACY_MODELS: dict[str, str] = {
 # _transcribe_alt) to route another language the same way.
 _ALT_ASR_LANGS = frozenset({"zh"})
 
+# Scripts written without spaces between words. These are the languages whose
+# ASR output is not already a list of words — the recogniser emits roughly one
+# token per character and the segmenter is what produces words — so they are
+# the ones whose transcript must be joined with no separator before spaCy sees
+# it, and the ones whose word_count is re-counted against spaCy rather than
+# taken from the ASR (see process_job and _process_window).
+_LOGOGRAPHIC = frozenset({"zh", "ja", "ko"})
+
 # If set, _transcribe_alt calls this URL instead of loading SenseVoice
 # (funasr + torch) into this process at all — see colab/sensevoice_server.ipynb.
 # SENSEVOICE_API_KEY must match whatever API_KEY that notebook was given.
@@ -233,18 +241,36 @@ class VerbalWorker:
             f"(language: {lang_code})"
         )
 
+        # The spaCy doc is built here, before the window loop, rather than
+        # inside _compute_corpus_stats afterwards, because logographic windows
+        # need it to count words — see _process_window.
+        doc, join_sep = self._build_transcript_doc(all_tokens, lang_code)
+        segmented_tokens = self._segmented_or_empty(doc, all_tokens, join_sep)
+
+        # Only logographic scripts re-count against spaCy. For a space-
+        # separated language the ASR's tokens already are words, and are the
+        # more reliable count of them: spaCy additionally splits contractions
+        # and hyphenated compounds and emits punctuation as its own token
+        # ("So, I don't think well-known leaders" is 9 ASR tokens and 14 spaCy
+        # ones), none of which is a disagreement about how many words were
+        # spoken. Chinese is the case where the ASR genuinely cannot count
+        # words, because SenseVoice emits roughly one token per character and
+        # only pkuseg groups them — 234k characters against 130k words on Yixi.
+        window_segments = segmented_tokens if lang_code in _LOGOGRAPHIC else None
+
         for idx, (start, end) in enumerate(windows):
             try:
                 window_tokens = [t for t in all_tokens if start <= t.start_s < end]
-                features = self._process_window(start, end, window_tokens)
+                features = self._process_window(start, end, window_tokens,
+                                                window_segments)
                 self.store.put_verbal(job_id, idx, features)
                 logger.debug(f"[verbal] window {idx} done")
             except Exception as exc:
                 logger.error(f"[verbal] Window {idx} failed: {exc}")
 
         try:
-            wordlist, ngrams, collocations, segmented_tokens = self._compute_corpus_stats(
-                all_tokens, lang_code
+            wordlist, ngrams, collocations = self._compute_corpus_stats(
+                all_tokens, lang_code, doc
             )
             self.store.put_wordlist(job_id, wordlist)
             self.store.put_ngrams(job_id, ngrams)
@@ -476,13 +502,74 @@ class VerbalWorker:
         start_s: float,
         end_s: float,
         tokens: list[WordToken],
+        segmented: Optional[list[dict]] = None,
     ) -> VerbalFeatures:
+        """Build one window's verbal features.
+
+        *tokens* are the ASR's own tokens for this window. *segmented* is the
+        whole transcript re-tokenized by spaCy, with timestamps mapped back
+        (see _segment_words), and is passed only for logographic scripts,
+        where the ASR emits characters rather than words; for everything else
+        it is None and the ASR's own count stands, which is the more reliable
+        word count there. Either way `word_count` means words — that is the
+        point, since counting ASR tokens meant "words" in English and
+        "characters" in Chinese under one field name.
+        """
+        if segmented:
+            word_count = sum(1 for s in segmented if start_s <= s["start_s"] < end_s)
+        else:
+            word_count = len(tokens)
         return VerbalFeatures(
             window=TimeWindow(start_s=start_s, end_s=end_s),
             transcript=" ".join(t.word for t in tokens),
             tokens=tokens,
-            word_count=len(tokens),
+            word_count=word_count,
         )
+
+    def _build_transcript_doc(self, all_tokens: list[WordToken], lang_code: str):
+        """Tokenize the whole transcript once. Returns (doc | None, join_sep).
+
+        Split out of _compute_corpus_stats so the window loop and the word list
+        share one tokenization — two spaCy passes over the same text would be
+        both wasteful and a chance for them to disagree.
+        """
+        nlp = self._get_nlp(lang_code)
+        # Chinese (and other logographic scripts) must be joined without spaces
+        # so that spaCy's pkuseg-based tokenizer can segment words correctly.
+        join_sep = "" if lang_code in ("zh", "ja", "ko") else " "
+        text = join_sep.join(t.word for t in all_tokens)
+        if not (nlp and text.strip()):
+            return None, join_sep
+
+        if len(text) > nlp.max_length:
+            # The doc would cover only a prefix, so every window past the cut
+            # would count zero words and look like silence. Refusing the doc
+            # for window counts is worse than a wrong number only if it goes
+            # unnoticed, hence the error-level log.
+            logger.error(
+                f"[verbal] Transcript is {len(text)} chars, over spaCy's "
+                f"max_length of {nlp.max_length} — word counts would be "
+                f"truncated. Falling back to ASR token counts for this video."
+            )
+            return None, join_sep
+
+        keep_glued = frozenset() if lang_code in ("zh", "ja", "ko") else _EN_NUMBER_GLUE_KEEP
+        return self._build_doc(nlp, text, keep_glued), join_sep
+
+    def _segmented_or_empty(self, doc, all_tokens: list[WordToken],
+                            join_sep: str) -> list[dict]:
+        """spaCy tokens with timestamps, or [] if that is not possible."""
+        if doc is None:
+            logger.warning(
+                "[verbal] No spaCy doc — word_count falls back to ASR tokens, "
+                "which for Chinese counts characters rather than words."
+            )
+            return []
+        try:
+            return self._segment_words(doc, all_tokens, len(join_sep))
+        except Exception as exc:
+            logger.error(f"[verbal] Token segmentation failed: {exc}")
+            return []
 
     @staticmethod
     def _segment_words(doc, all_tokens: list[WordToken], sep_len: int) -> list[dict]:
@@ -495,7 +582,7 @@ class VerbalWorker:
         reading from the exact same tokenization, for every language.
 
         This matters differently depending on how the transcript was joined
-        for spaCy (see _compute_corpus_stats' join_sep):
+        for spaCy (see _build_transcript_doc's join_sep):
         - CJK (sep_len=0, no separator): a single spaCy word can span
           *multiple* original per-character Whisper tokens, since pkuseg
           merges individual characters into real multi-character words. Uses
@@ -597,33 +684,27 @@ class VerbalWorker:
         return doc
 
     def _compute_corpus_stats(
-        self, all_tokens: list[WordToken], lang_code: str
-    ) -> tuple[dict, dict, dict, list]:
+        self, all_tokens: list[WordToken], lang_code: str, doc=None
+    ) -> tuple[dict, dict, dict]:
         """
-        Build word list, n-grams, collocations, and a spaCy-word-segmented
-        token list (with timestamps mapped back from the original Whisper
-        tokens — see _segment_words) from the full transcript. Uses the
-        spaCy model for *lang_code* if available, tokenized via _build_doc
-        (rather than calling nlp(text) directly) so a number glued onto
-        adjacent content with no boundary ("5apples", "30年") — which
-        neither faster-whisper nor spaCy's own tokenizer reliably splits on
-        its own — gets corrected before tagging/parsing, for every language.
-        Returns (wordlist, ngrams, collocations, segmented_tokens).
+        Build word list, n-grams and collocations from the full transcript.
+
+        *doc* is the already-tokenized transcript from _build_transcript_doc —
+        passed in rather than built here so that the window loop and the word
+        list are guaranteed to be counting the same tokens. Tokenization goes
+        through _build_doc (rather than calling nlp(text) directly) so a number
+        glued onto adjacent content with no boundary ("5apples", "30年") —
+        which neither faster-whisper nor spaCy's own tokenizer reliably splits
+        on its own — gets corrected before tagging/parsing, for every language.
+
+        Returns (wordlist, ngrams, collocations). The segmented token list is
+        produced by _segmented_or_empty in process_job, which needs it before
+        this runs.
         """
-        nlp = self._get_nlp(lang_code)
-        # Chinese (and other logographic scripts) must be joined without spaces
-        # so that spaCy's jieba-based tokenizer can segment words correctly.
-        join_sep = "" if lang_code in ("zh", "ja", "ko") else " "
-        text = join_sep.join(t.word for t in all_tokens)
         raw_words = [t.word.lower().strip(".,!?\"'") for t in all_tokens if t.word.strip()]
 
-        # ── spaCy pass (word list) ───────────────────────────────────────
-        doc = None
-        if nlp and text.strip():
-            nlp_text = text[: nlp.max_length]
-            keep_glued = frozenset() if lang_code in ("zh", "ja", "ko") else _EN_NUMBER_GLUE_KEEP
-            doc = self._build_doc(nlp, nlp_text, keep_glued)
-
+        # ── word list ────────────────────────────────────────────────────
+        if doc is not None:
             # Keyed by surface form, not lemma — "run"/"running"/"ran" get
             # separate rows with their own counts, consistent with the
             # surface-form keying used for collocations (core/corpus_analysis.py).
@@ -631,7 +712,17 @@ class VerbalWorker:
             # zh_core_web_sm (mis-tags real content words like 大/是), and for
             # consistency N-grams/Collocations never filtered stop words
             # either, so the word list doesn't filter them for any language.
-            word_data: dict[str, dict] = {}
+            # Keyed by (word, pos), not by word alone. Keying by word and
+            # recording the *first* token's tag — which is what this did — left
+            # every later occurrence filed under whichever sense happened to
+            # appear first in the talk, so a tag was a sample of one token
+            # rather than a distribution. The symptom was that a word's tags
+            # partitioned the corpus perfectly: `to` came out PART in 30 videos
+            # and ADP in 9, with no video ever showing both, although almost
+            # every talk uses both. Counts were never affected — each token was
+            # still counted once — but any per-tag figure was an artefact of
+            # word order.
+            word_data: Counter = Counter()
             for token in doc:
                 if token.is_punct:
                     continue
@@ -644,19 +735,17 @@ class VerbalWorker:
                 word = corpus_analysis._clean_word(token.text.lower())
                 if not word or not word.isalpha():
                     continue
-                if word not in word_data:
-                    word_data[word] = {"pos": token.pos_, "count": 0}
-                word_data[word]["count"] += 1
+                word_data[(word, token.pos_)] += 1
 
-            total = max(sum(v["count"] for v in word_data.values()), 1)
+            total = max(sum(word_data.values()), 1)
             word_entries = [
                 {
                     "word":          word,
-                    "pos":           d["pos"],
-                    "count":         d["count"],
-                    "freq_per_1000": round(d["count"] * 1000 / total, 2),
+                    "pos":           pos,
+                    "count":         count,
+                    "freq_per_1000": round(count * 1000 / total, 2),
                 }
-                for word, d in sorted(word_data.items(), key=lambda x: -x[1]["count"])
+                for (word, pos), count in word_data.most_common()
             ]
         else:
             counts = Counter(w for w in raw_words if w.isalpha())
@@ -705,18 +794,11 @@ class VerbalWorker:
             except Exception as exc:
                 logger.warning(f"[verbal] Collocations extraction failed: {exc}")
 
-        # ── Word-segmented tokens for Concordance (all languages) ────────
-        # Built from the same doc as Word List/Collocations/Word Sketch/
-        # Distributional Thesaurus, rather than Whisper's raw, un-reprocessed
-        # word list, so Concordance can never disagree with them about what
-        # words exist in the transcript (e.g. English contractions/hyphenated
-        # compounds that spaCy splits differently than Whisper's own word
-        # boundaries, or CJK words pkuseg merges from multiple characters).
-        segmented_tokens: list[dict] = []
-        if doc is not None:
-            try:
-                segmented_tokens = self._segment_words(doc, all_tokens, len(join_sep))
-            except Exception as exc:
-                logger.warning(f"[verbal] Word segmentation failed: {exc}")
-
-        return wordlist, ngrams, collocations, segmented_tokens
+        # The word-segmented token list that used to be built here now comes
+        # from _segmented_or_empty, called before the window loop in
+        # process_job — the windows need it to count words, and building it
+        # twice would risk the two copies disagreeing. It is still derived from
+        # this same doc, so Concordance cannot disagree with Word List,
+        # Collocations, Word Sketch or the Distributional Thesaurus about what
+        # words exist in the transcript.
+        return wordlist, ngrams, collocations

@@ -9,6 +9,7 @@ records, then enriches them with cross-modal derived features
 from __future__ import annotations
 
 import math
+import re
 
 import numpy as np
 from loguru import logger
@@ -17,6 +18,12 @@ from core.feature_store import FeatureStore
 from core.models import (
     FusedWindow, HorizontalAngle, PoseKeyframe, ShotType, TimeWindow, VerticalAngle,
 )
+
+# Han characters, for the speech-rate branch in _enrich. Deliberately not the
+# whole CJK range: Japanese kana are syllabic, but one kanji is read as one to
+# four morae, so counting kanji as syllables would undercount a Japanese
+# transcript while looking like it worked. This claims Chinese only.
+_HAN_CHAR = re.compile(r"[㐀-䶿一-鿿豈-﫿]")
 
 
 # MediaPipe BlazePose 33-point skeleton indices — see
@@ -239,12 +246,29 @@ class FusionEngine:
     # ------------------------------------------------------------------
 
     def _enrich(self, fused: FusedWindow) -> FusedWindow:
-        # 1. Speech rate: word count / window duration as a proxy
+        # 1. Speech rate, by script.
+        #
+        # Chinese is counted, not estimated: one Han character is one syllable,
+        # so the transcript gives the syllable count directly and exactly. The
+        # branch is on the transcript rather than on a language label because
+        # fusion has no language code, and the script is the thing that
+        # actually decides which method is valid.
+        #
+        # Everything else keeps the alphabetic estimate — word count times an
+        # assumed 1.5 syllables per word. That is a rough figure, but it is the
+        # right shape for English, where the ASR's tokens really are words.
+        # Applying it to Chinese was not: there the ASR emits one token per
+        # character, so `word_count` was already a syllable count and the
+        # multiplier inflated Mandarin by about 1.66x.
         if fused.verbal and fused.prosody:
             duration = fused.window.duration
             if duration > 0:
-                words_per_s = fused.verbal.word_count / duration
-                fused.prosody.speech_rate_syl_per_s = words_per_s * 1.5
+                han = len(_HAN_CHAR.findall(fused.verbal.transcript or ""))
+                if han:
+                    fused.prosody.speech_rate_syl_per_s = han / duration
+                else:
+                    words_per_s = fused.verbal.word_count / duration
+                    fused.prosody.speech_rate_syl_per_s = words_per_s * 1.5
 
         # 2. Pose-based shot classification + camera angle (both from world landmarks)
         if fused.gesture and fused.camera and fused.gesture.pose_keyframes:

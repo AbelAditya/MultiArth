@@ -21,6 +21,13 @@ queryable, rather than mixed into one collection with a discriminator field:
   {collection}_fused_windows   one doc per (job_id, window_idx), a FusedWindow
   {collection}_artifacts       one doc per job_id: wordlist, ngrams,
                                 collocations, spectrogram, waveform
+  {collection}_prosody_dense   one doc per job_id: f0 + intensity at a fixed
+                                hop (~10ms), as float32 binary — see
+                                put_dense_prosody
+
+Flagging runs are deliberately NOT stored here: they are cheap to recompute,
+they change whenever the manifest does, and the clusters are nearly full.
+They live as files instead — see core/flag_runner.py's save_run.
 
 Fused windows stay a separate per-window collection (not embedded in the
 video doc) regardless of corpus, so long videos with many windows never
@@ -79,6 +86,7 @@ import time
 from typing import Optional
 
 import bson
+import numpy as np
 from loguru import logger
 from pymongo import MongoClient
 from pymongo.errors import OperationFailure
@@ -87,6 +95,7 @@ from .models import AnalysisJob, FusedWindow
 
 _COLLECTION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _VIDEOS_SUFFIX = "_videos"
+_DENSE_PROSODY_SUFFIX = "_prosody_dense"
 _FUSED_WINDOWS_SUFFIX = "_fused_windows"
 _ARTIFACTS_SUFFIX = "_artifacts"
 
@@ -387,6 +396,88 @@ class ResultsRepository:
         )
 
     # ------------------------------------------------------------------
+    # Dense prosody (word-level pitch; see scripts/backfill_dense_prosody.py)
+    # ------------------------------------------------------------------
+
+    def put_dense_prosody(
+        self, collection: str, job_id: str, *,
+        hop_s: float, f0: "np.ndarray", intensity_db: "np.ndarray",
+        params: dict,
+    ) -> str:
+        """Store one job's f0 and intensity contours at their native hop.
+
+        Everything else here is per-5s-window; this is the raw contour, kept
+        because word-level questions ("what was the pitch while she said
+        *this*") cannot be answered from a window mean — a 5s window spans
+        ~15 words. See MultiArth_Search_Bar_QUANTITATIVE.docx section 7.1.
+
+        Stored as float32 **binary**, not JSON numbers: a 13-minute talk at a
+        10ms hop is ~78k samples per contour, which as BSON doubles would be
+        several MB per video and push a nearly-full free-tier cluster over
+        its quota. Binary float32 is ~310KB per contour, and NaN marks
+        unvoiced frames (Praat reports 0 there, which would otherwise be
+        read as a real 0Hz measurement).
+
+        Placement is by capacity, not by where the job's other documents
+        live: the older shards are close to full, and a contour is
+        self-contained — `get_dense_prosody` searches every shard, so it does
+        not need to sit beside its job.
+        """
+        _validate_collection(collection)
+        doc = {
+            "_id": job_id,
+            "hop_s": float(hop_s),
+            "n_samples": int(len(f0)),
+            "f0": bson.Binary(np.asarray(f0, dtype=np.float32).tobytes()),
+            "intensity_db": bson.Binary(
+                np.asarray(intensity_db, dtype=np.float32).tobytes()
+            ),
+            "params": params,
+            "created_at": time.time(),
+        }
+        estimate = len(doc["f0"]) + len(doc["intensity_db"]) + 1024
+        budget = self._shard_limit_bytes * _FILL_RATIO
+        for shard in self.shards:
+            if shard.full:
+                continue
+            used = shard.used_bytes() if len(self.shards) > 1 else 0
+            if used + estimate > budget:
+                continue
+            shard.db[collection + _DENSE_PROSODY_SUFFIX].replace_one(
+                {"_id": job_id}, doc, upsert=True
+            )
+            return shard.name
+        raise RuntimeError(
+            f"No shard has room for {job_id}'s dense prosody "
+            f"({estimate / 1e6:.1f}MB) — add another cluster as "
+            f"MONGO_URI_{len(self.shards) + 1}"
+        )
+
+    def get_dense_prosody(self, collection: str, job_id: str) -> Optional[dict]:
+        """Returns {hop_s, f0, intensity_db, params} with the contours as
+        float32 arrays (NaN = unvoiced), or None if this job has none."""
+        _validate_collection(collection)
+        for shard in self.shards:
+            doc = shard.db[collection + _DENSE_PROSODY_SUFFIX].find_one({"_id": job_id})
+            if doc:
+                return {
+                    "hop_s": doc["hop_s"],
+                    "f0": np.frombuffer(doc["f0"], dtype=np.float32),
+                    "intensity_db": np.frombuffer(doc["intensity_db"], dtype=np.float32),
+                    "params": doc.get("params", {}),
+                }
+        return None
+
+    def has_dense_prosody(self, collection: str, job_id: str) -> bool:
+        _validate_collection(collection)
+        return any(
+            shard.db[collection + _DENSE_PROSODY_SUFFIX].find_one(
+                {"_id": job_id}, {"_id": 1}
+            )
+            for shard in self.shards
+        )
+
+    # ------------------------------------------------------------------
     # Dedup lookup (bulk skip-if-already-shipped) — every shard, fail hard
     # ------------------------------------------------------------------
 
@@ -412,6 +503,7 @@ class ResultsRepository:
             videos.delete_one({"_id": job_id})
             fused_windows.delete_many({"job_id": job_id})
             artifacts.delete_one({"_id": job_id})
+            shard.db[collection + _DENSE_PROSODY_SUFFIX].delete_one({"_id": job_id})
         self._job_shard.pop(job_id, None)
 
     # ------------------------------------------------------------------
@@ -476,6 +568,48 @@ class ResultsRepository:
             FusedWindow(**{k: v for k, v in d.items() if k not in ("_id", "job_id", "window_idx")})
             for d in docs
         ]
+
+    # ------------------------------------------------------------------
+    # In-place patches (see scripts/backfill_verbal.py)
+    # ------------------------------------------------------------------
+    # Targeted $set rather than a re-ship. Both of these exist so that a
+    # quantity which can be recomputed from what is already stored — no audio,
+    # no video, no re-download — can be corrected without rewriting documents
+    # whose other fields are large and unchanged. save_artifacts in particular
+    # replaces the whole document, which would drop the ~2MB spectrogram just
+    # to change a word list.
+
+    def update_wordlist(self, collection: str, job_id: str, wordlist: dict) -> bool:
+        """Replace one job's word list, leaving its other artifacts untouched."""
+        shard = self._locate(collection, job_id)
+        if shard is None:
+            raise KeyError(f"{job_id} not found in {collection} on any shard")
+        _, _, artifacts = self._collections(collection, shard)
+        result = artifacts.update_one({"_id": job_id}, {"$set": {"wordlist": wordlist}})
+        return result.matched_count > 0
+
+    def update_window_fields(
+        self, collection: str, job_id: str, updates: dict[int, dict],
+    ) -> int:
+        """Patch fields on individual fused windows. Returns windows modified.
+
+        *updates* maps window_idx to a dict of dotted field paths and values,
+        e.g. {0: {"verbal.word_count": 14}}. Sent as one bulk write, because a
+        13-minute talk is ~160 windows and a round trip each would dominate.
+        """
+        from pymongo import UpdateOne
+
+        shard = self._locate(collection, job_id)
+        if shard is None:
+            raise KeyError(f"{job_id} not found in {collection} on any shard")
+        if not updates:
+            return 0
+        _, fused_windows, _ = self._collections(collection, shard)
+        ops = [
+            UpdateOne({"job_id": job_id, "window_idx": idx}, {"$set": fields})
+            for idx, fields in sorted(updates.items())
+        ]
+        return fused_windows.bulk_write(ops, ordered=False).modified_count
 
     def get_artifacts(self, collection: str, job_id: str) -> Optional[dict]:
         shard = self._locate(collection, job_id)
