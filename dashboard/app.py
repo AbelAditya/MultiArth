@@ -3312,7 +3312,12 @@ def kw_thesaurus(keyword, job_id, data_source, collection):
     wl = artifacts.get("wordlist")
     freq_map: dict[str, int] = {}
     if wl and wl.get("words"):
-        freq_map = {e["word"]: e["count"] for e in wl["words"]}
+        # Summed, not assigned: the word list has one row per (word, POS), so
+        # a word used as both noun and verb appears twice and a plain dict
+        # comprehension would silently keep only the last row's count.
+        freq_map = {}
+        for e in wl["words"]:
+            freq_map[e["word"]] = freq_map.get(e["word"], 0) + e["count"]
 
     rows = [
         {
