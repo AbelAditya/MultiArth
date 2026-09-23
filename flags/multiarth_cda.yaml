@@ -1,0 +1,355 @@
+# Multimodal discursive-function flags — seed manifest
+#
+# Encodes the ten functions and the co-occurrence rule from
+# FLAGS SYS X ABEL.xlsx. Everything here is data: to change how a category is
+# cut, which words count as a cognition verb, or how many elements a flag
+# needs, edit this file and bump `version`. Nothing in core/flagging.py knows
+# what a "discursive function" is.
+#
+# Results store this file's id, version and content hash, so a flag in a
+# thesis can be traced to the exact rule that produced it.
+#
+# STATUS: the lexicons below are the spreadsheet's *examples*, not curated
+# lists. Until they are completed by hand, verbal criteria will match only
+# these words, and the near-miss report in the notebook shows what that costs.
+
+id: multiarth-cda
+version: 4
+window_s: 5
+
+# ── continuous features → labels ────────────────────────────────────────
+# Default is tertiles computed per speaker: an absolute Hz or pixel threshold
+# would mostly sort speakers by voice type and body size rather than by
+# discourse style.
+variables:
+  pitch_level:
+    source: pitch_st            # semitones from the speaker's own median
+    scope: per_speaker
+    method: tertiles
+    labels: [low, medium, high]
+
+  pitch_variation:
+    source: pitch_var_st
+    scope: per_speaker
+    method: quantiles
+    edges: [0.5]                # median split
+    labels: [steady, varying]
+
+  wrist_velocity:
+    source: wrist_speed_mean    # shoulder-widths per second, body-normalised
+    scope: per_speaker
+    method: tertiles
+    labels: [low, medium, high]
+
+  # Already categorical in the pipeline — passed through, lower-cased.
+  shot:
+    source: dominant_shot_type
+    method: passthrough
+    # The stored vocabulary is finer than the rules need; map the extremes
+    # onto the categories the spreadsheet speaks.
+    map:
+      ShotType.EXTREME_CLOSE_UP: close_up
+      ShotType.CLOSE_UP: close_up
+      ShotType.MEDIUM_CLOSE: medium_close
+      ShotType.MEDIUM: medium
+      ShotType.MEDIUM_LONG: medium_long
+      ShotType.LONG: long
+      ShotType.VERY_LONG: very_long
+  horizontal:
+    source: horizontal_angle
+    method: passthrough
+    map:
+      HorizontalAngle.FRONTAL: frontal
+      HorizontalAngle.OBLIQUE: oblique
+      HorizontalAngle.TRANSITIONAL: transitional
+  vertical:
+    source: vertical_angle
+    method: passthrough
+    map:
+      VerticalAngle.LOW: low
+      VerticalAngle.EYE_LEVEL: eye_level
+      VerticalAngle.HIGH: high
+
+# ── verbal slots, filled by lexicon hits ────────────────────────────────
+# `role` is load-bearing: flags 8 and 9 share a word list and differ only in
+# whether those words are the grammatical subject or the object.
+elements:
+  subject: {role: subject}
+  object:  {role: object}
+  verb:    {role: any}
+
+lexicons:
+  first_singular:
+    pos: [PRON]
+    match: lemma
+    en: [i, me, my, mine, myself]
+    zh: [我, 我的]
+
+  first_plural:
+    pos: [PRON]
+    match: lemma
+    en: [we, us, our, ours, ourselves]
+    zh: [我们, 咱们, 我们的]
+
+  second_person:
+    pos: [PRON]
+    match: lemma
+    en: [you, your, yours, yourself, yourselves]
+    zh: [你, 你们, 您, 你的]
+
+  other_pronouns:
+    pos: [PRON]
+    match: lemma
+    en: [he, she, they, him, her, them, his, their, theirs, it, its]
+    zh: [他, 她, 它, 他们, 她们, 它们]
+
+  generic_subjects:
+    pos: [PRON, NOUN]
+    match: lemma
+    en: [one, people, everyone, everybody, someone, somebody, anyone]
+    zh: [人, 人们, 大家, 有人, 每个人]
+
+  proper_nouns:
+    pos: [PROPN]
+    match: lemma
+    en: []                      # any PROPN; see notes in the notebook
+    zh: []
+
+  non_pronominal_human:
+    pos: [NOUN]
+    match: lemma
+    en: [person, man, woman, child, student, teacher, worker, mother, father,
+         parent, friend, colleague, doctor, leader]
+    zh: [人, 男人, 女人, 孩子, 学生, 老师, 工人, 母亲, 父亲, 朋友, 同事, 医生]
+
+  women_terms:
+    pos: [NOUN, PROPN]
+    match: lemma
+    en: [woman, women, feminist, feminists, girl, girls, movement]
+    zh: [女性, 女人, 妇女, 姑娘, 美女, 女孩]
+
+  abstract_non_human:
+    pos: [NOUN]
+    match: lemma
+    en: [feminism, patriarchy, society, culture, history, power, system,
+         movement, oppression, inequality, discrimination, tradition]
+    zh: [女权主义, 女性主义, 父权, 社会, 文化, 历史, 权力, 制度, 压迫, 不平等, 歧视, 传统]
+
+  cognition_verbs:
+    pos: [VERB]
+    match: lemma
+    en: [know, think, believe, realise, realize, comprehend, recognise,
+         recognize, notice, assume, presume, suppose, suspect, guess,
+         understand, doubt, consider, contemplate, ponder, reflect, deduce,
+         infer, conclude]
+    zh: [知道, 认为, 明白, 懂, 认识, 理解, 了解, 意识到, 觉得, 相信, 以为, 猜,
+         怀疑, 想, 思考, 考虑, 分析]
+
+  material_verbs:
+    pos: [VERB]
+    match: lemma
+    en: [run, walk, jump, throw, catch, push, pull, carry, build, make, write,
+         draw, cook, bake, break, smash, tear, cut, bend, eat, drink, bite,
+         swallow, breathe]
+    zh: [走, 跑, 扔, 推, 拉, 拿, 做, 建, 盖, 写, 画, 打破, 切, 剪, 撕, 折, 吃,
+         喝, 咬, 呼吸]
+
+  perception_verbs:
+    pos: [VERB]
+    match: lemma
+    en: [feel, felt, experience, experienced, remember, see, saw, hear, heard,
+         watch, sense, live, lived]
+    zh: [感觉, 感到, experience, 记得, 看见, 听见, 看到, 听到, 经历, 体验]
+
+  agency_verbs:
+    pos: [VERB]
+    match: lemma
+    en: [fight, resist, reclaim, demand, organize, organise, challenge,
+         empower, mobilise, mobilize, lead, claim, protest]
+    zh: [争取, 反抗, 要求, 组织, 挑战, 赋权, 动员, 领导, 抗议]
+
+  passive_verbs:
+    pos: [VERB, AUX]
+    match: lemma
+    en: [tell, expect, silence, oppress, exclude, ignore, judge, blame]
+    zh: [被告知, 被期待, 被压迫, 被排斥, 被忽视, 被指责]
+
+  presentation_verbs:
+    pos: [VERB, AUX]
+    match: lemma
+    en: [be, is, are, show, indicate, prove, demonstrate, represent, mean]
+    zh: [是, 显示, 表明, 证明, 说明, 代表, 意味着]
+
+  emotional_lexis:
+    pos: [ADJ, ADV]
+    match: lemma
+    en: [angry, afraid, proud, ashamed, terrible, wonderful, painful,
+         beautiful, awful, incredible, deeply, painfully, desperately]
+    zh: [愤怒, 害怕, 骄傲, 羞愧, 可怕, 美好, 痛苦, 美丽, 难以置信, 深深]
+
+  causal_verbs:
+    pos: [VERB]
+    match: lemma
+    en: [cause, lead, produce, generate, result, determine, shape, drive]
+    zh: [导致, 引起, 产生, 造成, 决定, 塑造, 推动]
+
+# ── which element belongs to which modality ─────────────────────────────
+macro_categories:
+  verbal:   [subject, object, verb]
+  camera:   [shot, horizontal, vertical]
+  acoustic: [pitch_level, pitch_variation]
+  gesture:  [wrist_velocity]
+
+# ── the co-occurrence rule ──────────────────────────────────────────────
+rule:
+  min_elements: 5
+  require_each_macro: [verbal, camera, acoustic, gesture]
+
+# ── expected overlaps ───────────────────────────────────────────────────
+# From DEF_OVERLAPS in FLAGS SYS X ABEL.xlsx, which works out by hand which
+# pairs *can* co-occur under the rule: 19 of the 45 possible pairs, of which
+# 7 are residual. Declaring them here is purely for reporting — the engine
+# never consults this — so the overlap sheet can say whether an observed
+# co-occurrence was intended, expected between related functions, or neither.
+#
+# A designed pair that never occurs, or an "unexpected" pair that occurs
+# often, is a finding about the rule set rather than about the corpus.
+overlaps:
+  designed:            # affect as a cross-cutting dimension, and the two
+    - [F2, F5]         # deliberate agency overlaps
+    - [F3, F5]
+    - [F4, F5]
+    - [F5, F8]
+    - [F3, F8]         # collective female agency, "we women"
+    - [F7, F9]         # abstract agent acting on women
+  related:             # closely related functions
+    - [F1, F7]         # theoretical elaboration / construction of concepts
+    - [F4, F7]
+    - [F1, F6]         # individual authority / personal experience
+    - [F1, F4]         # individual vs collective
+    - [F2, F3]
+    - [F2, F8]         # individual material action / female agency
+  residual:            # neither designed nor closely related
+    - [F1, F5]
+    - [F5, F6]
+    - [F5, F7]
+    - [F4, F6]
+    - [F6, F7]
+    - [F7, F10]
+    - [F9, F10]
+
+# ── the flags ───────────────────────────────────────────────────────────
+flags:
+  - id: F1
+    name: Individual intellectual authority
+    criteria:
+      subject: [first_singular, proper_nouns]
+      verb: [cognition_verbs]
+      shot: [close_up, medium]
+      horizontal: [frontal, transitional]
+      vertical: [low]
+      pitch_level: [low]
+      pitch_variation: [steady]
+      wrist_velocity: [medium]
+
+  - id: F2
+    name: Individual material action
+    criteria:
+      subject: [first_singular, non_pronominal_human]
+      verb: [material_verbs]
+      shot: [close_up, medium]
+      horizontal: [frontal, transitional]
+      vertical: [low]
+      pitch_variation: [varying]
+      wrist_velocity: [high]
+
+  - id: F3
+    name: Collective material action
+    criteria:
+      subject: [first_plural]
+      verb: [material_verbs]
+      shot: [long, very_long]
+      horizontal: [frontal, transitional]
+      vertical: [high, eye_level]
+      pitch_variation: [varying]
+      wrist_velocity: [high]
+
+  - id: F4
+    name: Collective theorisation
+    criteria:
+      subject: [first_plural]
+      verb: [cognition_verbs]
+      shot: [long, very_long]
+      horizontal: [frontal, transitional]
+      vertical: [high, eye_level]
+      pitch_level: [high]
+      pitch_variation: [varying]
+      wrist_velocity: [medium]
+
+  - id: F5
+    name: Affective-persuasive
+    criteria:
+      subject: [first_singular, first_plural, second_person]
+      verb: [emotional_lexis]
+      shot: [close_up, medium_close]
+      horizontal: [frontal, transitional]
+      pitch_variation: [varying]
+      wrist_velocity: [medium, high]
+
+  - id: F6
+    name: Personal-experiential
+    criteria:
+      subject: [first_singular]
+      verb: [perception_verbs]
+      shot: [close_up, medium]
+      horizontal: [frontal, transitional]
+      vertical: [eye_level]
+      pitch_level: [low]
+      pitch_variation: [steady]
+      wrist_velocity: [medium]
+
+  - id: F7
+    name: Construction of non-human concepts
+    criteria:
+      subject: [abstract_non_human]
+      verb: [causal_verbs]
+      shot: [close_up, medium]
+      horizontal: [frontal, transitional]
+      vertical: [low, eye_level]
+      pitch_level: [low, medium]
+      pitch_variation: [steady]
+      wrist_velocity: [low, medium]
+
+  - id: F8
+    name: Women / feminism as agent
+    criteria:
+      subject: [women_terms]
+      verb: [agency_verbs]
+      shot: [close_up, medium]
+      horizontal: [frontal, transitional]
+      vertical: [low, eye_level]
+      pitch_level: [medium, high]
+      pitch_variation: [varying]
+      wrist_velocity: [high]
+
+  - id: F9
+    name: Women / feminism as patient
+    criteria:
+      object: [women_terms]
+      verb: [passive_verbs]
+      shot: [medium, long, very_long]
+      horizontal: [frontal, transitional]
+      vertical: [high]
+      pitch_variation: [steady]
+      wrist_velocity: [low]
+
+  - id: F10
+    name: Neutral distance
+    criteria:
+      subject: [generic_subjects]
+      verb: [presentation_verbs]
+      shot: [medium, long, very_long]
+      vertical: [low]
+      pitch_level: [low]
+      pitch_variation: [steady]
+      wrist_velocity: [low]
