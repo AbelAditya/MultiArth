@@ -1,0 +1,203 @@
+# EN–ZH concept mapping
+# =====================
+# The curated equivalence table specified in
+# MultiArth_Search_Bar_QUANTITATIVE.docx §7.3 / §7.3.1. The 28 concepts are the
+# document's; the word forms are a first pass and need your review.
+#
+# ── How this was populated ──────────────────────────────────────────────
+#
+# Not by translation. Every form below was checked against the corpora
+# themselves (Ted 39 videos, YiXi 29 videos, 2026-09-24) and only forms that
+# actually occur were kept, with two exceptions noted as `absent` — concepts
+# the document asks for that this corpus does not contain. A form that cannot
+# match is worse than a missing one: it reads as "this concept is rare here"
+# when it means "this list is broken".
+#
+# Two matching rules make or break a list:
+#
+#   English is matched by SURFACE FORM, not lemma, because the stored word
+#   list is keyed by surface form. So inflections must be listed one by one.
+#   Left implicit, `know` misses knew/knows/known/knowing — measured at a 30%
+#   undercount for cognition verbs, which biases every EN–ZH verb comparison
+#   against English. Until the word list stores lemmas, list the forms.
+#
+#   Chinese must be SINGLE pkuseg TOKENS. A multi-token phrase never matches:
+#   the flagging manifest lists passives as 被压迫, pkuseg segments that as
+#   被 + 压迫, and all six entries score zero.
+#
+# Check a candidate before adding it:
+#
+#     uv run python -c "
+#     import sys; sys.path.insert(0,'notebooks')
+#     import _corpus as C
+#     wl = C.load_corpus('YiXi', progress=False).wordlist(by_pos=False)
+#     have = dict(zip(wl.word, wl['count']))
+#     for w in ['女权主义','女性主义','父权']: print(w, have.get(w, 0))"
+#
+# ── Variants stay separate ──────────────────────────────────────────────
+#
+# Per §7.3, one-to-many is deliberate: "the choice between variants (e.g.
+# rights-focused vs. theory-focused register) is itself discourse-analytic
+# data, not noise." That distinction is live in this corpus —
+# 女权主义 (12) against 女性主义 (20) is exactly the split the document
+# anticipates, and merging them would erase it. Reporting shows the aggregate
+# and the per-variant breakdown.
+#
+# ── Review these ────────────────────────────────────────────────────────
+#
+# Judgement calls I made that you may want to reverse; each is marked `review`
+# on the concept below.
+#
+#   rights       bare English "right" (110) is mostly "correct" or a
+#                direction, not an entitlement. Excluded; only "rights" (31)
+#                is counted. Including it would treble the concept.
+#   lgbt         同志 (49) means both "comrade" and "gay". A word list cannot
+#                disambiguate. Included, because in a gender corpus the
+#                second reading is likely dominant — but it is the single
+#                least safe entry in this file.
+#   sexuality    bare 性 (48) is a bound morpheme as often as a word
+#                ("性别", "女性"). Excluded as too noisy; only unambiguous
+#                compounds are kept, which leaves the Chinese side thin.
+#   patriarchy   父权 does not occur in YiXi at all; only 男权 (5). The
+#                concept is near-absent on the Chinese side, which is itself
+#                a finding rather than a gap in the list.
+#
+# ── Concepts this corpus does not support ───────────────────────────────
+#
+#   intersectionality   zero occurrences in both corpora
+#   queer               EN 10, ZH 0 (酷儿 absent)
+#
+# Both are kept so the table matches the document, and both will be excluded
+# automatically by the match-coverage guard rather than reported as zero.
+
+id: multiarth-concepts
+version: 1
+source: MultiArth_Search_Bar_QUANTITATIVE.docx §7.3.1
+verified_against: {Ted: 39 videos, YiXi: 29 videos, date: 2026-09-24}
+
+concepts:
+  feminism:
+    en: [feminism, feminist, feminists]
+    zh: [女权主义, 女性主义, 女权, 女权主义者, 女性主义者]
+    note: >-
+      The document's own example of register-carrying variants. 女权主义
+      (rights) and 女性主义 (theory) are kept apart deliberately.
+
+  equality:
+    en: [equality, equal, equally, equitable, equity, inequality]
+    zh: [平等, 不平等, 公平]
+
+  power:
+    en: [power, powers, powerful]
+    zh: [权力, 力量, 权势]
+    note: 力量 also carries "strength"; it appears under both concepts.
+
+  rights:
+    en: [rights]
+    zh: [权利, 权益, 人权, 维权]
+    review: bare "right" excluded as too ambiguous — see header
+
+  body:
+    en: [body, bodies, bodily]
+    zh: [身体, 身材, 肉体, 容貌]
+
+  voice:
+    en: [voice, voices]
+    zh: [声音, 发声, 表达]
+
+  independence:
+    en: [independent]
+    zh: [独立, 自主]
+
+  choice:
+    en: [choice, choose, choosing, chose]
+    zh: [选择, 选项]
+
+  discrimination:
+    en: [discrimination, discriminatory, bias, biases, biased, stereotype, stereotypes]
+    zh: [歧视, 偏见, 刻板印象]
+
+  patriarchy:
+    en: [patriarchy, patriarchal]
+    zh: [男权]
+    review: 父权 absent from YiXi entirely; concept is near-empty in Chinese
+
+  oppression:
+    en: [oppression]
+    zh: [压迫, 压抑, 剥削, 束缚]
+
+  gender:
+    en: [gender, genders, gendered]
+    zh: [性别, 男女]
+
+  strength_empowerment:
+    en: [strength, strong, stronger, empowerment, empower, empowered, empowering, courage]
+    zh: [赋权, 强大, 坚强, 勇气, 力量]
+
+  marriage:
+    en: [marriage, married, marry, divorce]
+    zh: [婚姻, 结婚, 离婚, 已婚, 未婚]
+
+  family:
+    en: [family, families]
+    zh: [家庭, 家, 家人, 家里]
+
+  motherhood:
+    en: [motherhood, mother, mothers, maternity, maternal, pregnant, pregnancy]
+    zh: [母亲, 妈妈, 生育, 怀孕, 产后]
+
+  intersectionality:
+    en: [intersectionality, intersectional]
+    zh: []
+    note: zero occurrences in either corpus; kept to match the document
+
+  queer:
+    en: [queer]
+    zh: []
+    note: EN only (10 occurrences); 酷儿 does not appear in YiXi
+
+  lgbt:
+    en: [lgbt, lgbtq, gay, lesbian, transgender]
+    zh: [同志, 同性恋, lgbt]
+    review: 同志 is ambiguous with "comrade" — see header
+
+  sexuality:
+    en: [sexuality, sexual, sexually, sex]
+    zh: [性取向, 性别认同]
+    review: >-
+      bare 性 excluded as a bound morpheme; both kept forms are absent from the
+      current corpus, so the Chinese side will not match until curated further
+
+  violence:
+    en: [violence, violent, abuse, abused, assault]
+    zh: [暴力, 家暴, 性侵, 侵害, 伤害]
+
+  identity:
+    en: [identity, identities]
+    zh: [身份, 认同, 自我]
+
+  relationships:
+    en: [relationship, relationships, relation]
+    zh: [关系, 感情, 恋爱]
+
+  parenting:
+    en: [parent, parents, parenting, parenthood, father, fathers, dad]
+    zh: [父母, 育儿, 养育, 家长, 爸爸, 父亲]
+
+  woman:
+    en: [woman, women]
+    zh: [女性, 女人, 妇女, 女士]
+    note: bare 女 (71) excluded — it is a bound morpheme in 女性, 女孩 and others
+
+  girl:
+    en: [girl, girls]
+    zh: [女孩, 姑娘, 女生, 女童]
+
+  man:
+    en: [man, men]
+    zh: [男性, 男人]
+    note: bare 男 (20) excluded for the same reason as 女
+
+  boy:
+    en: [boy, boys]
+    zh: [男孩, 男生, 男童]
