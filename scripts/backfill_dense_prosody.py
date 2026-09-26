@@ -5,10 +5,10 @@ Compute and store the f0 and intensity contours at their native ~10ms hop,
 for videos already shipped to MongoDB.
 
     # one corpus, skipping videos that already have contours
-    uv run python scripts/backfill_dense_prosody.py --collection TedX
+    uv run python scripts/backfill_dense_prosody.py --collection Ted
 
     # a single video, recomputing even if present
-    uv run python scripts/backfill_dense_prosody.py --collection TedX \
+    uv run python scripts/backfill_dense_prosody.py --collection Ted \
         --job-id 1a39b362 --force
 
 ## Why this exists
@@ -186,7 +186,7 @@ def _verify(repo: ResultsRepository, collection: str, job_id: str,
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("##")[0].strip())
-    ap.add_argument("--collection", required=True, help="corpus, e.g. TedX")
+    ap.add_argument("--collection", required=True, help="corpus, e.g. Ted")
     ap.add_argument("--job-id", action="append", default=[],
                     help="only these jobs; repeatable (default: the whole corpus)")
     ap.add_argument("--force", action="store_true",

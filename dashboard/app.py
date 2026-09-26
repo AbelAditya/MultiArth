@@ -319,6 +319,23 @@ _POS_FILTER_SETS: dict[str, set[str]] = {
 }
 _KNOWN_POS = {"NOUN", "PROPN", "VERB", "AUX", "ADJ", "ADV"}
 
+
+def _pos_parts(pos: str) -> list[str]:
+    """Split a word list tag into its components.
+
+    A word is tagged with every part of speech spaCy gave its pieces, joined
+    by "+" — "don't" is AUX+PART — because the word list counts words as they
+    were spoken rather than as spaCy split them. A plain tag yields a
+    one-element list, so this is safe on artifacts written before that change.
+    See notebooks/DECISIONS.md section 4.
+    """
+    return str(pos or "").split("+")
+
+
+def _pos_label(pos: str) -> str:
+    """Full display label, expanding each component of a composite tag."""
+    return " + ".join(_POS_LABELS.get(part, part) for part in _pos_parts(pos))
+
 POS_COLOUR = {
     "NOUN": C["verbal"],  "PROPN": C["verbal"],
     "VERB": C["prosody"], "AUX":   C["prosody"],
@@ -2194,7 +2211,7 @@ def toggle_mode(mode):
 # core/results_repository.py), so renames that need one go here rather than
 # in the stored data.
 _COLLECTION_DISPLAY_NAMES = {
-    "TedX": "Ted Talks",
+    "Ted": "Ted Talks",
     "YiXi": "YiXi"
 }
 
@@ -3505,15 +3522,21 @@ def kw_wordlist_table(data, pos_filter, job_id, data_source, collection):
     if pos_filter == "ALL":
         entries = all_entries
     elif pos_filter == "OTHER":
-        entries = [e for e in all_entries if e["pos"] not in _KNOWN_POS]
+        # Any component outside the known set puts the entry here. A
+        # contraction therefore appears under both its host's filter and
+        # OTHER — "don't" (AUX+PART) is an auxiliary and has a particle.
+        # Filters overlap by design, so their counts must not be summed.
+        entries = [e for e in all_entries
+                   if not set(_pos_parts(e["pos"])) <= _KNOWN_POS]
     else:
         allowed = _POS_FILTER_SETS.get(pos_filter, set())
-        entries = [e for e in all_entries if e["pos"] in allowed]
+        entries = [e for e in all_entries
+                   if allowed & set(_pos_parts(e["pos"]))]
 
     # Filtering above uses spaCy's raw tag abbreviations (matching
     # _POS_FILTER_SETS/_KNOWN_POS); only the displayed value is expanded to
     # a full label, here at the end, so filtering logic is unaffected.
-    return [{**e, "pos": _POS_LABELS.get(e["pos"], e["pos"])} for e in entries]
+    return [{**e, "pos": _pos_label(e["pos"])} for e in entries]
 
 
 @callback(

@@ -8,7 +8,7 @@ currently in flight, ResultsRepository is the durable system of record that
 `core/bulk_orchestrator.py` ships a video's results to once it's DONE. The
 dashboard's Browse Corpus tab reads from here for already-shipped videos.
 
-Videos are grouped into named corpora — e.g. "TedX", "Yixi" — set per video
+Videos are grouped into named corpora — e.g. "Ted", "YiXi" — set per video
 in the bulk manifest. Each corpus gets its own set of three physical Mongo
 collections (database name configurable, default "multiarth"), so corpora
 are visibly separate in Atlas's collection browser and stay independently
@@ -118,7 +118,7 @@ def _validate_collection(collection: str) -> None:
     if not collection or not _COLLECTION_NAME_RE.match(collection):
         raise ValueError(
             f"Invalid collection name {collection!r} — use letters, digits, "
-            "underscores or hyphens only (e.g. 'TedX', 'Yixi')"
+            "underscores or hyphens only (e.g. 'Ted', 'YiXi')"
         )
 
 
@@ -586,6 +586,22 @@ class ResultsRepository:
             raise KeyError(f"{job_id} not found in {collection} on any shard")
         _, _, artifacts = self._collections(collection, shard)
         result = artifacts.update_one({"_id": job_id}, {"$set": {"wordlist": wordlist}})
+        return result.matched_count > 0
+
+    def update_segmented_tokens(self, collection: str, job_id: str,
+                                tokens: list) -> bool:
+        """Replace one job's segmented tokens, leaving its other artifacts be.
+
+        Rewritten whenever the tokenisation changes — they now carry each
+        token's part of speech and the index of the recogniser token it came
+        from, which is what lets a word list count words as they were spoken.
+        """
+        shard = self._locate(collection, job_id)
+        if shard is None:
+            raise KeyError(f"{job_id} not found in {collection} on any shard")
+        _, _, artifacts = self._collections(collection, shard)
+        result = artifacts.update_one({"_id": job_id},
+                                      {"$set": {"segmented_tokens": tokens}})
         return result.matched_count > 0
 
     def update_window_fields(

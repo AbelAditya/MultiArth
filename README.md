@@ -140,11 +140,11 @@ with dummy entries to overwrite lives at `vids/manifest.yml`.
 
 ```yaml
 - path: /data/staging/talk1.mp4
-  collection: TedX
+  collection: Ted
   drive_url: https://drive.google.com/file/d/xxxx/view
   label: "Speaker A — Talk 1"
 - path: /data/staging/talk2.mp4
-  collection: Yixi
+  collection: YiXi
   drive_url: https://drive.google.com/file/d/yyyy/view
   label: "Speaker B — Talk 1"
 ```
@@ -153,18 +153,18 @@ with dummy entries to overwrite lives at `vids/manifest.yml`.
 
 ```json
 [
-  {"path": "/data/staging/talk1.mp4", "collection": "TedX", "drive_url": "https://drive.google.com/file/d/xxxx/view", "label": "Speaker A — Talk 1"},
-  {"path": "/data/staging/talk2.mp4", "collection": "Yixi", "drive_url": "https://drive.google.com/file/d/yyyy/view", "label": "Speaker B — Talk 1"}
+  {"path": "/data/staging/talk1.mp4", "collection": "Ted", "drive_url": "https://drive.google.com/file/d/xxxx/view", "label": "Speaker A — Talk 1"},
+  {"path": "/data/staging/talk2.mp4", "collection": "YiXi", "drive_url": "https://drive.google.com/file/d/yyyy/view", "label": "Speaker B — Talk 1"}
 ]
 ```
 
 - `path` (required) — local file to process.
 - `collection` (required) — names the corpus this video belongs to (e.g.
-  `"TedX"`, `"Yixi"`). Each distinct collection gets its own set of three
+  `"Ted"`, `"YiXi"`). Each distinct collection gets its own set of three
   MongoDB collections (`{collection}_videos`, `{collection}_fused_windows`,
   `{collection}_artifacts`) in the `MONGO_DB` database, so corpora stay
-  fully separate — a video shipped under `"TedX"` is invisible when browsing
-  `"Yixi"`, including for dedup checks. Letters, digits, `_` and `-` only.
+  fully separate — a video shipped under `"Ted"` is invisible when browsing
+  `"YiXi"`, including for dedup checks. Letters, digits, `_` and `-` only.
 - `drive_url` (optional) — a shareable Drive link, kept only so the
   dashboard's Browse Corpus tab can embed playback later; it is not used to
   fetch the video.
@@ -211,7 +211,7 @@ Options:
 
 With `MONGO_URI` configured, the dashboard's **Browse Corpus** tab (next to
 **Live Analysis**) shows a dropdown of every collection that has at least
-one shipped video (e.g. `TedX`, `Yixi`); picking one lists its videos —
+one shipped video (e.g. `Ted`, `YiXi`); picking one lists its videos —
 label, filename, duration, processed date. Clicking a row loads that
 video's charts, transcript, and word-sketch tools exactly like a live
 analysis job, with video playback embedded from its Google Drive link

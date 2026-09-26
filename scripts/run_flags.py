@@ -4,10 +4,10 @@ scripts/run_flags.py
 Flag a corpus's videos against a manifest and write one Excel workbook each.
 
     # every video in a corpus
-    uv run python scripts/run_flags.py --collection TedX
+    uv run python scripts/run_flags.py --collection Ted
 
     # one video, a different rulebook, somewhere else
-    uv run python scripts/run_flags.py --collection TedX --job-id 80e15587 \
+    uv run python scripts/run_flags.py --collection Ted --job-id 80e15587 \
         --manifest flags/my_rules.yaml --out ~/flag_reports
 
 Nothing is written to MongoDB and no intermediate files are kept: the workbook
@@ -39,7 +39,7 @@ _DEFAULT_MANIFEST = Path(__file__).resolve().parent.parent / "flags" / "multiart
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[1].strip())
-    ap.add_argument("--collection", required=True, help="corpus, e.g. TedX or Yixi")
+    ap.add_argument("--collection", required=True, help="corpus, e.g. Ted or YiXi")
     ap.add_argument("--manifest", default=str(_DEFAULT_MANIFEST),
                     help=f"flagging manifest (default: {_DEFAULT_MANIFEST.name})")
     ap.add_argument("--job-id", action="append", default=[],

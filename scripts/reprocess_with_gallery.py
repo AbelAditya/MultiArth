@@ -215,7 +215,7 @@ def main() -> None:
                     help="pre-assign the new job id (default: random)")
     ap.add_argument("--ship", action="store_true",
                     help="write the results to MongoDB when the run finishes")
-    ap.add_argument("--collection", help="corpus to ship into, e.g. TedX")
+    ap.add_argument("--collection", help="corpus to ship into, e.g. Ted")
     ap.add_argument("--label", help="human label stored with the video")
     ap.add_argument("--drive-url", help="Drive link; also the dedupe key's "
                                         "basis, so pass the same one the "
@@ -226,7 +226,7 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.ship and not args.collection:
-        raise SystemExit("--ship needs --collection (e.g. --collection TedX)")
+        raise SystemExit("--ship needs --collection (e.g. --collection Ted)")
     if args.ship:
         # Fail before the hours of processing, not after.
         ResultsRepository()

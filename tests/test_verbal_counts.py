@@ -212,3 +212,74 @@ def test_mixed_transcript_with_any_han_is_treated_as_chinese():
     rate = _rate(transcript, word_count=15, duration=5.0)
 
     assert rate == pytest.approx(len(ZH_CHARS) / 5.0)
+
+
+# ── composite part-of-speech tags ────────────────────────────────────────
+# The word list counts words as they were spoken, tagging each with every
+# component spaCy produced. See notebooks/DECISIONS.md §4.
+
+def _wordlist(worker, words, lang, step=0.4):
+    tokens = _tokens(words, step)
+    doc, sep = worker._build_transcript_doc(tokens, lang)
+    seg = worker._segmented_or_empty(doc, tokens, sep)
+    wordlist, _, _ = worker._compute_corpus_stats(tokens, lang, doc, seg)
+    return {e["word"]: e for e in wordlist["words"]}
+
+
+def test_contraction_is_one_entry_with_a_composite_tag(worker):
+    rows = _wordlist(worker, ["I", "don't", "think", "so"], "en")
+
+    assert "don't" in rows
+    assert rows["don't"]["pos"] == "AUX+PART"
+    # The pieces must not also appear on their own.
+    assert "do" not in rows and "n't" not in rows
+
+
+def test_wo_and_ca_never_appear_as_words(worker):
+    """"won't" and "can't" used to leave the non-words "wo" and "ca" behind."""
+    rows = _wordlist(worker, ["I", "won't", "and", "I", "can't"], "en")
+
+    assert "wo" not in rows and "ca" not in rows
+    assert "won't" in rows and "can't" in rows
+
+
+def test_possessive_keeps_the_noun_as_its_first_component(worker):
+    """First component decides the lexical class — DECISIONS.md §4."""
+    rows = _wordlist(worker, ["the", "women's", "movement"], "en")
+
+    assert "women's" in rows
+    assert rows["women's"]["pos"].split("+")[0] == "NOUN"
+
+
+def test_punctuation_leaves_no_trace_in_surface_or_tag(worker):
+    rows = _wordlist(worker, ["So,", "women", "are", "here."], "en")
+
+    assert "so" in rows and "so," not in rows
+    assert all("PUNCT" not in e["pos"] for e in rows.values())
+
+
+def test_bare_numerals_are_still_excluded(worker):
+    rows = _wordlist(worker, ["about", "30", "women"], "en")
+
+    assert "30" not in rows
+    assert "women" in rows
+
+
+def test_chinese_tags_stay_atomic(worker):
+    """spaCy merges characters in Chinese, so every group is a singleton."""
+    rows = _wordlist(worker, list("我们讨论女性的权利"), "zh", step=0.2)
+
+    assert rows, "expected a Chinese word list"
+    assert all("+" not in e["pos"] for e in rows.values())
+    assert "女性" in rows          # a real word, not its characters
+    assert "女" not in rows
+
+
+def test_every_token_is_counted_exactly_once(worker):
+    """Regrouping must not drop or duplicate spoken words."""
+    words = ["I", "don't", "think", "women's", "voices", "are", "heard"]
+    rows = _wordlist(worker, words, "en")
+
+    # every entry is one spoken word; numerals and punctuation aside, the
+    # totals must match the number of words given
+    assert sum(e["count"] for e in rows.values()) == len(words)

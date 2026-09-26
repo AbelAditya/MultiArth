@@ -255,7 +255,7 @@ class VerbalWorker:
         # ones), none of which is a disagreement about how many words were
         # spoken. Chinese is the case where the ASR genuinely cannot count
         # words, because SenseVoice emits roughly one token per character and
-        # only pkuseg groups them — 234k characters against 130k words on Yixi.
+        # only pkuseg groups them — 234k characters against 130k words on YiXi.
         window_segments = segmented_tokens if lang_code in _LOGOGRAPHIC else None
 
         for idx, (start, end) in enumerate(windows):
@@ -270,7 +270,7 @@ class VerbalWorker:
 
         try:
             wordlist, ngrams, collocations = self._compute_corpus_stats(
-                all_tokens, lang_code, doc
+                all_tokens, lang_code, doc, segmented_tokens
             )
             self.store.put_wordlist(job_id, wordlist)
             self.store.put_ngrams(job_id, ngrams)
@@ -598,6 +598,12 @@ class VerbalWorker:
         *sep_len*: number of characters joining consecutive Whisper tokens in
         the string handed to spaCy (0 for CJK's no-separator join, 1 for a
         single-space join).
+
+        Each entry also carries `pos` and `asr_idx`, the index of the first
+        original token it covers. Grouping on `asr_idx` reconstructs the spoken
+        word: in English several spaCy tokens share one index ("do"/"n't" both
+        belong to "don't"), while in CJK each spaCy token consumes its own
+        span, so groups are singletons and regrouping is a no-op.
         """
         # (start_char, end_char) for each Whisper token, in the same
         # coordinate space as the string the spaCy doc was built from.
@@ -627,6 +633,13 @@ class VerbalWorker:
                 "word": token.text,
                 "start_s": start_tok.start_s,
                 "end_s": end_tok.end_s,
+                # Carried so the word list can regroup spaCy tokens back onto
+                # the word that was actually spoken, and tag it losslessly —
+                # see _compute_corpus_stats. Both were already computed here
+                # and discarded; deriving them anywhere else would mean a
+                # second copy of this alignment.
+                "pos": token.pos_,
+                "asr_idx": span_i,
             })
             span_i = end_i
 
@@ -683,8 +696,53 @@ class VerbalWorker:
             doc = proc(doc)
         return doc
 
+    @staticmethod
+    def _wordlist_from_segments(segmented: list[dict]) -> "Counter":
+        """Count words as they were spoken, tagged losslessly.
+
+        spaCy splits an English word into several tokens — "don't" becomes
+        "do" + "n't" — and the word list used to count those pieces. The
+        clitic was then dropped by the alphabetic filter, so a contraction was
+        half-recorded: "do" absorbed every "don't", and "won't"/"can't" left
+        behind the non-words "wo" and "ca" as vocabulary entries.
+
+        Here the pieces are regrouped onto the token the recogniser heard
+        (`asr_idx`), so an entry is a spoken word. Its tag is every component's
+        part of speech joined by "+", in token order — "don't" is AUX+PART.
+        Joining rather than choosing a head keeps it derived: "'s" is AUX in
+        "it's", PART in "women's", VERB in "there's" and PRON in "let's", so
+        any rule that picks one would be guessing on the interesting cases.
+
+        Chinese is unaffected. There spaCy *merges* characters instead of
+        splitting words, so each token consumes its own span, every group is a
+        singleton, and a group's tag is a single part of speech.
+
+        Punctuation is dropped from the tag but kept while building the
+        surface, so "well-known" survives as one hyphenated word while "now,"
+        cleans back to "now" rather than acquiring a PUNCT component.
+        """
+        groups: dict = {}
+        for seg in segmented:
+            groups.setdefault(seg.get("asr_idx"), []).append(seg)
+
+        counts: Counter = Counter()
+        for _, parts in groups.items():
+            tagged = [p for p in parts if p.get("pos") != "PUNCT"]
+            if not tagged:
+                continue
+            surface = corpus_analysis._clean_word(
+                "".join(str(p["word"]) for p in parts).lower()
+            )
+            # Keeps "don't" and "well-known", which are not isalpha, while
+            # still dropping bare numerals the way the old filter did.
+            if not surface or not any(ch.isalpha() for ch in surface):
+                continue
+            counts[(surface, "+".join(p.get("pos") or "X" for p in tagged))] += 1
+        return counts
+
     def _compute_corpus_stats(
-        self, all_tokens: list[WordToken], lang_code: str, doc=None
+        self, all_tokens: list[WordToken], lang_code: str, doc=None,
+        segmented: Optional[list[dict]] = None,
     ) -> tuple[dict, dict, dict]:
         """
         Build word list, n-grams and collocations from the full transcript.
@@ -704,7 +762,19 @@ class VerbalWorker:
         raw_words = [t.word.lower().strip(".,!?\"'") for t in all_tokens if t.word.strip()]
 
         # ── word list ────────────────────────────────────────────────────
-        if doc is not None:
+        if segmented:
+            word_data = self._wordlist_from_segments(segmented)
+            total = max(sum(word_data.values()), 1)
+            word_entries = [
+                {
+                    "word":          word,
+                    "pos":           pos,
+                    "count":         count,
+                    "freq_per_1000": round(count * 1000 / total, 2),
+                }
+                for (word, pos), count in word_data.most_common()
+            ]
+        elif doc is not None:
             # Keyed by surface form, not lemma — "run"/"running"/"ran" get
             # separate rows with their own counts, consistent with the
             # surface-form keying used for collocations (core/corpus_analysis.py).

@@ -149,7 +149,7 @@ def bulk(ctx, manifest_path, force, mongo_uri, mongo_db, window, whisper_model, 
     Sequentially process every video listed in a manifest JSON file and ship
     each result to MongoDB. Manifest format: a JSON list of
     {"path": "...", "collection": "...", "drive_url": "...", "label": "..."}
-    objects. "collection" names the corpus (e.g. "TedX", "Yixi") a video's
+    objects. "collection" names the corpus (e.g. "Ted", "YiXi") a video's
     results are shipped into — see core/results_repository.py.
     """
     store = ctx.obj["store"]

@@ -5,7 +5,7 @@ Sequential multi-video runner for `analyze bulk` and the dashboard's Bulk
 Upload tab.
 
 Each manifest entry is tagged with a "collection" — the named corpus (e.g.
-"TedX", "Yixi") its results should be shipped into; see
+"Ted", "YiXi") its results should be shipped into; see
 core/results_repository.py for how that maps to Mongo collections. A manifest
 entry's local `path` may either already exist (manually staged in advance,
 the `analyze bulk` CLI workflow) or not — if it doesn't and a `drive_url` is

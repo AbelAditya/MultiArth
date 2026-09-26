@@ -11,7 +11,7 @@ import pytest
 from core.models import AnalysisJob, FusedWindow, GestureFeatures, JobStatus, TimeWindow
 from core.results_repository import ResultsRepository
 
-COLLECTION = "TedX"
+COLLECTION = "Ted"
 
 
 def make_window(start=0.0, end=5.0) -> TimeWindow:
@@ -97,30 +97,30 @@ class TestResultsRepository:
         tedx_job = AnalysisJob(job_id="tedx1", video_path="/videos/tedx.mp4", status=JobStatus.DONE)
         yixi_job = AnalysisJob(job_id="yixi1", video_path="/videos/yixi.mp4", status=JobStatus.DONE)
 
-        repo.save_job("TedX", tedx_job, drive_url=None, label="TedX Talk", dedupe_key="dupe", duration_s=10.0)
-        repo.save_job("Yixi", yixi_job, drive_url=None, label="Yixi Talk", dedupe_key="dupe", duration_s=10.0)
+        repo.save_job("Ted", tedx_job, drive_url=None, label="Ted Talk", dedupe_key="dupe", duration_s=10.0)
+        repo.save_job("YiXi", yixi_job, drive_url=None, label="YiXi Talk", dedupe_key="dupe", duration_s=10.0)
 
-        tedx_videos = repo.list_videos("TedX")
-        yixi_videos = repo.list_videos("Yixi")
+        tedx_videos = repo.list_videos("Ted")
+        yixi_videos = repo.list_videos("YiXi")
         assert [v["_id"] for v in tedx_videos] == ["tedx1"]
         assert [v["_id"] for v in yixi_videos] == ["yixi1"]
 
         # Same dedupe_key in both corpora resolves to each corpus's own video
-        assert repo.find_by_dedupe_key("TedX", "dupe") == "tedx1"
-        assert repo.find_by_dedupe_key("Yixi", "dupe") == "yixi1"
+        assert repo.find_by_dedupe_key("Ted", "dupe") == "tedx1"
+        assert repo.find_by_dedupe_key("YiXi", "dupe") == "yixi1"
 
-        # A job_id shipped only to TedX is invisible from Yixi
-        assert repo.get_job("Yixi", "tedx1") is None
+        # A job_id shipped only to Ted is invisible from YiXi
+        assert repo.get_job("YiXi", "tedx1") is None
 
     def test_list_collections(self, repo):
         assert repo.list_collections() == []
 
         tedx_job = AnalysisJob(job_id="tedx1", video_path="/videos/tedx.mp4", status=JobStatus.DONE)
         yixi_job = AnalysisJob(job_id="yixi1", video_path="/videos/yixi.mp4", status=JobStatus.DONE)
-        repo.save_job("TedX", tedx_job, drive_url=None, label=None, dedupe_key="d1", duration_s=None)
-        repo.save_job("Yixi", yixi_job, drive_url=None, label=None, dedupe_key="d2", duration_s=None)
+        repo.save_job("Ted", tedx_job, drive_url=None, label=None, dedupe_key="d1", duration_s=None)
+        repo.save_job("YiXi", yixi_job, drive_url=None, label=None, dedupe_key="d2", duration_s=None)
 
-        assert repo.list_collections() == ["TedX", "Yixi"]
+        assert repo.list_collections() == ["Ted", "YiXi"]
 
     def test_invalid_collection_name_rejected(self, repo):
         with pytest.raises(ValueError):
@@ -221,11 +221,11 @@ class TestShards:
     def test_reads_merge_every_shard(self, sharded):
         repo, usage = sharded
         _ship(repo, "old", dedupe_key="d-old")
-        _ship(repo, "yixi", dedupe_key="d-y", collection="Yixi")
+        _ship(repo, "yixi", dedupe_key="d-y", collection="YiXi")
         usage["shard-a"] = 10**9
         _ship(repo, "new", dedupe_key="d-new")
 
-        assert repo.list_collections() == ["TedX", "Yixi"]
+        assert repo.list_collections() == ["Ted", "YiXi"]
         assert [v["_id"] for v in repo.list_videos(COLLECTION)] == ["old", "new"]
 
         # a fresh repository (no routing cache) still finds each job
@@ -264,15 +264,15 @@ class TestShards:
 
         repo.shards[0].db = Down()
         repo.shards[0].indexed_collections.clear()
-        assert repo.list_collections() == ["TedX"]
+        assert repo.list_collections() == ["Ted"]
         assert [v["_id"] for v in repo.list_videos(COLLECTION)] == ["b"]
 
     def test_reading_does_not_create_collections_on_other_shards(self, sharded):
         repo, _ = sharded
-        _ship(repo, "j1", collection="Yixi")
-        repo.list_videos("Yixi")
-        repo.get_all_fused("Yixi", "j1")
-        repo.find_by_dedupe_key("Yixi", "d")
+        _ship(repo, "j1", collection="YiXi")
+        repo.list_videos("YiXi")
+        repo.get_all_fused("YiXi", "j1")
+        repo.find_by_dedupe_key("YiXi", "d")
         assert repo.shards[1].db.list_collection_names() == []
 
     def test_atlas_quota_refusal_moves_the_whole_job_to_the_next_shard(self, sharded, monkeypatch):

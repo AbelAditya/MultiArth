@@ -29,7 +29,7 @@ shipped to MongoDB — no terminal required.
    below if you don't have one yet.
 3. Once parsed, a summary line shows how many entries were loaded and which
    collections they'll ship into, e.g.
-   `Loaded 12 entries from "manifest.yml" — collections: TedX, Yixi`.
+   `Loaded 12 entries from "manifest.yml" — collections: Ted, YiXi`.
    If the file couldn't be parsed (bad YAML/JSON, missing required fields),
    an error message replaces this line instead — fix the file and re-upload.
 4. Optionally tick **"Reprocess already-shipped videos"** if you want to
@@ -62,11 +62,11 @@ A YAML or JSON list of entries. Every entry needs `collection`, and **either**
 `path` **or** `drive_url` (not necessarily both):
 
 ```yaml
-- collection: TedX
+- collection: Ted
   drive_url: https://drive.google.com/file/d/XXXXXXXX/view
   label: "Speaker A — Talk 1"
 
-- collection: TedX
+- collection: Ted
   path: /data/staging/already_downloaded.mp4
   drive_url: https://drive.google.com/file/d/YYYYYYYY/view
   label: "Speaker B — Talk 2"
@@ -74,7 +74,7 @@ A YAML or JSON list of entries. Every entry needs `collection`, and **either**
 
 | Field | Required | Meaning |
 |---|---|---|
-| `collection` | yes | Named corpus results ship into (e.g. `"TedX"`, `"Yixi"`) — letters, digits, `_`/`-` only. |
+| `collection` | yes | Named corpus results ship into (e.g. `"Ted"`, `"YiXi"`) — letters, digits, `_`/`-` only. |
 | `path` | no* | A local file to use if it already exists. If omitted (or the file isn't there yet), the video is downloaded from `drive_url` first. |
 | `drive_url` | no* | Shareable Google Drive link. Required if `path` is omitted, or if `path` is given but the file doesn't exist locally yet. |
 | `label` | no | Free-text tag shown in the Browse Corpus video list. |

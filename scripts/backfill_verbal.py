@@ -5,20 +5,20 @@ Recompute the three verbal quantities that were computed wrongly, for videos
 already shipped to MongoDB.
 
     # see what would change, touching nothing
-    uv run python scripts/backfill_verbal.py --collection Yixi --dry-run
+    uv run python scripts/backfill_verbal.py --collection YiXi --dry-run
 
     # apply it
-    uv run python scripts/backfill_verbal.py --collection Yixi
+    uv run python scripts/backfill_verbal.py --collection YiXi
 
     # one video
-    uv run python scripts/backfill_verbal.py --collection Yixi --job-id b56f7756
+    uv run python scripts/backfill_verbal.py --collection YiXi --job-id b56f7756
 
 ## What it fixes
 
 1. **`verbal.word_count`** — was the number of raw ASR tokens. SenseVoice
    emits roughly one token per Han character, so the field meant "words" in
    English and "characters" in Chinese under one name (234k against 130k on
-   Yixi). Chinese is now counted against spaCy's segmentation. English is
+   YiXi). Chinese is now counted against spaCy's segmentation. English is
    left alone: there the ASR's tokens already are words, and re-counting them
    against spaCy would only split contractions and count punctuation.
 
@@ -28,7 +28,13 @@ already shipped to MongoDB.
    (stored median 7.2 syl/s against a counted 4.4). Now Chinese counts its Han
    characters and everything else keeps the English estimate.
 
-3. **`artifacts.wordlist`** — recorded the part-of-speech tag of a word's
+3. **`artifacts.segmented_tokens`** — gains each token's part of speech and
+   the index of the recogniser token it came from, so the word list can count
+   words as they were spoken rather than as spaCy split them. "don't" becomes
+   one entry tagged AUX+PART instead of "do" plus a discarded "n't"; "won't"
+   and "can't" stop leaving the non-words "wo" and "ca" behind.
+
+4. **`artifacts.wordlist`** — recorded the part-of-speech tag of a word's
    *first* occurrence in a video and filed every later occurrence under it, so
    a tag was a sample of one token. The symptom: `to` came out PART in 30
    videos and ADP in 9, with no video showing both, although nearly every talk
@@ -52,7 +58,7 @@ and no video is downloaded.
 ## Cost
 
 spaCy over a whole transcript, once per video: a few seconds each, dominated
-by the MongoDB round trips. Yixi's 26 videos take a couple of minutes.
+by the MongoDB round trips. YiXi's 26 videos take a couple of minutes.
 """
 
 from __future__ import annotations
@@ -168,13 +174,15 @@ def _recompute(worker: VerbalWorker, all_tokens, windows, lang):
         if fields:
             updates[w["idx"]] = fields
 
-    wordlist, _, _ = worker._compute_corpus_stats(all_tokens, lang, doc)
-    return updates, wordlist, len(segmented), rates, recount
+    # Pass the segments so the word list counts spoken words with composite
+    # tags, exactly as the worker now does for newly processed videos.
+    wordlist, _, _ = worker._compute_corpus_stats(all_tokens, lang, doc, segmented)
+    return updates, wordlist, len(segmented), rates, recount, segmented
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("##")[0].strip())
-    ap.add_argument("--collection", required=True, help="corpus, e.g. Yixi")
+    ap.add_argument("--collection", required=True, help="corpus, e.g. YiXi")
     ap.add_argument("--job-id", action="append", default=[],
                     help="only these jobs; repeatable (default: the whole corpus)")
     ap.add_argument("--limit", type=int, default=None, help="stop after N videos")
@@ -210,7 +218,7 @@ def main() -> None:
                 print("    no stored tokens — skipped")
                 continue
             lang = _language_of("".join(t.word for t in all_tokens))
-            updates, wordlist, n_seg, rates, recount = _recompute(
+            updates, wordlist, n_seg, rates, recount, segmented = _recompute(
                 worker, all_tokens, windows, lang)
 
             old_total = sum(w["old_word_count"] or 0 for w in windows)
@@ -239,7 +247,8 @@ def main() -> None:
 
             modified = repo.update_window_fields(args.collection, job_id, updates)
             repo.update_wordlist(args.collection, job_id, wordlist)
-            print(f"    written: {modified} windows + word list")
+            repo.update_segmented_tokens(args.collection, job_id, segmented)
+            print(f"    written: {modified} windows + word list + {len(segmented)} segments")
             ok += 1
         except Exception as exc:
             print(f"    FAILED: {exc}")
