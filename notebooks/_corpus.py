@@ -203,7 +203,7 @@ def load_windows(corpus: str, mask_missing: bool = True) -> pd.DataFrame:
     # Count the big arrays server-side instead of downloading them. A window
     # carries ~50 pose keyframes of 33 landmarks each, which is the bulk of the
     # corpus by bytes — and this function only ever uses their *length*.
-    # Measured on TedX: minutes with the arrays, seconds without.
+    # Measured on Ted: minutes with the arrays, seconds without.
     pipeline = [
         {"$addFields": {
             "n_keyframes": {"$size": {"$ifNull": ["$gesture.pose_keyframes", []]}},
@@ -389,7 +389,7 @@ def wrist_speed_series(
 
     That metric is pixels/second, which confounds two things with gesture
     magnitude: shot scale (a close-up makes the same physical movement sweep
-    more pixels — it correlates with mean_face_bbox_area at ~0.47 in TedX)
+    more pixels — it correlates with mean_face_bbox_area at ~0.47 in Ted)
     and video resolution (the same framing at 720p yields two thirds the
     pixel velocity of 1080p). Neither has anything to do with the speaker.
 
@@ -408,7 +408,7 @@ def wrist_speed_series(
 
     ## The body scale must be LOCAL, not per video
 
-    Measured on TedX, shoulder width varies ~8x *within* a single talk as the
+    Measured on Ted, shoulder width varies ~8x *within* a single talk as the
     camera cuts between close-ups and wide shots. An earlier version divided
     by one median for the whole video, which corrected nothing within it: the
     resulting metric still tracked shot scale (rho 0.71 against face area,
@@ -544,7 +544,7 @@ def chinese_syllable_rate(df: pd.DataFrame) -> pd.Series:
         roughly one token per Han character — so for Chinese it is already a
         syllable count, not a word count.
       * Multiplying that by an assumed 1.5 syllables-per-word inflates the
-        rate by about half again. Yixi's stored median is 7.2 syl/s; counted,
+        rate by about half again. YiXi's stored median is 7.2 syl/s; counted,
         4.4, which is the range the literature reports for Mandarin.
 
     The error is near-monotone rather than a clean constant (stored/counted
@@ -560,6 +560,56 @@ def chinese_syllable_rate(df: pd.DataFrame) -> pd.Series:
     dur = (df.end_s - df.start_s).replace(0, np.nan)
     rate = (syl / dur).where(syl > 0)
     return rate.rename("syl_per_s")
+
+
+def segmented_tokens(corpus: str, job_id: str) -> pd.DataFrame:
+    """Words with timestamps, as **spaCy** segments them. Columns: word, start_s, end_s.
+
+    Prefer this over `word_tokens` for anything that searches or counts words.
+
+    The recogniser's own tokens are words in English but roughly one per
+    character in Chinese, so an index built from them cannot match 女性 or
+    婚姻 — it holds 女, 性, 婚 and 姻 separately, and every Chinese query
+    silently returns nothing. The verbal worker already solves this: it joins
+    the transcript without separators, runs spaCy (pkuseg for Chinese), then
+    maps each resulting word back onto the ASR tokens it spans to recover its
+    timing (`VerbalWorker._segment_words`). That is what this reads.
+
+    Using it also keeps word-level work on the same tokenisation as the word
+    list, collocations and the word sketch, so counts cannot disagree between
+    two parts of the system.
+
+    Punctuation is dropped: spaCy emits 。and , as tokens, and they are not
+    words. Returns an empty frame for a job processed before segmented tokens
+    were stored — callers should fall back to `word_tokens` and say so.
+
+    Rows are **spoken words**, not spaCy tokens: pieces sharing an `asr_idx`
+    are rejoined, so "don't" comes back as one row tagged AUX+PART rather than
+    "do" and "n't" separately. A `pos` column carries that composite tag. See
+    notebooks/DECISIONS.md §4.
+    """
+    art = load_artifacts(corpus, job_id, fields=["segmented_tokens"]) or {}
+    rows = art.get("segmented_tokens") or []
+    if not rows:
+        return pd.DataFrame(columns=["word", "start_s", "end_s", "pos"])
+    df = pd.DataFrame(rows)
+
+    # Regroup onto the word that was actually spoken. spaCy splits "don't"
+    # into "do" + "n't"; both carry the same asr_idx, so the group rebuilds the
+    # contraction and tags it AUX+PART. In Chinese spaCy merges instead, every
+    # group is a singleton, and this is a no-op. Videos processed before
+    # asr_idx was stored fall through unchanged, one token per row.
+    if "asr_idx" in df.columns and df.asr_idx.notna().any():
+        agg = {"word": ("word", lambda x: "".join(map(str, x))),
+               "start_s": ("start_s", "first"), "end_s": ("end_s", "last")}
+        if "pos" in df.columns:
+            agg["pos"] = ("pos", lambda x: "+".join(
+                p for p in map(str, x) if p not in ("PUNCT", "nan")) or None)
+        df = (df.sort_values(["asr_idx"], kind="stable")
+                .groupby("asr_idx", sort=True).agg(**agg).reset_index(drop=True))
+
+    keep = df.word.astype(str).str.contains(r"[\w\u3400-\u4dbf\u4e00-\u9fff]", regex=True)
+    return df[keep].reset_index(drop=True)
 
 
 def word_tokens(corpus: str, job_id: str) -> pd.DataFrame:
@@ -658,17 +708,24 @@ def _fetch_per_video_words(corpus: str, videos: pd.DataFrame):
             continue
         # Deliberately NOT wl["total_tokens"]: that is the count of raw ASR
         # tokens, while every `count` below is a spaCy-segmented word. The two
-        # agree in English (ratio 1.005 on TedX) but not in Chinese, where the
+        # agree in English (ratio 1.005 on Ted) but not in Chinese, where the
         # ASR emits one token per character and spaCy re-segments into words —
-        # 234k ASR tokens against 130k words on Yixi. Dividing segmented counts
+        # 234k ASR tokens against 130k words on YiXi. Dividing segmented counts
         # by an ASR total understated every Chinese frequency by ~1.8x, and
         # made freq_per_1000 disagree with mean_video_freq (which the worker
         # computes against its own segmented total) for reasons that had
         # nothing to do with one talk dominating a word.
-        totals.append(sum(w["count"] for w in words))
+        total = sum(w["count"] for w in words)
+        totals.append(total)
         for w in words:
+            # video_tokens travels with every row so a per-video rate can be
+            # recomputed downstream. The artifact's own freq_per_1000 is kept
+            # for reference but deliberately not used: it is rounded to two
+            # decimals at write time, and it is one row per (word, POS), which
+            # is the wrong denominator once a word carries several tags.
             rows.append({"job_id": job_id, "word": w["word"], "pos": w.get("pos"),
-                         "count": w["count"], "video_freq": w.get("freq_per_1000")})
+                         "count": w["count"], "video_tokens": total,
+                         "video_freq": w.get("freq_per_1000")})
     return pd.DataFrame(rows), totals
 
 
@@ -697,6 +754,11 @@ def corpus_wordlist(
     "to" as an infinitive marker and "to" as a preposition stay distinct —
     which also means neither row alone is that word's corpus frequency. Pass
     `by_pos=False` for one row per surface form.
+
+    Tags may be composite: a word is recorded as it was spoken and tagged with
+    every part of speech spaCy gave its pieces, joined by "+", so "don't" is
+    AUX+PART. The `pos` filter matches a tag's **first** component, the host
+    word's class. See notebooks/DECISIONS.md §4.
 
     Chinese is segmented by pkuseg (via spaCy's zh_core_web_sm) upstream, not
     jieba as the spec suggests — same role, different tokeniser, worth stating
@@ -727,15 +789,41 @@ _WORDLIST_CACHE: dict = {}
 def _aggregate_wordlist(per_video, totals, pos, by_pos) -> pd.DataFrame:
     """Group an already-fetched per-video frame; see corpus_wordlist."""
     if pos:
-        per_video = per_video[per_video.pos.isin(pos)]
+        # Match on the FIRST component of the tag. A word is tagged with every
+        # part of speech spaCy gave its pieces — "don't" is AUX+PART — and the
+        # host word carries the lexical class while the clitic does not. So
+        # "women's" (NOUN+PART) is a noun and belongs in a content-word cut,
+        # while "there's" (PRON+VERB) is not a verb and does not. Matching any
+        # component would admit the second; see notebooks/DECISIONS.md §4.
+        # A plain tag has one component, so pre-composite data is unaffected.
+        per_video = per_video[per_video.pos.astype(str).str.split("+").str[0].isin(pos)]
     corpus_tokens = float(sum(totals))
     n_videos_total = per_video.job_id.nunique()
 
     keys = ["word", "pos"] if by_pos else ["word"]
-    agg = (per_video.groupby(keys, dropna=False)
+
+    # Collapse to one row per (key, video) before computing a rate, rather
+    # than averaging the per-row rates the artifact already carries.
+    #
+    # The difference only appears once a word holds more than one tag inside
+    # one video, which is exactly what fixing the first-occurrence POS bug
+    # makes possible. With by_pos=False, "watch" used twice as a verb and once
+    # as a noun in a 10k-word talk is two rows at 0.2 and 0.1 per 1,000; their
+    # mean is 0.15, half the word's true 0.3 rate for that video — and that
+    # video is counted twice in the average, outweighing videos where the word
+    # carries a single tag. Summing first gives the rate the video actually
+    # had, and weights every speaker once.
+    per_key_video = (per_video.groupby(keys + ["job_id"], dropna=False)
+                     .agg(count=("count", "sum"),
+                          video_tokens=("video_tokens", "first"))
+                     .reset_index())
+    per_key_video["video_rate"] = (per_key_video["count"]
+                                   / per_key_video["video_tokens"] * 1000)
+
+    agg = (per_key_video.groupby(keys, dropna=False)
            .agg(count=("count", "sum"),
-                mean_video_freq=("video_freq", "mean"),
-                sd_video_freq=("video_freq", "std"),
+                mean_video_freq=("video_rate", "mean"),
+                sd_video_freq=("video_rate", "std"),
                 n_videos=("job_id", "nunique"))
            .reset_index())
     agg["freq_per_1000"] = agg["count"] / corpus_tokens * 1000
@@ -743,6 +831,78 @@ def _aggregate_wordlist(per_video, totals, pos, by_pos) -> pd.DataFrame:
     agg.attrs["corpus_tokens"] = corpus_tokens
     agg.attrs["n_videos"] = n_videos_total
     return agg.sort_values("count", ascending=False).reset_index(drop=True)
+
+
+def shot_segments(corpus: str) -> pd.DataFrame:
+    """One row per **shot segment**, not per window (spec §3).
+
+    Columns: job_id, shot_idx, start_s, end_s, duration_s, shot_type.
+
+    §3 asks for "percentages of total shots" and for shots-per-minute before
+    comparing corpora. Both need shots, and the pipeline stores per-window
+    *dominant* labels — so a 30-second close-up held across six windows counts
+    six times in a by-window tally, and a corpus whose talks are simply longer
+    accumulates more of everything.
+
+    Segments are rebuilt from the cut timestamps the camera worker already
+    stores (`camera.scene_cuts`): a segment runs from one cut to the next, with
+    the video's start and end as the outer boundaries.
+
+    The one approximation: a segment's shot type is taken from the window
+    containing its **midpoint**, because shot type is classified per window and
+    not per segment. The midpoint is the right choice rather than the start —
+    a window straddling a cut is labelled for whichever shot dominates it, so
+    the window at a segment's start may still be describing the previous shot.
+    Segments shorter than a window are therefore the least reliable, and
+    `duration_s` is kept so they can be filtered.
+    """
+    pipeline = [{"$project": {
+        "job_id": 1, "window": 1,
+        "camera.scene_cuts.timestamp_s": 1,
+        "camera.dominant_shot_type": 1,
+    }}]
+    docs = [
+        d
+        for shard in _each_shard(
+            lambda db: list(db[f"{corpus}_fused_windows"].aggregate(pipeline)),
+            f"{corpus}'s scene cuts",
+        )
+        for d in shard
+    ]
+    if not docs:
+        return pd.DataFrame(columns=["job_id", "shot_idx", "start_s", "end_s",
+                                     "duration_s", "shot_type"])
+
+    per_job: dict = {}
+    for d in docs:
+        w = d.get("window") or {}
+        c = d.get("camera") or {}
+        job = per_job.setdefault(d.get("job_id"), {"cuts": set(), "windows": []})
+        # Same sentinel handling as load_windows: "unknown" means the
+        # classifier failed, not that there is a category called unknown.
+        shot = c.get("dominant_shot_type")
+        if shot == _CATEGORICAL_SENTINEL["dominant_shot_type"]:
+            shot = None
+        job["windows"].append((w.get("start_s"), w.get("end_s"), shot))
+        for cut in (c.get("scene_cuts") or []):
+            ts = cut.get("timestamp_s")
+            if ts is not None:
+                job["cuts"].add(round(float(ts), 3))
+
+    rows = []
+    for job_id, job in per_job.items():
+        windows = sorted((a, b, t) for a, b, t in job["windows"] if a is not None)
+        if not windows:
+            continue
+        start, end = windows[0][0], windows[-1][1]
+        # Cuts outside the windowed span would create empty segments.
+        bounds = sorted({start, end} | {c for c in job["cuts"] if start < c < end})
+        for i, (a, b) in enumerate(zip(bounds[:-1], bounds[1:])):
+            mid = (a + b) / 2
+            shot = next((t for ws, we, t in windows if ws <= mid < we), None)
+            rows.append({"job_id": job_id, "shot_idx": i, "start_s": a, "end_s": b,
+                         "duration_s": b - a, "shot_type": shot})
+    return pd.DataFrame(rows)
 
 
 def gesture_normalised(
@@ -872,7 +1032,9 @@ _DEFAULT_CACHE_DIR = Path(os.environ.get("WORK_DIR", "/tmp/mannerism")) / "corpu
 # Bumped whenever a change here alters what is cached or how it is computed, so
 # that old pickles are ignored rather than silently serving superseded numbers.
 # 2: word-frequency denominator switched from ASR tokens to segmented words.
-_CACHE_SCHEMA = 2
+# 3: per-video word rows carry video_tokens, so mean_video_freq is computed
+#    per (word, video) instead of averaging the artifact's per-tag rates.
+_CACHE_SCHEMA = 3
 
 
 class CorpusData:
@@ -936,7 +1098,7 @@ def load_corpus(
 ) -> CorpusData:
     """Fetch a corpus once, with progress, and cache it on disk.
 
-    Measured on TedX (39 videos): ~2.8 min cold — windows 37s, keyframes
+    Measured on Ted (39 videos): ~2.8 min cold — windows 37s, keyframes
     ~97s, wordlists ~16s — and ~3s warm, nearly all of which is the
     fingerprint check.
 
